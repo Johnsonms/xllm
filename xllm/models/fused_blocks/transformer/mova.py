@@ -33,7 +33,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx: Any,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
-        segments: Optional[Tuple[torch.Tensor, torch.Tensor, int, int, int]],
+        bos_mask: Optional[torch.Tensor],
+        segments: Optional[Any],
         attn_norm_w: torch.Tensor,  # (d/MP)
         attn_norm_b: Optional[torch.Tensor],  # (d/MP)
         wq: torch.Tensor,  # (d/MP, d)
@@ -117,17 +118,30 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         mx, _, _ = layer_or_rmsnorm_fwd(x_, attn_norm_w, attn_norm_b, norm_local_groups, layernorm_eps, rmsnorm_eps, apply_rmsnorm)
 
         # MoVA forward
-        xqkv, cu_seqlens, attn_out, xh, aux_loss_mova, rng_states, routing_state = mova_fwd(
-            mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads,
-            rmsnorm_eps, gather_before_norm, mova_router_w, mova_router_bias, routing_score_func, routing_scaling_factor,
-            router_load_balancing_type, n_values, mova_topk, value_backend, moe_permutation_backend,
+        xqkv, attn_out, xh, aux_loss_mova, rng_states, routing_state, end_seq = mova_fwd(
+            mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
+            head_dim, rope_head_dim, local_heads, local_kv_heads,
+            rmsnorm_eps, gather_before_norm, mova_router_w, mova_router_bias,
+            routing_score_func, routing_scaling_factor, router_load_balancing_type,
+            n_values, mova_topk, value_backend, moe_permutation_backend,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
+            causal_attn_backend, attn_stability_control, recompute_attention
         )
         xq, xk, xv, xk_rstd = xqkv
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq = cu_seqlens
-        attn_out, attn_lse = attn_out
+        attn_for_save, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
         v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert, v_group_sizes = routing_state
+
+        if segments is not None:
+            if causal_attn_backend == 'flash':
+                seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
+            elif causal_attn_backend == 'xattn':
+                seg1, total_seqlen_k = segments
+                seg2, max_seqlen_q, max_seqlen_k = None, None, None
+            else:
+                raise ValueError(f"Unknown causal attention backend: {causal_attn_backend}")
+        else:
+            seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
 
         # residual
         xo = torch.add(xh, residual, out=xh)
@@ -167,8 +181,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         ctx.save_for_backward(
             x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
-            cu_seqlens_q,
-            cu_seqlens_k,
+            bos_mask,  # (bsz, slen)
+            seg1,
+            seg2,
             attn_norm_w,  # (d/MP)
             attn_norm_b,  # (d/MP)
             wq,  # (d/MP, d)
@@ -200,8 +215,8 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_routing_indices,  # (bsz, slen, topk)
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
-            attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
-            attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
+            attn_for_save,  # (bsz, slen, n_heads, head_dim)
+            attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             original_scores if not recompute_router else None,  # (bsz, slen, n_experts)
@@ -272,8 +287,9 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         (
             x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
-            cu_seqlens_q,
-            cu_seqlens_k,
+            bos_mask,  # (bsz, slen)
+            seg1,
+            seg2,
             attn_norm_w,  # (d/MP)
             attn_norm_b,  # (d/MP)
             wq,  # (d/MP, d)
@@ -305,7 +321,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
             v_routing_indices,  # (bsz, slen, topk)
             v_org_topk_scores,  # (bsz, slen, topk)
             v_tokens_per_expert,  # (n_experts)
-            attn_out,  # (bsz, slen, n_heads, head_dim)
+            attn_for_save,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)

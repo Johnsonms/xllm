@@ -117,8 +117,8 @@ class TransformerBlockFunction(torch.autograd.Function):
             if causal_attn_backend == 'flash':
                 seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
             elif causal_attn_backend == 'xattn':
-                seg1 = segments
-                seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None
+                seg1, total_seqlen_k = segments
+                seg2, max_seqlen_q, max_seqlen_k = None, None, None
             else:
                 raise ValueError(f"Unknown causal attention backend: {causal_attn_backend}")
         else:

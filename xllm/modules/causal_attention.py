@@ -136,8 +136,15 @@ class CausalSoftmaxAttention(nn.Module):
                 xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
             )
         elif self.backend == 'xattn':
-            # TODO: total_seqlen_k
-            segidx = segments
+            if segments is not None:
+                segidx, total_seqlen_k = segments
+                xk = xk[:, -total_seqlen_k:]
+                xv = xv[:, -total_seqlen_k:]
+                bos_mask = bos_mask[:, -total_seqlen_k:]
+                segidx = segidx[: -total_seqlen_k:]
+            else:
+                segidx = None
+
             output = xattn_causal_flash_attn(
                 xq, xk, xv, self.scale, bos_mask, segidx, stability_control, deterministic
             )

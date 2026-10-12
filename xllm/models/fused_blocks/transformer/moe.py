@@ -33,7 +33,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         ctx: Any,
         x: torch.Tensor,  # (bsz, slen, d/MP)
         freqs_cis: Optional[torch.Tensor],  # (slen, d)
-        segments: Optional[Tuple[torch.Tensor, torch.Tensor, int, int, int]],
+        bos_mask: Optional[torch.Tensor],
+        segments: Optional[Any],
         attn_norm_w: torch.Tensor,  # (d/MP)
         attn_norm_b: Optional[torch.Tensor],  # (d/MP)
         wq: torch.Tensor,  # (d/MP, d)
@@ -114,15 +115,26 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             mx, _ = all_gather(mx, parallel_region='model', async_op=False)
 
         # MHA forward
-        xqkv, cu_seqlens, attn_out, xh, rng_states = multihead_attention_fwd(
-            mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w,
+        xqkv, attn_out, xh, rng_states, end_seq = multihead_attention_fwd(
+            mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
             head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
             attn_gate_func, dropout, attention_dropout, hidden_dropout,
+            causal_attn_backend, attn_stability_control, recompute_attention
         )
         xq, xk, xv, xk_rstd = xqkv
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq = cu_seqlens
-        attn_out, attn_lse = attn_out
+        attn_for_save, attn_lse = attn_out
         flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state = rng_states
+
+        if segments is not None:
+            if causal_attn_backend == 'flash':
+                seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
+            elif causal_attn_backend == 'xattn':
+                seg1, total_seqlen_k = segments
+                seg2, max_seqlen_q, max_seqlen_k = None, None, None
+            else:
+                raise ValueError(f"Unknown causal attention backend: {causal_attn_backend}")
+        else:
+            seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
 
         # residual
         xo = torch.add(xh, residual, out=xh)
@@ -161,8 +173,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         ctx.save_for_backward(
             x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
-            cu_seqlens_q,
-            cu_seqlens_k,
+            bos_mask,  # (bsz, slen)
+            seg1,
+            seg2,
             attn_norm_w,  # (d/MP)
             attn_norm_b,  # (d/MP)
             wq,  # (d/MP, d)
@@ -188,8 +201,8 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             xk if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
             xk_rstd if not recompute_kv else None,  # (bsz, slen, kv_heads)
             xv if not recompute_kv else None,  # (bsz, slen, n_kv_heads, head_dim)
-            attn_out if not recompute_attention else None,  # (bsz, slen, n_heads, head_dim)
-            attn_lse if not recompute_attention else None,  # (bsz, h/MP, slen, slen)
+            attn_for_save,  # (bsz, slen, n_heads, head_dim)
+            attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)
             original_scores if not recompute_router else None,  # (bsz, slen, n_experts)
@@ -253,8 +266,9 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         (
             x,  # (bsz, slen, d/MP)
             freqs_cis,  # (slen, s)
-            cu_seqlens_q,
-            cu_seqlens_k,
+            bos_mask,  # (bsz, slen)
+            seg1,
+            seg2,
             attn_norm_w,  # (d/MP)
             attn_norm_b,  # (d/MP)
             wq,  # (d/MP, d)
@@ -280,7 +294,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
             xk,  # (bsz, slen, n_kv_heads, head_dim)
             xk_rstd,  # (bsz, slen, kv_heads)
             xv,  # (bsz, slen, n_kv_heads, head_dim)
-            attn_out,  # (bsz, slen, n_heads, head_dim)
+            attn_for_save,  # (bsz, slen, n_heads, head_dim)
             attn_lse,  # (bsz, h/MP, slen, slen)
             flash_rng_state,
             xo,  # (bsz, slen, d/MP)

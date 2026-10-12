@@ -732,7 +732,14 @@ class Transformer(XLLModel):
             return q_segment_idx, k_segment_idx
         elif self.causal_attn_backend == 'xattn':
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)
-            return segment_idx[:, :end]
+            # B x L1
+            q_segment_idx = segment_idx[:, start:end]
+            # B x 1
+            last_qidx = q_segment_idx[:, 0:1]
+            # B x L2
+            segment_idx = segment_idx[:, :end]
+            total_seqlen_k = torch.sum(segment_idx >= last_qidx, dim=1).max().item()
+            return segment_idx, total_seqlen_k
         else:
             assert self.causal_attn_backend is None
             segment_idx = get_segment_idx_from_bos_mask(bos_mask)

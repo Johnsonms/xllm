@@ -464,9 +464,17 @@ def flash_attention_fwd(
         y_for_bwd = y if save_aux else None
         lse = lse if save_aux else None
     elif backend == 'xattn':
-        segidx = segments
-        flash_rng_state = None
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[: -total_seqlen_k:]
+        else:
+            segidx = None
+
         y, y_for_bwd, lse = xattn_fwd(xq, xk, xv, scale, bos_mask, segidx, stability_control, requires_grad=save_aux)
+        flash_rng_state = None
     else:
         raise ValueError(f"Unknown causal attention backend: {backend}")
 

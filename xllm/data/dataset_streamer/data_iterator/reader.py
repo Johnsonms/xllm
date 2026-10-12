@@ -94,7 +94,7 @@ class JSONLReader(Reader):
             return
         self.line_num = state["line_num"]
         self.file_pos = state["file_pos"]
-        logger.warning(
+        logger.debug(
             f"Setting JSONL position on {self.fpath} ({self.world_rank}/{self.world_size}): {self.file_pos}"
         )
         self.f.seek(self.file_pos)
