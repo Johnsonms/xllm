@@ -261,23 +261,12 @@ def test_flash_sliding_window_attention_speed(
             flash_attn_gpu.bwd(
                 out_grad, query, key, value, out, softmax_lse, q_grad, k_grad, v_grad,
                 None, None, None, None, None, None,  # cu_seqlens_q/k, seqused_q/k, max_seqlen_q/k
-                scale, True, window_size[0], window_size[1], 0.0, True, 0,
-            )
-        torch.cuda.synchronize()
-
-        delta1 = timer() - start
-
-        start = timer()
-        for _ in range(epochs):
-            flash_attn_gpu.bwd(
-                out_grad, query, key, value, out, softmax_lse, q_grad, k_grad, v_grad,
-                None, None, None, None, None, None,  # cu_seqlens_q/k, seqused_q/k, max_seqlen_q/k
                 scale, True, window_size[0], window_size[1], 0.0, False, 0,
             )
         torch.cuda.synchronize()
 
         delta = timer() - start
-        print(f'flash3 SWA bwd: {delta:.2f}s ({delta1:.2f}s)')
+        print(f'flash3 SWA bwd: {delta:.2f}s')
 
 
 def test_sliding_chunk_attention(
