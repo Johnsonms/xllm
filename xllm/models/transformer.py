@@ -115,6 +115,7 @@ class TransformerBlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
@@ -126,6 +127,7 @@ class TransformerBlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.attention.norm.weight,
                 self.attention.norm.bias,
@@ -170,7 +172,7 @@ class TransformerBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, attn_stability_control, deterministic, cache
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
         # FFN
         out = self.nffn(y)
@@ -258,6 +260,7 @@ class TransformerMoEBlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
@@ -269,6 +272,7 @@ class TransformerMoEBlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.attention.norm.weight,
                 self.attention.norm.bias,
@@ -329,7 +333,7 @@ class TransformerMoEBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, attn_stability_control, deterministic, cache
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
         # MoE
         out, aux_loss = self.moe(y, moe_router_load_balancing_type)
@@ -425,6 +429,7 @@ class TransformerMoVABlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
         attn_stability_control: int = 0,
@@ -436,6 +441,7 @@ class TransformerMoVABlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.mova.norm.weight,
                 self.mova.norm.bias,
@@ -501,7 +507,7 @@ class TransformerMoVABlock(nn.Module):
             )
 
         y, aux_loss_mova, cache = self.mova(
-            x, freqs_cis, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
         )
         # MoE
         out, aux_loss_moe = self.moe(y, moe_router_load_balancing_type)
@@ -667,13 +673,13 @@ class Transformer(XLLModel):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, segments, moe_router_load_balancing_type,
+                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache,
                     use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 x, aux_loss, layer_cache = layer(
-                    x, freq_cis, segments, moe_router_load_balancing_type,
+                    x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
                     attn_stability_control, deterministic, layer_cache
                 )
 

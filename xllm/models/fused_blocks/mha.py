@@ -29,9 +29,10 @@ from .distributed import (
 
 
 def multihead_attention_fwd(
-    mx, freqs_cis, segments, wq, wk, wv, wr, wo, q_norm_w,
+    mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr, wo, q_norm_w,
     head_dim, rope_head_dim, local_heads, local_kv_heads, eps,
     attn_gate_func, dropout, attention_dropout, hidden_dropout,
+    causal_attn_backend, stability_control, recompute_attn
 ):
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
@@ -68,18 +69,11 @@ def multihead_attention_fwd(
         handle_xk.wait()
         xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
 
-    if segments is not None:
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
-        xk_ = xk_[:, -total_seqlen_k:]
-        xv_ = xv_[:, -total_seqlen_k:]
-    else:
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
-
-    attn_out, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
-        xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout
+    attn, attn_for_save, attn_lse, flash_rng_state, attn_rng_state = flash_attention_fwd(
+        xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout, stability_control,
+        backend=causal_attn_backend, save_aux= not recompute_attn
     )
-    # B x L x H x D/H -> B x L x D
-    attn = attn_out.view(bsz, seq_len, -1)
+    attn = rearrange(attn, 'b l h v -> b l (h v)')
     if wr is not None:
         r = attn_gate_fn(F.linear(mx, wr, None))
         attn = torch.mul(attn, r, out=r)
@@ -89,8 +83,8 @@ def multihead_attention_fwd(
     xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
     return (
-        (xq, xk, xv, xk_rstd), (cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq),
-        (attn_out, attn_lse), xh, (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state)
+        (xq, xk, xv, xk_rstd), (attn_for_save, attn_lse), xh,
+        (flash_rng_state, attn_rng_state, attn_out_rng_state, xh_rng_state), end_seq
     )
 
 

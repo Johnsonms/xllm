@@ -15,6 +15,8 @@ from xllm.modules.fused_ops import (
     memory_efficient_dropout_bwd,
     flash_attention_fwd as flash_fwd,
     flash_attention_bwd as flash_bwd,
+    xattn_causal_flash_attn_fwd as xattn_fwd,
+    xattn_causal_flash_attn_bwd as xattn_bwd,
     causal_conv1d_fwd as conv1d_fwd,
     causal_conv1d_bwd as conv1d_bwd,
     sliding_chunk_attention_fwd as sca_fwd,
@@ -439,18 +441,36 @@ def flash_attention_fwd(
     xq: Tensor,
     xk: Tensor,
     xv: Tensor,
-    cu_seqlens_q: Optional[Tensor],
-    cu_seqlens_k: Optional[Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
     scale: float,
-    dropout: float = 0.0,
-) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
+    dropout: float,
+    stability_control: int,
+    backend: str,
+    save_aux: bool
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Tensor, Optional[Tensor]]:
     rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
-    y, lse, flash_rng_state = flash_fwd(
-        xq, xk, xv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout, True,
-    )
-    return y, lse, flash_rng_state, rng_state
+    if backend == 'flash':
+        if segments is not None:
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+        else:
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
+
+        y, lse, flash_rng_state = flash_fwd(
+            xq, xk, xv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout, True,
+        )
+        y_for_bwd = y if save_aux else None
+        lse = lse if save_aux else None
+    elif backend == 'xattn':
+        segidx = segments
+        flash_rng_state = None
+        y, y_for_bwd, lse = xattn_fwd(xq, xk, xv, scale, bos_mask, segidx, stability_control, requires_grad=save_aux)
+    else:
+        raise ValueError(f"Unknown causal attention backend: {backend}")
+
+    return y, y_for_bwd, lse, flash_rng_state, rng_state
 
 
 def flash_attention_bwd(

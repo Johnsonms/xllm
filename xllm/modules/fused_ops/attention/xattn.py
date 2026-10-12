@@ -58,7 +58,7 @@ def xattn_causal_flash_attn_fwd(
         high_precision_level=high_precision_level
     )
     lse = lse if requires_grad else None
-    y_for_bwd = y if requires_grad and high_precision_level == 0 else y_fp32
+    y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
     return y, y_for_bwd, lse
 
 

@@ -224,6 +224,7 @@ class MOVAttention(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         stability_control: int = 0,
         deterministic: bool = True,
@@ -262,7 +263,7 @@ class MOVAttention(nn.Module):
 
         # B x L x (H*S)
         attn, new_cache = self.causal_attention(
-            xq, xk, xv, g, freqs_cis, segments, stability_control, deterministic, cache
+            xq, xk, xv, g, freqs_cis, bos_mask, segments, stability_control, deterministic, cache
         )
         if self.apply_attn_gate:
             if self.attn_gate_fn == "silu":

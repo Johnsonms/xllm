@@ -13,6 +13,7 @@ from xllm.modules.context_parallel import (
 )
 from xllm.modules.fused_ops import (
     flash_attention,
+    xattn_causal_flash_attn,
     swift_efficient_attention,
     memory_efficient_dropout,
 )
@@ -51,7 +52,7 @@ class CausalSoftmaxAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
 
         if backend == 'xattn':
-            raise NotImplementedError
+            assert dropout == 0, f"xattn does not support attention dropout: {dropout}"
 
     def forward(
         self,
@@ -60,6 +61,7 @@ class CausalSoftmaxAttention(nn.Module):
         xv: Tensor,
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor],
         segments: Optional[Any],
         stability_control: int = 0,
         deterministic: bool = True,
@@ -133,6 +135,12 @@ class CausalSoftmaxAttention(nn.Module):
             output = swift_efficient_attention(
                 xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
             )
+        elif self.backend == 'xattn':
+            # TODO: total_seqlen_k
+            segidx = segments
+            output = xattn_causal_flash_attn(
+                xq, xk, xv, self.scale, bos_mask, segidx, stability_control, deterministic
+            )
         elif self.backend == 'flash':
             if segments is not None:
                 cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
@@ -188,6 +196,7 @@ class CausalSoftdeltaAttention(nn.Module):
         xv: Tensor,
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor],
         segments: Optional[Any],
         stability_control: int = 0,
         deterministic: bool = True,
