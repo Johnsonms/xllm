@@ -392,24 +392,16 @@ def mova_bwd(
 
 
 def mova_recompute(
-    attn_out, attn_lse, xq, xk, xv, xk_rstd, total_seqlen_k, end_seq,
+    attn_for_save, attn_lse, xq, xk, xv, xk_rstd, end_seq,
     sx, original_scores, routing_indices, org_topk_scores, group_sizes,
-    router_w, routing_score_func, routing_scaling_factor, n_values, topk,
-    value_backend, moe_permutation_backend, mx, freqs_cis,
+    router_w, routing_score_func, routing_scaling_factor,
+    n_values, topk, value_backend, moe_permutation_backend,
+    mx, freqs_cis, bos_mask, segments,
     wq, wk, wv, wr, q_norm_w, head_dim, rope_head_dim,
     local_heads, local_kv_heads, eps,
-    cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
     attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
+    causal_attn_backend, stability_control
 ):
-    def recompute_qk(cq, wc, qknorm, norm_w, n_heads):
-        if cq is None:
-            cq = F.linear(mx, wc)
-
-        cq_, cq_rstd = rmsnorm_fwd(cq, norm_w, n_heads, eps) if qknorm else (cq, None)
-        cq_ = rearrange(cq_, 'b l (h s) -> b l h s', h=n_heads)
-        cq_ = apply_rope(cq_, freqs_cis, head_dim, rope_head_dim, False)
-        return cq, cq_, cq_rstd
-
     bsz, seq_len, _ = mx.shape
     attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
 
@@ -492,7 +484,7 @@ def mova_recompute(
         rmx, r = None, None
 
     # recompute attention output
-    if attn_out is None:
+    if attn_for_save is None:
         assert attn_lse is None
 
         if handle_xk is not None:
@@ -505,15 +497,16 @@ def mova_recompute(
             handle_xv = None
             xv_ = reshape_gathered_tensor_along_specific_dim(xv_, gather_dim=1)[:, :end_seq]
 
-        if total_seqlen_k is not None:
-            xk_ = xk_[:, -total_seqlen_k:]
-            xv_ = xv_[:, -total_seqlen_k:]
-
-        attn_out, attn_lse, _ = recompute_flash_attention_lse(
-            xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, attn_scale, attention_dropout, attn_rng_state
+        attn_out, attn_for_save, attn_lse, _ = recompute_flash_attention_lse(
+            xq_, xk_, xv_, bos_mask, segments, attn_scale, attention_dropout,
+            attn_rng_state, stability_control, backend=causal_attn_backend
         )
+    else:
+        attn_out = attn_for_save.to(xq.dtype)
 
+    # B x L x H x D/H -> B x L x D
+    attn_out = rearrange(attn_out, 'b l h v -> b l (h v)')
     return (
-        (attn_out, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_), (handle_xk, handle_xv),
-        (rmx, r), (permuted_sx, original_scores, sorted_indices, inverse_indices)
+        (attn_out, attn_for_save, attn_lse), (xq, xq_, xq_rstd), (xk, xk_, xk_rstd), (xv, xvv_, xv_),
+        (handle_xk, handle_xv), (rmx, r), (permuted_sx, original_scores, sorted_indices, inverse_indices)
     )

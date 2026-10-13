@@ -449,20 +449,31 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         xh_grad = memory_efficient_dropout_bwd(xh_grad, dropout, xh_rng_state)
         xh_grad, handle_xh = all_gather(xh_grad, parallel_region='model', async_op=True)
 
+        if bos_mask is not None:
+            if causal_attn_backend == 'flash':
+                segments = seg1, seg2, max_seqlen_q, max_seqlen_k, total_seqlen_k
+            elif causal_attn_backend == 'xattn':
+                segments = seg1, total_seqlen_k
+            else:
+                raise ValueError(f"Unknown causal attention backend: {causal_attn_backend}")
+        else:
+            segments = None
+
         if handle_mx is not None:
             handle_mx.wait()
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
         attn_outs, q_outs, k_outs, v_outs, handle_kv, attn_gate_outs, router_outs = mova_recompute(
-            attn_out, attn_lse, xq, xk, xv, xk_rstd, total_seqlen_k, end_seq,
+            attn_for_save, attn_lse, xq, xk, xv, xk_rstd, end_seq,
             sx, v_original_scores, v_routing_indices, v_org_topk_scores, v_group_sizes,
-            mova_router_w, routing_score_func, routing_scaling_factor, n_values, mova_topk,
-            value_backend, moe_permutation_backend, mx, freqs_cis, wq, wk, wv, wr,
+            mova_router_w, routing_score_func, routing_scaling_factor,
+            n_values, mova_topk, value_backend, moe_permutation_backend,
+            mx, freqs_cis, bos_mask, segments, wq, wk, wv, wr,
             q_norm_w, head_dim, rope_head_dim, local_heads, local_kv_heads, rmsnorm_eps,
-            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            attn_scale, attn_gate_func, attention_dropout, attn_rng_state
+            attn_scale, attn_gate_func, attention_dropout, attn_rng_state,
+            causal_attn_backend, attn_stability_control
         )
-        attn_out, attn_lse = attn_outs
+        attn_out, attn_for_save, attn_lse = attn_outs
         xq, xq_, xq_rstd = q_outs
         xk, xk_, xk_rstd = k_outs
         xv, xvv_, xv_ = v_outs
@@ -470,9 +481,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         rmx, r = attn_gate_outs
         permuted_sx, v_original_scores, v_sorted_indices, v_inverse_indices = router_outs
 
-        # B x L x H x D/H -> B x L x D
-        attn_r = attn_out.view(bsz, seq_len, -1)
-        attn = attn_r * r if r is not None else attn_r
+        attn = attn_out * r if r is not None else attn_out
         attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
@@ -482,7 +491,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         attn_grad = xh_grad.matmul(wo)
         attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
         attn_r_grad = torch.mul(attn_grad, r, out=r) if r is not None else attn_grad
-        r_grad = torch.mul(attn_grad, attn_r, out=attn_grad) if r is not None else None
+        r_grad = torch.mul(attn_grad, attn_out, out=attn_grad) if r is not None else None
 
         # grads for wh2
         attn_flat = attn.flatten(end_dim=-2)
@@ -502,7 +511,7 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         # B x L x D -> B x L x H x D/H
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, mova_router_w_grad = mova_bwd(
-            attn_r_grad, r_grad, aux_loss_grad, attn_out, attn_lse, xq_, xk_, xv_,
+            attn_r_grad, r_grad, aux_loss_grad, attn_for_save, attn_lse, xq_, xk_, xv_,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq, freqs_cis,
             local_kv_heads, rope_head_dim, xq, xk, xv, xvv_, xq_rstd , xk_rstd, rmx, mx,
             q_norm_w, wq, wk, wv, wr, attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
