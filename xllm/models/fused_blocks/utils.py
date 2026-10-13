@@ -411,14 +411,14 @@ def recompute_flash_attention_lse(
     xq: Tensor,
     xk: Tensor,
     xv: Tensor,
-    cu_seqlens_q: Optional[Tensor],
-    cu_seqlens_k: Optional[Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
     scale: float,
     dropout: float,
-    rng_state: Optional[Tensor]
-) -> Tuple[Tensor, Tensor, Tensor]:
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    backend: str,
+) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor]]:
     if rng_state is not None:
         assert dropout > 0, dropout
         org_rng_state = torch.cuda.get_rng_state()
@@ -426,15 +426,15 @@ def recompute_flash_attention_lse(
     else:
         org_rng_state = None
 
-    y, lse, flash_state = flash_fwd(
-        xq, xk, xv, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale, dropout, True,
+    y, y_for_bwd, lse, flash_rng_state, _ = flash_attention_fwd(
+        xq, xk, xv, bos_mask, segments, scale, dropout, stability_control, backend, save_aux=True
     )
     if rng_state is not None:
         # reset the original rng state
         assert org_rng_state is not None
         torch.cuda.set_rng_state(org_rng_state)
 
-    return y, lse, flash_state
+    return y, y_for_bwd, lse, flash_rng_state
 
 
 def flash_attention_fwd(
@@ -448,7 +448,8 @@ def flash_attention_fwd(
     stability_control: int,
     backend: str,
     save_aux: bool
-) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Tensor, Optional[Tensor]]:
+) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor],
+           Optional[Tensor], Optional[Tensor]]:
     rng_state = None if dropout == 0 else torch.cuda.get_rng_state()
     if backend == 'flash':
         if segments is not None:

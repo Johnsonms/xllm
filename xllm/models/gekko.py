@@ -524,8 +524,8 @@ class Gekko(XLLModel):
         res_flops = 0.0
         conv_flops = self.causal_conv_width * (q_dim + k_dim + v_dim) * 2
         sca_flops = self.model_dim * (q_dim + k_dim + v_dim + h_dim)
-        sca_flops += (q_dim + h_dim) * self.chunk_size
-        awk_flops = (k_dim + q_dim) * self.v_head_dim
+        sca_flops += (q_dim + h_dim) * self.chunk_size * 1.5
+        awk_flops = (k_dim * 2 + q_dim) * self.v_head_dim
         attn_flops = sca_flops + awk_flops + self.model_dim * h_dim
         ffn_flops = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         moe_flops = self.model_dim * self.expert_inter_dim * (self.num_activated_experts + self.num_shared_experts) * 3
