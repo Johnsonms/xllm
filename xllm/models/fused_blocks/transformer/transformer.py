@@ -402,19 +402,18 @@ class TransformerBlockFunction(torch.autograd.Function):
             xv_ = reshape_gathered_tensor_along_specific_dim(xv_, gather_dim=1)[:, :end_seq]
             handle_xk.wait()
             xk_ = reshape_gathered_tensor_along_specific_dim(xk_, gather_dim=1)[:, :end_seq]
-            if total_seqlen_k is not None:
-                xk_ = xk_[:, -total_seqlen_k:]
-                xv_ = xv_[:, -total_seqlen_k:]
 
         # MHA backward
         # B x L x D -> B x L x H x D/H
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad = multihead_attention_bwd(
-            attn_r_grad, r_grad, attn_for_save, attn_lse, xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-            total_seqlen_k, end_seq, freqs_cis, local_kv_heads, rope_head_dim,
+            attn_r_grad, r_grad, attn_for_save, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
+            freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
             xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
-            attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
-            x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups, apply_rmsnorm, gather_before_norm
+            attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+            causal_attn_backend, attn_stability_control, deterministic,
+            x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_local_groups,
+            apply_rmsnorm, gather_before_norm
         )
 
         # residual connection

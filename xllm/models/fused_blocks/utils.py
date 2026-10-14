@@ -489,19 +489,42 @@ def flash_attention_bwd(
     xk: Tensor,
     xv: Tensor,
     softmax_lse: Tensor,
-    cu_seqlens_q: Optional[Tensor],
-    cu_seqlens_k: Optional[Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
+    bos_mask: Optional[Tensor],
+    segments: Optional[Any],
     scale: float,
-    dropout: float = 0.0,
-    rng_state: Optional[Tensor] = None,
-    deterministic: bool = True
+    dropout: float,
+    rng_state: Optional[Tensor],
+    stability_control: int,
+    deterministic: bool,
+    backend: str,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    return flash_bwd(
-        y_grad, y, xq, xk, xv, softmax_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-        scale, dropout, rng_state, use_causal_mask=True, deterministic=deterministic
-    )
+    if backend == 'flash':
+        if segments is not None:
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+        else:
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k = None, None, None, None, None
+
+        return flash_bwd(
+            y_grad, y, xq, xk, xv, softmax_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            scale, dropout, rng_state, use_causal_mask=True, deterministic=deterministic
+        )
+    elif backend == 'xattn':
+        if segments is not None:
+            segidx, total_seqlen_k = segments
+            xk = xk[:, -total_seqlen_k:]
+            xv = xv[:, -total_seqlen_k:]
+            bos_mask = bos_mask[:, -total_seqlen_k:]
+            segidx = segidx[: -total_seqlen_k:]
+        else:
+            segidx = None
+
+        return xattn_bwd(
+            y_grad, xq, xk, xv, y, softmax_lse, scale, bos_mask, segidx, stability_control, deterministic
+        )
+    else:
+        raise ValueError(f"Unknown causal attention backend: {backend}")
 
 
 def recompute_sliding_chunk_attention(

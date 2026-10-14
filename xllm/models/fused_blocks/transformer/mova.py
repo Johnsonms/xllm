@@ -512,9 +512,10 @@ class TransformerMoVABlockFunction(torch.autograd.Function):
         attn_r_grad = attn_r_grad.view(bsz, seq_len, local_heads, head_dim)
         x_grad, wq_grad, wk_grad, wv_grad, wr_grad, q_norm_w_grad, attn_norm_w_grad, attn_norm_b_grad, mova_router_w_grad = mova_bwd(
             attn_r_grad, r_grad, aux_loss_grad, attn_for_save, attn_lse, xq_, xk_, xv_,
-            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq, freqs_cis,
-            local_kv_heads, rope_head_dim, xq, xk, xv, xvv_, xq_rstd , xk_rstd, rmx, mx,
-            q_norm_w, wq, wk, wv, wr, attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
+            total_seqlen_k, end_seq, freqs_cis, bos_mask, segments,local_kv_heads, rope_head_dim,
+            xq, xk, xv, xvv_, xq_rstd , xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
+            attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+            causal_attn_backend, attn_stability_control, deterministic,
             sx, permuted_sx, v_original_scores, v_routing_indices, v_org_topk_scores, v_tokens_per_expert,
             v_sorted_indices, v_inverse_indices, v_group_sizes, mova_router_w, mova_router_bias, router_bias_update_rate,
             routing_score_func, routing_scaling_factor, router_load_balancing_type, n_values, mova_topk,

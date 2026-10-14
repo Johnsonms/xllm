@@ -180,10 +180,11 @@ def mova_fwd(
 
 
 def mova_bwd(
-    attn_grad, r_grad, aux_loss_grad, attn_out, attn_lse, xq_, xk_, xv_,
-    cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, total_seqlen_k, end_seq, freqs_cis,
-    local_kv_heads, rope_head_dim, xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx,
-    q_norm_w, wq, wk, wv, wr, attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
+    attn_grad, r_grad, aux_loss_grad, attn_for_bwd, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
+    freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
+    xq, xk, xv, xvv_, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
+    attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+    causal_attn_backend, stability_control, deterministic,
     sx, permuted_sx, original_scores, routing_indices, org_topk_scores, tokens_per_expert,
     sorted_indices, inverse_indices, group_sizes, router_w, router_bias, router_bias_update_rate,
     routing_score_func, routing_scaling_factor, router_load_balancing_type, n_values, topk,
@@ -198,8 +199,9 @@ def mova_bwd(
     }[attn_gate_func]
 
     xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
-        attn_grad, attn_out, xq_, xk_, xv_, attn_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-        attn_scale, attention_dropout, flash_rng_state, deterministic
+        attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
+        attn_scale, attention_dropout, flash_rng_state,
+        stability_control, deterministic, causal_attn_backend
     )
 
     tail_seq = get_context_parallel_world_size() * seq_len - end_seq

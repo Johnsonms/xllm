@@ -89,11 +89,13 @@ def multihead_attention_fwd(
 
 
 def multihead_attention_bwd(
-    attn_grad, r_grad, attn_out, attn_lse, xq_, xk_, xv_, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-    total_seqlen_k, end_seq, freqs_cis, local_kv_heads, rope_head_dim,
+    attn_grad, r_grad, attn_for_bwd, attn_lse, xq_, xk_, xv_, total_seqlen_k, end_seq,
+    freqs_cis, bos_mask, segments, local_kv_heads, rope_head_dim,
     xq, xk, xq_rstd, xk_rstd, rmx, mx, q_norm_w, wq, wk, wv, wr,
-    attn_scale, attn_gate_func, attention_dropout, flash_rng_state, deterministic,
-    x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_groups, apply_rmsnorm, gather_before_norm,
+    attn_scale, attn_gate_func, attention_dropout, flash_rng_state,
+    causal_attn_backend, stability_control, deterministic,
+    x_, x_mean, x_invvar, attn_norm_w, attn_norm_b, norm_groups,
+    apply_rmsnorm, gather_before_norm,
 ):
 
     # B x L x D -> B x L x H x D/H
@@ -104,8 +106,9 @@ def multihead_attention_bwd(
     }[attn_gate_func]
 
     xq_grad, xk_grad_, xv_grad_ = flash_attention_bwd(
-        attn_grad, attn_out, xq_, xk_, xv_, attn_lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-        attn_scale, attention_dropout, flash_rng_state, deterministic
+        attn_grad, attn_for_bwd, xq_, xk_, xv_, attn_lse, bos_mask, segments,
+        attn_scale, attention_dropout, flash_rng_state,
+        stability_control, deterministic, causal_attn_backend
     )
 
     tail_seq = get_context_parallel_world_size() * seq_len - end_seq
