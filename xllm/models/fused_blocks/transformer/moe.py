@@ -484,6 +484,7 @@ class TransformerMoEBlockFunction(torch.autograd.Function):
         return (
             x_grad,
             None,  # freqs_cis
+            None,  # bos mask
             None,  # segments
             attn_norm_w_grad,
             attn_norm_b_grad,
