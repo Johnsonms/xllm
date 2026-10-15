@@ -105,7 +105,7 @@ class OptimConf(Config):
 @dataclass
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
-    ddp_backend: str = 'fsdp1'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
+    ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention
