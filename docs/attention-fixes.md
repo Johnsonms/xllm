@@ -23,3 +23,7 @@ Focused CUDA regressions:
 ```bash
 python -m pytest -q tests/attn/test_attention_regressions.py
 ```
+
+[All six cases pass](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon/runs/r4j7jj4w);
+five fail on the [unmodified release](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon/runs/8np8ec93).
+[74 selected existing convolution checks](https://wandb.ai/mbzuai-llm/xllm-release-v1.01-muon/runs/srla7y0p) also pass.
