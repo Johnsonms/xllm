@@ -13,6 +13,7 @@ from xllm.modules.context_parallel import (
 )
 from xllm.modules.fused_ops import (
     flash_attention,
+    xattn_causal_flash_attn,
     swift_efficient_attention,
     memory_efficient_dropout,
 )
@@ -51,7 +52,7 @@ class CausalSoftmaxAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim) if scale is None else scale
 
         if backend == 'xattn':
-            raise NotImplementedError
+            assert dropout == 0, f"xattn does not support attention dropout: {dropout}"
 
     def forward(
         self,
@@ -60,8 +61,9 @@ class CausalSoftmaxAttention(nn.Module):
         xv: Tensor,
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor],
         segments: Optional[Any],
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ):
@@ -122,7 +124,7 @@ class CausalSoftmaxAttention(nn.Module):
             xv = repeat_kv(xv, n_rep)
 
             if segments is not None:
-                q_segment_idx, k_segment_idx, _, _, _ = segments
+                q_segment_idx, k_segment_idx = segments
             else:
                 q_segment_idx, k_segment_idx = None, None
 
@@ -132,6 +134,19 @@ class CausalSoftmaxAttention(nn.Module):
                 use_causal_mask = True
             output = swift_efficient_attention(
                 xq, xk, xv, q_segment_idx, k_segment_idx, self.scale, self.dropout, use_causal_mask, self.training
+            )
+        elif self.backend == 'xattn':
+            if segments is not None:
+                segidx, total_seqlen_k = segments
+                xk = xk[:, -total_seqlen_k:]
+                xv = xv[:, -total_seqlen_k:]
+                bos_mask = bos_mask[:, -total_seqlen_k:]
+                segidx = segidx[: -total_seqlen_k:]
+            else:
+                segidx = None
+
+            output = xattn_causal_flash_attn(
+                xq, xk, xv, self.scale, bos_mask, segidx, stability_control, deterministic
             )
         elif self.backend == 'flash':
             if segments is not None:
@@ -188,8 +203,9 @@ class CausalSoftdeltaAttention(nn.Module):
         xv: Tensor,
         g: Optional[Tensor],
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor],
         segments: Optional[Any],
-        fp32_attn_output: bool = False,
+        stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ):

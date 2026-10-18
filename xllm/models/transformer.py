@@ -25,6 +25,10 @@ from xllm.modules.model_parallel import (
     gather_copy_model_parallel_region,
 )
 from xllm.modules.context_parallel import gather_from_context_parallel_region
+from xllm.modules.utils import (
+    get_bos_mask,
+    get_segment_idx_from_bos_mask,
+)
 from xllm.config import ModelConf
 from xllm.models.xllm import XLLModel
 from xllm.distributed import (
@@ -111,9 +115,10 @@ class TransformerBlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -122,6 +127,7 @@ class TransformerBlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.attention.norm.weight,
                 self.attention.norm.bias,
@@ -132,7 +138,6 @@ class TransformerBlock(nn.Module):
                 self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
@@ -157,7 +162,7 @@ class TransformerBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -167,7 +172,7 @@ class TransformerBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
         # FFN
         out = self.nffn(y)
@@ -255,9 +260,10 @@ class TransformerMoEBlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -266,6 +272,7 @@ class TransformerMoEBlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.attention.norm.weight,
                 self.attention.norm.bias,
@@ -276,7 +283,6 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.wg.weight if self.attention.attn_act_func == 'softdelta' else None,
                 self.attention.wo.weight,
                 self.attention.query_norm.weight if self.attention.qknorm else None,
-                self.attention.key_norm.weight if self.attention.qknorm else None,
                 self.attention.local_heads,
                 self.attention.local_kv_heads,
                 self.attention.head_dim,
@@ -316,7 +322,7 @@ class TransformerMoEBlock(nn.Module):
                 self.attention.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -327,7 +333,7 @@ class TransformerMoEBlock(nn.Module):
             )
 
         y, cache = self.attention(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache
         )
         # MoE
         out, aux_loss = self.moe(y, moe_router_load_balancing_type)
@@ -423,9 +429,10 @@ class TransformerMoVABlock(nn.Module):
         self,
         x: Tensor,
         freqs_cis: Optional[Tensor],
+        bos_mask: Optional[Tensor] = None,
         segments: Optional[Any] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[Tuple[Tensor, Tensor, int]] = None,
     ) -> Tuple[Tensor, Optional[Tensor], Optional[Any]]:
@@ -434,6 +441,7 @@ class TransformerMoVABlock(nn.Module):
             return fn.apply(
                 x,
                 freqs_cis,
+                bos_mask,
                 segments,
                 self.mova.norm.weight,
                 self.mova.norm.bias,
@@ -444,7 +452,6 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.wg.weight if self.mova.attn_act_func == 'softdelta' else None,
                 self.mova.wo.weight,
                 self.mova.query_norm.weight if self.mova.qknorm else None,
-                self.mova.key_norm.weight if self.mova.qknorm else None,
                 self.mova.local_heads,
                 self.mova.local_kv_heads,
                 self.mova.head_dim,
@@ -455,7 +462,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.router.bias,
                 self.mova.value_backend,
                 self.mova.attn_gate_fn,
-                self.mova.causal_attention,
+                self.mova.causal_attn_backend,
                 None,
                 self.moe.norm.weight,
                 self.moe.norm.bias,
@@ -489,7 +496,7 @@ class TransformerMoVABlock(nn.Module):
                 self.mova.norm.gather_input,
                 self.residual_func,
                 self.residual_heads,
-                fp32_attn_output,
+                attn_stability_control,
                 deterministic,
                 self.recompute_q,
                 self.recompute_kv,
@@ -500,7 +507,7 @@ class TransformerMoVABlock(nn.Module):
             )
 
         y, aux_loss_mova, cache = self.mova(
-            x, freqs_cis, segments, fp32_attn_output, deterministic, cache, moe_router_load_balancing_type
+            x, freqs_cis, bos_mask, segments, attn_stability_control, deterministic, cache, moe_router_load_balancing_type
         )
         # MoE
         out, aux_loss_moe = self.moe(y, moe_router_load_balancing_type)
@@ -514,7 +521,7 @@ class TransformerOutputLayer(nn.Module):
         super().__init__()
 
         self.model_dim = cfg.model_dim
-        self.output_size = cfg.vocab_size if cfg.output_size == -1 else cfg.output_size
+        self.output_size = cfg.vocab_size
         self.apply_rmsnorm = cfg.apply_rmsnorm
         self.layernorm_eps = cfg.layernorm_eps
         self.rmsnorm_eps = cfg.rmsnorm_eps
@@ -620,7 +627,7 @@ class Transformer(XLLModel):
         targets: Optional[Tensor] = None,
         token_mask: Optional[Tensor] = None,
         moe_router_load_balancing_type: Optional[str] = None,
-        fp32_attn_output: bool = False,
+        attn_stability_control: int = 0,
         deterministic: bool = True,
         cache: Optional[List[Tuple[Tensor, Tensor, int]]] = None,
     ):
@@ -631,7 +638,7 @@ class Transformer(XLLModel):
 
         if multi_segments:
             assert cache is None
-            bos_mask = torch.eq(tokens, self.bos_id)
+            bos_mask = get_bos_mask(tokens, self.eos_id, use_eos=True)
             segments = self.get_segment_arg(bos_mask)
         else:
             bos_mask = None
@@ -666,14 +673,14 @@ class Transformer(XLLModel):
             layer_cache = cache[i] if cache is not None else None
             if self.layerwise_ckpt:
                 x, aux_loss, layer_cache = checkpoint(
-                    layer, x, freq_cis, segments, moe_router_load_balancing_type,
-                    fp32_attn_output, deterministic, layer_cache,
+                    layer, x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                    attn_stability_control, deterministic, layer_cache,
                     use_reentrant=False, preserve_rng_state=True
                 )
             else:
                 x, aux_loss, layer_cache = layer(
-                    x, freq_cis, segments, moe_router_load_balancing_type,
-                    fp32_attn_output, deterministic, layer_cache
+                    x, freq_cis, bos_mask, segments, moe_router_load_balancing_type,
+                    attn_stability_control, deterministic, layer_cache
                 )
 
             if aux_loss is not None:
@@ -717,18 +724,25 @@ class Transformer(XLLModel):
             total_seqlen_k = cu_seqlens_k[-1].item()
             return cu_seqlens_q.int(), cu_seqlens_k.int(), max_seqlen_q, max_seqlen_k, total_seqlen_k
         elif self.causal_attn_backend == 'swift':
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
             k_segment_idx = segment_idx[:, :end]
             return q_segment_idx, k_segment_idx
         elif self.causal_attn_backend == 'xattn':
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
-            return segment_idx[:, :end]
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
+            # B x L1
+            q_segment_idx = segment_idx[:, start:end]
+            # B x 1
+            last_qidx = q_segment_idx[:, 0:1]
+            # B x L2
+            segment_idx = segment_idx[:, :end]
+            total_seqlen_k = torch.sum(segment_idx >= last_qidx, dim=1).max().item()
+            return segment_idx, total_seqlen_k
         else:
             assert self.causal_attn_backend is None
-            segment_idx = torch.cumsum(bos_mask, dim=-1)
+            segment_idx = get_segment_idx_from_bos_mask(bos_mask)
             # B x L1
             q_segment_idx = segment_idx[:, start:end]
             # B x L2
@@ -748,7 +762,7 @@ class Transformer(XLLModel):
         # Norm
         norm_params_per_block = self.model_dim * (2 if self.apply_rmsnorm else 4)
         if self.qknorm:
-            norm_params_per_block += self.head_dim * (self.num_heads + self.num_kv_heads)
+            norm_params_per_block += self.head_dim * self.num_heads
         # FFN
         ffn_params_per_block = self.model_dim * self.ffn_hidden_dim * (3 if self.swiglu else 2)
         ffn_params_per_block += num_params_in_residual(self.residual_func, self.model_dim, self.residual_heads, self.ffn_hidden_dim)
@@ -791,7 +805,7 @@ class Transformer(XLLModel):
         logits_flops = self.model_dim * self.vocab_size
         norm_flops = self.model_dim * (4 if self.apply_rmsnorm else 8)
         if self.qknorm:
-            norm_flops += self.head_dim * (self.num_heads + self.num_kv_heads) * 2
+            norm_flops += self.head_dim * self.num_heads * 2
         attn_flops = self.model_dim * (self.num_heads + self.num_kv_heads) * self.head_dim * 2
 
         # FFN
