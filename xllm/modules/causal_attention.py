@@ -140,7 +140,7 @@ class CausalSoftmaxAttention(nn.Module):
                 segidx, total_seqlen_k = segments
                 xk = xk[:, -total_seqlen_k:]
                 xv = xv[:, -total_seqlen_k:]
-                bos_mask = bos_mask[:, -total_seqlen_k:] if bos_mask is not None else None
+                bos_mask = bos_mask[:, -total_seqlen_k:]
                 segidx = segidx[:, -total_seqlen_k:]
             else:
                 segidx = None
