@@ -461,6 +461,31 @@ class TimestepDecayNormFwd:
         v = cute.make_tensor(ptr, cute.make_layout(self.VEC)).load().to(Float32)
         return [v[k] for k in range(self.VEC)]
 
+    def _scatter_rows(self, per_row, li):
+        """Sum per-row partials over the TPG lanes of a (row, group) by a reduce-scatter: each shuffle level
+        (largest offset first) exchanges half of the remaining rows, so lane ``li`` ends up with the totals of
+        ``k`` consecutive row slots (block * k + q) after len(row) * RPT * (1 - 1 / 2^s) shuffles instead of
+        len(row) * RPT * log2(TPG). Levels left over when RPT has fewer factors of two than TPG are butterflies
+        (those lanes duplicate the result). Returns (k rows of totals, block, whether this lane writes)."""
+        levels = int(math.log2(self.TPG))
+        n = len(per_row[0])
+        sl = 0
+        while sl < levels and (self.RPT >> sl) % 2 == 0:
+            sl += 1
+        vals = [v for row in per_row for v in row]
+        for o in range(sl):
+            off = self.TPG >> (o + 1)
+            upper = (li & off) != 0
+            half = len(vals) // 2
+            vals = [cutlass.select_(upper, vals[i + half], vals[i])
+                    + cute.arch.shuffle_sync_bfly(cutlass.select_(upper, vals[i], vals[i + half]), offset=off)
+                    for i in range(half)]
+        for o in range(levels - sl):
+            vals = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in vals]
+        k = self.RPT >> sl
+        dup = levels - sl
+        return [vals[q * n:(q + 1) * n] for q in range(k)], li >> dup, (li & ((1 << dup) - 1)) == 0
+
     @cute.jit
     def _moments(self, sX, xs_base, buf, cidx, rsub, gl, w_dyn, inv_dg, sMomM, sMomV):
         """Compute warps: mean and (biased) variance of each (row, group) of this thread's rows.
@@ -488,12 +513,17 @@ class TimestepDecayNormFwd:
             for k in cutlass.range_constexpr(1, npair):
                 acc = cute.arch.fma_packed_f32x2(d[k], d[k], acc)
             sqs.append(acc[0] + acc[1])
-        for o in cutlass.range_constexpr(levels):
-            sqs = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sqs]
-        if cidx % self.TPG == 0:
-            for i in cutlass.range_constexpr(self.RPT):
-                sMomM[buf, gl, rows[i]] = means[i]
-                sMomV[buf, gl, rows[i]] = sqs[i] * inv_dg
+        # the means are needed by every lane (butterflies); the squared deviations only by the lane that
+        # stores the row, so they are reduce-scattered
+        mine, block, writer = self._scatter_rows([(v,) for v in sqs], cidx % self.TPG)
+        for q in cutlass.range_constexpr(len(mine)):
+            slot = block * len(mine) + q
+            mean = means[q]
+            for i in cutlass.range_constexpr(q + len(mine), self.RPT, len(mine)):
+                mean = cutlass.select_(slot == i, means[i], mean)
+            if writer:
+                sMomM[buf, gl, rsub + slot * self.R] = mean
+                sMomV[buf, gl, rsub + slot * self.R] = mine[q][0] * inv_dg
 
     @cute.jit
     def _load_affine(self, gtile, rW, rB, pGamma, pBeta, cidx, w_dyn, vec_dyn):
@@ -1408,7 +1438,6 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         """Compute warps: per (row, group) the mean of x, db = sum(dy * gamma), ds = sum(dy * gamma * (x - cm)),
         and the local gradients (lu, lv) of the decayed mean / variance."""
         npair = self.VEC // 2
-        levels = int(math.log2(self.TPG))
         rows = [rsub + i * self.R for i in range(self.RPT)]
         w = cute.local_tile(sGam[stage, None], (self.VEC,), (cidx,)).load().to(Float32)
         xs = [self._load_row_f32((sX.iterator + (xs_base + row * w_dyn)).align(16)) for row in rows]
@@ -1429,24 +1458,13 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             sx.append(ax[0] + ax[1])
             sg.append(ag[0] + ag[1])
             sgx.append(agx[0] + agx[1])
-        for o in cutlass.range_constexpr(levels):
-            sx = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sx]
-            sg = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sg]
-            sgx = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sgx]
-        # after the butterflies every lane of a group holds the sums of all its rows: lane li of the group
-        # handles row li (the scalar work runs once instead of once per row)
-        li = cidx % self.TPG
-        for p in cutlass.range_constexpr((self.RPT + self.TPG - 1) // self.TPG):
-            lo, hi = p * self.TPG, min((p + 1) * self.TPG, self.RPT)
-            mine_x = sx[lo]
-            mine_g = sg[lo]
-            mine_gx = sgx[lo]
-            for i in cutlass.range_constexpr(lo + 1, hi):
-                mine_x = cutlass.select_(li == i - lo, sx[i], mine_x)
-                mine_g = cutlass.select_(li == i - lo, sg[i], mine_g)
-                mine_gx = cutlass.select_(li == i - lo, sgx[i], mine_gx)
-            if li < hi - lo:
-                row = rsub + (lo + li) * self.R
+        # reduce-scatter: lane li of the group ends up with the totals of its own rows, so the scalar work
+        # below runs once per row instead of once per lane
+        mine, block, writer = self._scatter_rows([(sx[i], sg[i], sgx[i]) for i in range(self.RPT)], cidx % self.TPG)
+        for q in cutlass.range_constexpr(len(mine)):
+            mine_x, mine_g, mine_gx = mine[q]
+            if writer:
+                row = rsub + (block * len(mine) + q) * self.R
                 cm = sCm[stage, gl, row]
                 rs = sR[stage, gl, row]
                 cnt = sMeta[stage, row] >> 2
