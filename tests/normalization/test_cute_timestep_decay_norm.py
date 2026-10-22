@@ -1,0 +1,116 @@
+"""Check the CuTe DSL timestep decay norm forward against an independent FP64 PyTorch reference.
+
+Run from the repository root:
+    python -m pytest tests/normalization/test_cute_timestep_decay_norm.py
+
+The kernel module is loaded from its file so that the test does not need the compiled
+xllm_extension that the xllm.modules package imports.
+"""
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+import torch
+
+_PATH = Path(__file__).resolve().parents[2] / "xllm/modules/fused_ops/cute/timestep_decay_norm.py"
+_spec = importlib.util.spec_from_file_location("cute_timestep_decay_norm", _PATH)
+tsdn = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(tsdn)
+
+BETA1, BETA2, EPS = 0.999, 0.9999, 1e-5
+
+
+def reference_fwd(x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, num_groups, padding_mask):
+    """FP64 time loop: returns y, count, mean, var, cummean [B, G, L], cumrstd [B, G, L], step count [B, L]."""
+    B, L, H = x.shape
+    G = num_groups
+    xd = x.double().view(B, L, G, H // G)
+    mt = xd.mean(-1)
+    vt = xd.var(-1, correction=0)
+    bos = bos_mask if bos_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=x.device)
+    pad = padding_mask if padding_mask is not None else torch.zeros(B, L, dtype=torch.bool, device=x.device)
+    count = prev_count.clone()
+    M = prev_mean.double()
+    V = prev_var.double()
+    cms, crs, cnts = [], [], []
+    for t in range(L):
+        live = (~pad[:, t]).view(B, 1)
+        reset = (bos[:, t] & ~pad[:, t]).view(B, 1)
+        M = torch.where(live, torch.where(reset, 0.0, BETA1) * M + (1 - BETA1) * mt[:, t], M)
+        V = torch.where(live, torch.where(reset, 0.0, BETA2) * V + (1 - BETA2) * vt[:, t], V)
+        count = torch.where(live.view(B), torch.where(reset.view(B), 1, count + 1), count)
+        c = count.double().view(B, 1)
+        ok = c > 0
+        cms.append(torch.where(ok, M / (1 - BETA1 ** c).clamp_min(1e-300), 0.0))
+        crs.append(torch.where(ok, torch.rsqrt(V / (1 - BETA2 ** c).clamp_min(1e-300) + EPS), EPS ** -0.5))
+        cnts.append(count.clone())
+    cummean = torch.stack(cms, dim=2)
+    cumrstd = torch.stack(crs, dim=2)
+    xn = (xd - cummean.transpose(1, 2).unsqueeze(-1)) * cumrstd.transpose(1, 2).unsqueeze(-1)
+    y = (xn.reshape(B, L, H) * gamma.double() + beta.double()).masked_fill(pad.unsqueeze(-1), 0.0)
+    return y, count, M, V, cummean, cumrstd, torch.stack(cnts, dim=1)
+
+
+def make_inputs(B, L, H, G, dtype, bos_ratio, pad_ratio, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = (torch.randn(B, L, H, device="cuda", generator=g) * 2 + 0.5).to(dtype)
+    bos = torch.rand(B, L, device="cuda", generator=g) < bos_ratio if bos_ratio > 0 else None
+    pad = torch.rand(B, L, device="cuda", generator=g) < pad_ratio if pad_ratio > 0 else None
+    prev_count = torch.randint(0, 50, (B,), device="cuda", generator=g)
+    prev_mean = (torch.randn(B, G, device="cuda", generator=g) * 0.1).to(dtype)
+    prev_var = (torch.rand(B, G, device="cuda", generator=g) * 0.1).to(dtype)
+    gamma = torch.randn(H, device="cuda", generator=g).to(dtype)
+    beta = torch.randn(H, device="cuda", generator=g).to(dtype)
+    return x, bos, prev_count, prev_mean, prev_var, gamma, beta, pad
+
+
+def rel_err(out, ref):
+    return ((out.double() - ref).abs().max() / ref.abs().max().clamp_min(1e-30)).item()
+
+
+CASES = [  # B, L, H, G, dtype, bos_ratio, pad_ratio, config
+    (2, 128, 256, 4, torch.float32, 0.0, 0.0, None),
+    (3, 300, 256, 4, torch.float32, 0.02, 0.0, None),  # L not a multiple of the tile length
+    (2, 517, 512, 8, torch.float32, 0.02, 0.1, None),
+    (2, 517, 512, 16, torch.float32, 0.01, 0.1, None),
+    (2, 1000, 256, 32, torch.bfloat16, 0.01, 0.05, None),  # several groups per tile
+    (1, 9000, 1024, 16, torch.bfloat16, 0.0005, 0.0, None),  # > 32 segments: multi-window look-back
+    (2, 4100, 2048, 32, torch.bfloat16, 0.001, 0.01, None),
+    (2, 700, 512, 8, torch.bfloat16, 0.01, 0.0, (2, 64, 128, 4, 2, 1)),
+    (2, 700, 512, 8, torch.bfloat16, 0.01, 0.0, (1, 256, 256, 2, 2, 1)),
+    (3, 2000, 512, 8, torch.bfloat16, 0.01, 0.05, (1, 64, 64, 4, 1, 1)),
+    (2, 333, 512, 8, torch.float16, 0.01, 0.05, None),
+]
+
+
+@pytest.mark.parametrize("B,L,H,G,dtype,bos_ratio,pad_ratio,config", CASES)
+def test_forward_matches_reference(B, L, H, G, dtype, bos_ratio, pad_ratio, config):
+    x, bos, pc, pm, pv, w, b, pad = make_inputs(B, L, H, G, dtype, bos_ratio, pad_ratio)
+    y, count, mean, var, cummean, cumrstd, step_count = tsdn.timestep_decay_norm_fwd(
+        x, bos, pc, pm, pv, w, b, pad, G, BETA1, BETA2, EPS, config)
+    ry, rcount, rmean, rvar, rcm, rcr, rsc = reference_fwd(x, bos, pc, pm, pv, w, b, G, pad)
+    # fp32 matches the reference to fp32 accumulation error; 16-bit outputs add their own rounding
+    tol = 3e-4 if dtype == torch.float32 else 1.5e-2
+    assert rel_err(y, ry) < tol
+    assert rel_err(mean, rmean) < tol
+    assert rel_err(var, rvar) < tol
+    assert rel_err(cummean, rcm) < 3e-4
+    assert rel_err(cumrstd, rcr) < 3e-4
+    assert torch.equal(count, rcount)
+    assert torch.equal(step_count.long(), rsc)
+
+
+def test_repeated_interleaved_calls():
+    """Many back-to-back calls of different shapes: catches races in the pipeline and the look-back."""
+    cases = []
+    for B, L, H, G, pad_ratio in [(4, 4100, 2048, 32, 0.02), (2, 9000, 1024, 16, 0.0), (1, 300, 512, 8, 0.05)]:
+        args = make_inputs(B, L, H, G, torch.bfloat16, 0.002, pad_ratio, seed=B * L)
+        x, bos, pc, pm, pv, w, b, pad = args
+        call = (x, bos, pc, pm, pv, w, b, pad, G, BETA1, BETA2, EPS)
+        cases.append((call, [t.clone() for t in tsdn.timestep_decay_norm_fwd(*call)]))
+    for _ in range(20):
+        for call, first in cases:
+            for out, ref in zip(tsdn.timestep_decay_norm_fwd(*call), first):
+                scale = max(1.0, ref.double().abs().max().item())
+                assert (out.double() - ref.double()).abs().max().item() <= 1e-3 * scale
