@@ -1291,7 +1291,7 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                 else:
                     self._aggregate_bwd(tk, jt % nb, abuf, jt % stages, lane, mAggW, sMeta, sU, sV, sRow,
                                         sAgg, sAggMaskI, beta1, beta2)
-                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff + 32)
                     jt = jt + 1
         elif warp <= self.NCW + self.NRW:
             # ================================ resolve warps ================================================
@@ -1308,7 +1308,7 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                     self._resolve_bwd(tk, sTkInfo, jt % nb, abuf, num_chains, num_segs, lane,
                                       mAggW, mIncW, mZeroCount, mMeanGrad, mVarGrad, mScratchCount, mPrevMeanGrad, mPrevVarGrad,
                                       sAgg, sAggMaskI, sIn[rw, None, None], sInC[rw, None], log2_beta1, log2_beta2)
-                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff)
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff + 32)
                     jt = jt + self.NRW
         else:
             # ================================ producer warp ================================================
@@ -1478,15 +1478,14 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
 
     @cute.jit
     def _aggregate_bwd(self, tk, h, a, stage, lane, mAggW, sMeta, sU, sV, sRow, sAgg, sAggMaskI, beta1, beta2):
-        """Aggregate warp: time-reversed local scan of a tile. Publishes the tile aggregate; per row stores
+        """Aggregate warp: time-reversed local scan of a tile. Publishes the tile aggregate and hands the tile to
+        its resolve warp first (both are on the look-back's critical path); then per row stores
         q = (exclusive local prefix) + (local gradient) in place of the local gradient, and the exclusive
         prefix's (k, reset) and the row's live bit."""
         identity = (Int32(0), Int32(0), Float32(1.0), Float32(1.0), Float32(0.0), Float32(0.0))
         meta = cute.local_tile(sMeta[stage, None], (self.LPR,), (lane,)).load()
         codes = [meta[jj] & 3 for jj in range(self.LPR)]
-        rq = cute.make_rmem_tensor((self.LPR,), Float32)
-        rqv = cute.make_rmem_tensor((self.LPR,), Float32)
-        rrow = cute.make_rmem_tensor((self.LPR,), Int32)
+        lus, lvs, elemss, accs = [], [], [], []
         for g in cutlass.range_constexpr(self.Gt):
             lu = cute.local_tile(sU[h, g, None], (self.LPR,), (lane,)).load()
             lv = cute.local_tile(sV[h, g, None], (self.LPR,), (lane,)).load()
@@ -1507,7 +1506,26 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             for o in cutlass.range_constexpr(5):
                 other = _shuffle_elem(acc, 1 << o, up=False)
                 acc = _select_elem(lane + (1 << o) < 32, _compose(other, acc), acc)
-            state = _select_elem(lane < 31, _shuffle_elem(acc, 1, up=False), identity)
+            if lane == 0:
+                hdr = _agg_header(acc[0], acc[1])
+                cute.arch.store((mAggW.iterator + (tk * self.Gt + g) * 2).llvm_ptr, _pack(hdr, acc[4]), sem="relaxed", scope="gpu")
+                cute.arch.store((mAggW.iterator + (tk * self.Gt + g) * 2 + 1).llvm_ptr, _pack(hdr, acc[5]), sem="relaxed", scope="gpu")
+                sAgg[a, g, 0] = acc[4]
+                sAgg[a, g, 1] = acc[5]
+                if g == 0:
+                    sAggMaskI[a, 0] = acc[0]
+                    sAggMaskI[a, 1] = acc[1]
+            lus.append(lu)
+            lvs.append(lv)
+            elemss.append(elems)
+            accs.append(acc)
+        cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + a, number_of_threads=64)
+        rq = cute.make_rmem_tensor((self.LPR,), Float32)
+        rqv = cute.make_rmem_tensor((self.LPR,), Float32)
+        rrow = cute.make_rmem_tensor((self.LPR,), Int32)
+        for g in cutlass.range_constexpr(self.Gt):
+            lu, lv, elems = lus[g], lvs[g], elemss[g]
+            state = _select_elem(lane < 31, _shuffle_elem(accs[g], 1, up=False), identity)
             for jj in cutlass.range_constexpr(self.LPR):
                 r = self.LPR - 1 - jj
                 rq[r] = state[4] + lu[r]
@@ -1518,15 +1536,6 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             cute.local_tile(sV[h, g, None], (self.LPR,), (lane,)).store(rqv.load())
             if g == 0:
                 cute.local_tile(sRow[a, None], (self.LPR,), (lane,)).store(rrow.load())
-            if lane == 0:
-                hdr = _agg_header(acc[0], acc[1])
-                cute.arch.store((mAggW.iterator + (tk * self.Gt + g) * 2).llvm_ptr, _pack(hdr, acc[4]), sem="relaxed", scope="gpu")
-                cute.arch.store((mAggW.iterator + (tk * self.Gt + g) * 2 + 1).llvm_ptr, _pack(hdr, acc[5]), sem="relaxed", scope="gpu")
-                sAgg[a, g, 0] = acc[4]
-                sAgg[a, g, 1] = acc[5]
-                if g == 0:
-                    sAggMaskI[a, 0] = acc[0]
-                    sAggMaskI[a, 1] = acc[1]
 
     @cute.jit
     def _resolve_bwd(self, tk, sTkInfo, h, a, num_chains, num_segs, lane,
@@ -1553,7 +1562,7 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         stage = j % stages
         gtile = sTile[stage, 2]
         h = j % nb
-        cute.arch.barrier(barrier_id=BAR_BASE + self.NB + self.NA + h, number_of_threads=self.NC + 32)
+        cute.arch.barrier(barrier_id=BAR_BASE + self.NB + self.NA + h, number_of_threads=self.NC + 64)
         w = cute.local_tile(sGam[stage, None], (self.VEC,), (cidx,)).load().to(Float32)
         npair = self.VEC // 2
         xs_base = stage * tile_elems + cidx * vec_dyn
