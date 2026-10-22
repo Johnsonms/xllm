@@ -1652,22 +1652,25 @@ def step_counts(bos_mask: Optional[torch.Tensor], padding_mask: Optional[torch.T
 
 @lru_cache(maxsize=None)
 def default_bwd_config(dtype: torch.dtype, H: int, G: int) -> Tuple[int, int, int, int, int, int, int]:
-    """(groups_per_tile, tile_len, compute_threads, ctas_per_sm, prefetch, lag, vec_mult): x and dy tiles of
-    ~16 KiB each."""
+    """(groups_per_tile, tile_len, compute_threads, ctas_per_sm, prefetch, lag, vec_mult).
+
+    One CTA per SM with the longest tile that fits in shared memory: the per-tile look-back latency is
+    what limits the backward, so fewer, larger tiles beat more resident CTAs."""
     esize = dtype.itemsize
     Dg = H // G
     gt = 1
     while gt * Dg * esize < 64 and G % (gt * 2) == 0 and gt < 4:
         gt *= 2
-    row_bytes = gt * Dg * esize
-    tile_len = 256
-    while tile_len > 64 and tile_len * row_bytes > 16 * 1024:
-        tile_len //= 2
-    if tile_len == 128:
-        tile_len = 96  # leaves shared memory for two CTAs per SM
     prefetch, lag, nc = 1, 1, 256
-    ctas = max(1, min(3, SMEM_PER_SM // (_bwd_smem_bytes(esize, Dg, gt, tile_len, prefetch, lag, nc) + 1024)))
-    return gt, tile_len, nc, ctas, prefetch, lag, 1
+    vec = math.gcd(Dg, 128 // max(esize * 8, 16))
+    rows_per_pass = nc // (gt * Dg // vec)
+    step = math.lcm(32, rows_per_pass)
+    tile_len = step
+    for t in range(256 // step * step, step - 1, -step):
+        if _bwd_smem_bytes(esize, Dg, gt, t, prefetch, lag, nc) + 1024 <= SMEM_PER_SM:
+            tile_len = t
+            break
+    return gt, tile_len, nc, 1, prefetch, lag, 1
 
 
 def _bwd_smem_bytes(esize: int, Dg: int, gt: int, tile_len: int, prefetch: int, lag: int, nc: int) -> int:
