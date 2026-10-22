@@ -48,6 +48,12 @@ def timenorm_fwd(
     backend: str,
 ):
     gamma = gamma + 1.0
+    if backend == 'cute':
+        from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_fwd
+        y, count, mean, var, cummean, cumrstd, _ = timestep_decay_norm_fwd(
+            x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
+        )
+        return y, count, mean, var, cummean, cumrstd
     timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_cub_fwd if backend == 'cub' else xllm_ops.group_timestep_decay_norm_fwd
     y, count, mean, var, cummean, cumrstd = timestep_norm_fwd(
         x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
@@ -75,7 +81,15 @@ def timenorm_bwd(
     backend: str,
 ):
     gamma = gamma + 1.0
-    if backend == 'cub':
+    if backend == 'cute':
+        assert not memory_efficient
+        from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_bwd
+        # per-step counts are recomputed from prev_count and the bos mask
+        x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_decay_norm_bwd(
+            y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, None,
+            gamma, None, num_groups, beta1, beta2, prev_count=prev_count
+        )
+    elif backend == 'cub':
         assert not memory_efficient
         x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = xllm_ops.group_timestep_decay_norm_cub_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd,

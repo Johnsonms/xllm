@@ -109,8 +109,49 @@ def test_repeated_interleaved_calls():
         x, bos, pc, pm, pv, w, b, pad = args
         call = (x, bos, pc, pm, pv, w, b, pad, G, BETA1, BETA2, EPS)
         cases.append((call, [t.clone() for t in tsdn.timestep_decay_norm_fwd(*call)]))
+    # The look-back composes whichever predecessor states are published first, so results are not
+    # bitwise reproducible (fp32 rounding can flip a 16-bit output by one ulp); races would be far larger.
     for _ in range(20):
         for call, first in cases:
             for out, ref in zip(tsdn.timestep_decay_norm_fwd(*call), first):
                 scale = max(1.0, ref.double().abs().max().item())
-                assert (out.double() - ref.double()).abs().max().item() <= 1e-3 * scale
+                assert (out.double() - ref.double()).abs().max().item() <= 1e-2 * scale
+
+
+BWD_CASES = [  # B, L, H, G, dtype, bos_ratio, pad_ratio
+    (2, 128, 256, 4, torch.float32, 0.0, 0.0),
+    (3, 300, 256, 4, torch.float32, 0.02, 0.0),
+    (2, 517, 512, 8, torch.float32, 0.02, 0.1),
+    (2, 1000, 256, 32, torch.bfloat16, 0.01, 0.05),
+    (1, 9000, 1024, 16, torch.bfloat16, 0.0005, 0.0),
+    (2, 4100, 2048, 32, torch.bfloat16, 0.001, 0.01),
+]
+
+
+@pytest.mark.parametrize("recompute_counts", [False, True])
+@pytest.mark.parametrize("B,L,H,G,dtype,bos_ratio,pad_ratio", BWD_CASES)
+def test_backward_matches_autograd(B, L, H, G, dtype, bos_ratio, pad_ratio, recompute_counts):
+    x, bos, pc, pm, pv, w, b, pad = make_inputs(B, L, H, G, dtype, bos_ratio, pad_ratio)
+    _, _, _, _, cummean, cumrstd, step_count = tsdn.timestep_decay_norm_fwd(
+        x, bos, pc, pm, pv, w, b, pad, G, BETA1, BETA2, EPS)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    dy = torch.randn(B, L, H, device="cuda", generator=g).to(dtype)
+    mean_grad = torch.randn(B, G, device="cuda", generator=g).to(dtype)
+    var_grad = torch.randn(B, G, device="cuda", generator=g).to(dtype)
+    grads = tsdn.timestep_decay_norm_bwd(
+        dy, mean_grad, var_grad, x, bos, cummean, cumrstd, None if recompute_counts else step_count, w, pad,
+        G, BETA1, BETA2, prev_count=pc)
+    leaves = [t.double().requires_grad_() for t in (x, pm, pv, w, b)]
+    ry, _, rmean, rvar, _, _, _ = reference_fwd(leaves[0], bos, pc, leaves[1], leaves[2], leaves[3], leaves[4], G, pad)
+    ((ry * dy.double()).sum() + (rmean * mean_grad.double()).sum() + (rvar * var_grad.double()).sum()).backward()
+    tol = 3e-4 if dtype == torch.float32 else 1e-2
+    for out, leaf in zip(grads, leaves):
+        assert rel_err(out, leaf.grad) < tol
+
+
+def test_step_counts_match_forward():
+    x, bos, pc, pm, pv, w, b, pad = make_inputs(3, 2000, 256, 4, torch.float32, 0.01, 0.05)
+    step_count = tsdn.timestep_decay_norm_fwd(x, bos, pc, pm, pv, w, b, pad, 4, BETA1, BETA2, EPS)[6]
+    assert torch.equal(step_count, tsdn.step_counts(bos, pad, pc, 2000))
+    assert torch.equal(tsdn.timestep_decay_norm_fwd(x, None, pc, pm, pv, w, b, None, 4, BETA1, BETA2, EPS)[6],
+                       tsdn.step_counts(None, None, pc, 2000))
