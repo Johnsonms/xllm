@@ -1024,6 +1024,12 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                  groups_per_tile, tile_len, num_threads, prefetch, lag, min_ctas_per_sm=0, vec_mult=1):
         super().__init__(dtype, w_dtype, s_dtype, hidden, num_groups, has_bos, has_pad,
                          groups_per_tile, tile_len, num_threads, prefetch, lag, min_ctas_per_sm, vec_mult)
+        # two resolve warps take alternate tiles (the look-back latency of one overlaps the other); the
+        # aggregate -> resolve hand-off then needs an even number of buffers so that each resolve warp
+        # owns its own barrier ids
+        self.NRW = 2
+        self.NA = 4
+        self.NT = self.NC + 32 * (2 + self.NRW)
         self.BAR_FINAL = BAR_BASE + 2 * self.NB + self.NA + self.S  # compute warps done -> aggregate warp
         assert self.BAR_FINAL < 16, "named barriers"
         assert self.D == 1, "the dgamma / dbeta hand-off to the aggregate warp assumes a lag of one tile"
@@ -1156,14 +1162,13 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         sM = smem.allocate_tensor(Float32, stat_layout, byte_alignment=16)
         sU = smem.allocate_tensor(Float32, stat_layout, byte_alignment=16)
         sV = smem.allocate_tensor(Float32, stat_layout, byte_alignment=16)
-        sInfo = smem.allocate_tensor(Int32, cute.make_layout((self.NB, self.T), stride=(self.T, 1)), byte_alignment=16)
         sRow = smem.allocate_tensor(Int32, cute.make_layout((self.NA, self.T), stride=(self.T, 1)), byte_alignment=16)
         sAgg = smem.allocate_tensor(Float32, cute.make_layout((self.NA, self.Gt, 2), stride=(2 * self.Gt, 2, 1)), byte_alignment=16)
         sAggMaskI = smem.allocate_tensor(Int32, cute.make_layout((self.NA, 2), stride=(2, 1)), byte_alignment=8)
         sTk = smem.allocate_tensor(Int32, cute.make_layout(self.NA), byte_alignment=8)
         sTkInfo = smem.allocate_tensor(Int32, cute.make_layout((self.NA, 4), stride=(4, 1)), byte_alignment=16)
-        sIn = smem.allocate_tensor(Float32, cute.make_layout((self.Gt, 2), stride=(2, 1)), byte_alignment=16)
-        sInC = smem.allocate_tensor(Int32, cute.make_layout(1))
+        sIn = smem.allocate_tensor(Float32, cute.make_layout((self.NRW, self.Gt, 2), stride=(2 * self.Gt, 2, 1)), byte_alignment=16)
+        sInC = smem.allocate_tensor(Int32, cute.make_layout((self.NRW, 1), stride=(1, 1)), byte_alignment=8)
         # per-warp dgamma / dbeta partials of a tile, double buffered: written by the compute warps when they
         # finish tile k (iteration k+1), summed over the warps by the aggregate warp after MOM(k+2)
         sRed = smem.allocate_tensor(Float32, cute.make_layout((2, self.NCW, 2 * self.W), stride=(self.NCW * 2 * self.W, 2 * self.W, 1)), byte_alignment=16)
@@ -1205,9 +1210,10 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                     cute.arch.barrier_arrive(barrier_id=BAR_BASE + buf, number_of_threads=handoff)
                     old = rOld[0]
                     if old >= 0:
-                        self._finish_bwd(sTile, it - self.D, sGam, sX, sDy, sM, sCm, sR, sU, sV, sInfo,
+                        self._finish_bwd(sTile, it - self.D, sGam, sX, sDy, sM, sCm, sR, sU, sV, sRow, sIn,
                                          sRed, sRedInfo, num_chains, num_segs, tidx, warp, lane,
-                                         cidx, rsub, gl, stages, nb, tile_elems, w_dyn, vec_dyn, inv_dg)
+                                         cidx, rsub, gl, stages, nb, na, tile_elems, w_dyn, vec_dyn, inv_dg,
+                                         beta1, beta2, log2_beta1, log2_beta2)
                     for d in cutlass.range_constexpr(self.D - 1):
                         rOld[d] = rOld[d + 1]
                     rOld[self.D - 1] = cur
@@ -1216,9 +1222,10 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             for d in cutlass.range_constexpr(self.D):
                 old = rOld[d]
                 if old >= 0:
-                    self._finish_bwd(sTile, it - self.D + d, sGam, sX, sDy, sM, sCm, sR, sU, sV, sInfo,
+                    self._finish_bwd(sTile, it - self.D + d, sGam, sX, sDy, sM, sCm, sR, sU, sV, sRow, sIn,
                                      sRed, sRedInfo, num_chains, num_segs, tidx, warp, lane,
-                                     cidx, rsub, gl, stages, nb, tile_elems, w_dyn, vec_dyn, inv_dg)
+                                     cidx, rsub, gl, stages, nb, na, tile_elems, w_dyn, vec_dyn, inv_dg,
+                                     beta1, beta2, log2_beta1, log2_beta2)
             cute.arch.barrier_arrive(barrier_id=self.BAR_FINAL, number_of_threads=handoff)
         elif warp == self.NCW:
             # ================================ aggregate warp ===============================================
@@ -1236,6 +1243,12 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                     self._reduce_partials(jt % 2, lane, sRed, sRedInfo, mGammaPart, mBetaPart, num_segs)
                 if tk >= num_tiles:
                     running = Int32(0)
+                    # also stop the other resolve warp, which waits for the following tile
+                    nbuf = (jt + 1) % na
+                    if lane == 0:
+                        sTk[nbuf] = tk
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + nbuf, number_of_threads=64)
                     # the last tile's partials are written during the compute warps' drain
                     cute.arch.barrier(barrier_id=self.BAR_FINAL, number_of_threads=handoff)
                     if jt >= 1:
@@ -1243,11 +1256,12 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                 else:
                     self._aggregate_bwd(tk, jt % nb, abuf, jt % stages, lane, mAggW, sMeta, sU, sV, sRow,
                                         sAgg, sAggMaskI, beta1, beta2)
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
                     jt = jt + 1
-                cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
-        elif warp == self.NCW + 1:
-            # ================================ resolve warp =================================================
-            jt = Int32(0)
+        elif warp <= self.NCW + self.NRW:
+            # ================================ resolve warps ================================================
+            rw = warp - self.NCW - 1
+            jt = rw
             running = Int32(1)
             while running != 0:
                 abuf = jt % na
@@ -1258,9 +1272,9 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                 else:
                     self._resolve_bwd(tk, sTkInfo, jt % nb, abuf, num_chains, num_segs, lane,
                                       mAggW, mIncW, mZeroCount, mMeanGrad, mVarGrad, mScratchCount, mPrevMeanGrad, mPrevVarGrad,
-                                      sRow, sAgg, sAggMaskI, sIn, sInC, sU, sV, sInfo, beta1, beta2, log2_beta1, log2_beta2)
+                                      sAgg, sAggMaskI, sIn[rw, None, None], sInC[rw, None], log2_beta1, log2_beta2)
                     cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff)
-                    jt = jt + 1
+                    jt = jt + self.NRW
         else:
             # ================================ producer warp ================================================
             gX = cute.local_tile(mXt, (1, self.T, self.W), (None, None, None))
@@ -1405,7 +1419,6 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         npair = self.VEC // 2
         levels = int(math.log2(self.TPG))
         rows = [rsub + i * self.R for i in range(self.RPT)]
-        leader = cidx % self.TPG == 0
         w = cute.local_tile(sGam[stage, None], (self.VEC,), (cidx,)).load().to(Float32)
         xs = [cute.make_tensor((sX.iterator + (xs_base + row * w_dyn)).align(16), cute.make_layout(self.VEC)).load().to(Float32)
               for row in rows]
@@ -1431,19 +1444,29 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             sx = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sx]
             sg = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sg]
             sgx = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sgx]
-        if leader:
-            for i in cutlass.range_constexpr(self.RPT):
-                row = rows[i]
+        # after the butterflies every lane of a group holds the sums of all its rows: lane li of the group
+        # handles row li (the scalar work runs once instead of once per row)
+        li = cidx % self.TPG
+        for p in cutlass.range_constexpr((self.RPT + self.TPG - 1) // self.TPG):
+            lo, hi = p * self.TPG, min((p + 1) * self.TPG, self.RPT)
+            mine_x = sx[lo]
+            mine_g = sg[lo]
+            mine_gx = sgx[lo]
+            for i in cutlass.range_constexpr(lo + 1, hi):
+                mine_x = cutlass.select_(li == i - lo, sx[i], mine_x)
+                mine_g = cutlass.select_(li == i - lo, sg[i], mine_g)
+                mine_gx = cutlass.select_(li == i - lo, sgx[i], mine_gx)
+            if li < hi - lo:
+                row = rsub + (lo + li) * self.R
                 cm = sCm[stage, gl, row]
                 rs = sR[stage, gl, row]
                 cnt = sMeta[stage, row] >> 2
-                db = sg[i]
-                ds = sgx[i] - cm * db
+                ds = mine_gx - cm * mine_g
                 cf = Int32(cnt).to(Float32)
                 inv1 = cute.arch.rcp_approx(1.0 - cute.math.exp2(cf * log2_beta1, fastmath=True))
                 inv2 = cute.arch.rcp_approx(1.0 - cute.math.exp2(cf * log2_beta2, fastmath=True))
-                sM[buf, gl, row] = sx[i] * inv_dg
-                sU[buf, gl, row] = cutlass.select_(cnt > 0, -rs * db * inv1, Float32(0.0))
+                sM[buf, gl, row] = mine_x * inv_dg
+                sU[buf, gl, row] = cutlass.select_(cnt > 0, -rs * mine_g * inv1, Float32(0.0))
                 sV[buf, gl, row] = cutlass.select_(cnt > 0, -0.5 * rs * rs * rs * ds * inv2, Float32(0.0))
 
     @cute.jit
@@ -1501,8 +1524,9 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
     @cute.jit
     def _resolve_bwd(self, tk, sTkInfo, h, a, num_chains, num_segs, lane,
                      mAggW, mIncW, mZeroCount, mMeanGrad, mVarGrad, mScratchCount, mPrevMeanGrad, mPrevVarGrad,
-                     sRow, sAgg, sAggMaskI, sIn, sInC, sU, sV, sInfo, beta1, beta2, log2_beta1, log2_beta2):
-        """Resolve warp: look-back along the reversed chain, then per row du = (1 - beta1) * (p * U + qu)."""
+                     sAgg, sAggMaskI, sIn, sInC, log2_beta1, log2_beta2):
+        """Resolve warp: look-back along the reversed chain; leaves the tile's entry state (U, V) in sIn.
+        (The compute warps turn it into du = (1 - beta1) * (p * U + qu) per row.)"""
         b = sTkInfo[a, 0]
         rseg = num_segs - 1 - sTkInfo[a, 1]
         gtile = sTkInfo[a, 2]
@@ -1512,36 +1536,11 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
                        mAggW, mIncW, mZeroCount, mMeanGrad, mVarGrad, mScratchCount, mPrevMeanGrad, mPrevVarGrad,
                        sAgg[a, None, None], sAggMaskI[a, None], sIn, sInC, log2_beta1, log2_beta2)
         cute.arch.sync_warp()
-        info = cute.local_tile(sRow[a, None], (self.LPR,), (lane,)).load()
-        rdu = cute.make_rmem_tensor((self.LPR,), Float32)
-        rdv = cute.make_rmem_tensor((self.LPR,), Float32)
-        rinfo = cute.make_rmem_tensor((self.LPR,), Int32)
-        dec1 = []
-        dec2 = []
-        lives = []
-        for jj in cutlass.range_constexpr(self.LPR):
-            kf = Int32(info[jj] >> 2).to(Float32)
-            reset = (info[jj] >> 1) & 1
-            dec1.append(cutlass.select_(reset != 0, Float32(0.0), cute.math.exp2(kf * log2_beta1, fastmath=True)))
-            dec2.append(cutlass.select_(reset != 0, Float32(0.0), cute.math.exp2(kf * log2_beta2, fastmath=True)))
-            lives.append(Int32(info[jj] & 1).to(Float32))
-            rinfo[jj] = info[jj] & 1
-        for g in cutlass.range_constexpr(self.Gt):
-            u0 = sIn[g, 0]
-            v0 = sIn[g, 1]
-            qu = cute.local_tile(sU[h, g, None], (self.LPR,), (lane,)).load()
-            qv = cute.local_tile(sV[h, g, None], (self.LPR,), (lane,)).load()
-            for jj in cutlass.range_constexpr(self.LPR):
-                rdu[jj] = (1.0 - beta1) * (dec1[jj] * u0 + qu[jj]) * lives[jj]
-                rdv[jj] = (1.0 - beta2) * (dec2[jj] * v0 + qv[jj]) * lives[jj]
-            cute.local_tile(sU[h, g, None], (self.LPR,), (lane,)).store(rdu.load())
-            cute.local_tile(sV[h, g, None], (self.LPR,), (lane,)).store(rdv.load())
-        cute.local_tile(sInfo[h, None], (self.LPR,), (lane,)).store(rinfo.load())
 
     @cute.jit
-    def _finish_bwd(self, sTile, j, sGam, sX, sDy, sM, sCm, sR, sU, sV, sInfo, sRed,
+    def _finish_bwd(self, sTile, j, sGam, sX, sDy, sM, sCm, sR, sU, sV, sRow, sIn, sRed,
                     sRedInfo, num_chains, num_segs, tidx, warp, lane, cidx, rsub, gl,
-                    stages, nb, tile_elems, w_dyn, vec_dyn, inv_dg):
+                    stages, nb, na, tile_elems, w_dyn, vec_dyn, inv_dg, beta1, beta2, log2_beta1, log2_beta2):
         """Compute warps: dx of tile ``tk`` (local index ``j``) in place of dy, released to the producer for
         the TMA store, and the tile's dgamma / dbeta partials."""
         stage = j % stages
@@ -1560,16 +1559,35 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         dys = [t.load().to(Float32) for t in dyt]
         accg = [(Float32(0.0), Float32(0.0)) for _ in range(npair)]
         accb = [(Float32(0.0), Float32(0.0)) for _ in range(npair)]
-        for i in cutlass.range_constexpr(self.RPT):
-            row = rows[i]
-            live = Int32(sInfo[h, row]).to(Float32)
-            rs = sR[stage, gl, row] * live
+        # per-row coefficients: lane li of each group computes those of row p * TPG + li, the others fetch them
+        abuf = j % na
+        li = cidx % self.TPG
+        group_lane0 = lane - li
+        coefs = []
+        for p in cutlass.range_constexpr((self.RPT + self.TPG - 1) // self.TPG):
+            lo, hi = p * self.TPG, min((p + 1) * self.TPG, self.RPT)
+            row_l = rsub + (lo + cutlass.min(li, hi - lo - 1)) * self.R
+            # the row's gradient of the decayed statistics from the tile's entry state and the row's local
+            # prefix: du = (1 - beta1) * (beta1^k * U + qu), with k / reset of the prefix (live rows only)
+            info = sRow[abuf, row_l]
+            live_l = Int32(info & 1).to(Float32)
+            kf = Int32(info >> 2).to(Float32)
+            keep = ((info >> 1) & 1) == 0
+            dec1 = cutlass.select_(keep, cute.math.exp2(kf * log2_beta1, fastmath=True), Float32(0.0))
+            dec2 = cutlass.select_(keep, cute.math.exp2(kf * log2_beta2, fastmath=True), Float32(0.0))
+            du = (1.0 - beta1) * (dec1 * sIn[j % self.NRW, gl, 0] + sU[h, gl, row_l]) * live_l
+            dv = (1.0 - beta2) * (dec2 * sIn[j % self.NRW, gl, 1] + sV[h, gl, row_l]) * live_l
+            rs_l = sR[stage, gl, row_l] * live_l
             # dx = dy * rstd * gamma + (du + 2 dv (x - m)) / Dg = dy * (gamma * rstd) + (x * a + c)
-            # (zero on padded rows: du, dv and rs are 0 there)
-            a = 2.0 * sV[h, gl, row] * inv_dg
-            c = sU[h, gl, row] * inv_dg - sM[h, gl, row] * a
-            # dgamma += dy * (x - cm) * rstd, dbeta += dy   (live rows)
-            ncr = -sCm[stage, gl, row] * rs
+            # (zero on padded rows: du, dv and rs are 0 there); dgamma += dy * (x - cm) * rstd, dbeta += dy
+            a_l = 2.0 * dv * inv_dg
+            c_l = du * inv_dg - sM[h, gl, row_l] * a_l
+            ncr_l = -sCm[stage, gl, row_l] * rs_l
+            for i in cutlass.range_constexpr(lo, hi):
+                src = group_lane0 + (i - lo)
+                coefs.append(tuple(cute.arch.shuffle_sync(v, src) for v in (live_l, rs_l, a_l, c_l, ncr_l)))
+        for i in cutlass.range_constexpr(self.RPT):
+            live, rs, a, c, ncr = coefs[i]
             dx = cute.make_rmem_tensor((self.VEC,), Float32)
             for k in cutlass.range_constexpr(npair):
                 xp = (xs[i][2 * k], xs[i][2 * k + 1])
@@ -1655,9 +1673,9 @@ def default_bwd_config(dtype: torch.dtype, H: int, G: int) -> Tuple[int, int, in
 def _bwd_smem_bytes(esize: int, Dg: int, gt: int, tile_len: int, prefetch: int, lag: int, nc: int) -> int:
     """Shared memory of one backward CTA (mirrors the allocations in the kernel, plus alignment slack)."""
     T, W = tile_len, gt * Dg
-    S, NB, NA = lag + 1 + prefetch, lag + 2, lag + 2
+    S, NB, NA = lag + 1 + prefetch, lag + 2, 4
     rings = 2 * S * T * W * esize + S * (T * 4 + 2 * gt * T * 4 + W * esize + 16 + 8 + 16)
-    stats = 3 * NB * gt * T * 4 + NB * T * 4
+    stats = 3 * NB * gt * T * 4
     handoff = NA * (T * 4 + gt * 8 + 8 + 4)
     reduce = 2 * (nc // 32) * 2 * W * 4 + 32
     return rings + stats + handoff + reduce + gt * 8 + 4 + 1024
