@@ -49,6 +49,7 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         ctx.chunk_size = chunk_size
         ctx.ortho = ortho
         ctx.eps = eps
+        ctx.backend = backend
         return y, mask, mem, lnt
 
     @staticmethod
@@ -67,6 +68,12 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         ortho = ctx.ortho
         eps = ctx.eps
+        if ctx.backend == 'cute' and _cute_bwd_supported(q, v, chunk_size, ortho, memory, prev_k):
+            from .cute.adaptive_working_memory_bwd import adaptive_working_memory_bwd as cute_bwd
+            q_grad, qk_grad, k_grad, v_grad, _, _ = cute_bwd(
+                y_grad, mem_grad, lnt_grad, q, qk, k, v, chunk_size, segment_idx
+            )
+            return (q_grad, qk_grad, k_grad, v_grad, None, None, None, None, None, None, None, None, None, None, None)
         # accumulative memory
         (
             (accum_memory, memory_residual, memory_mask),
@@ -647,6 +654,14 @@ def _cute_supported(query: Tensor, value: Tensor, chunk_size: int, ortho: bool) 
         and torch.cuda.get_device_capability(query.device)[0] == 10
         and S in (128, 256) and V % 64 == 0 and chunk_size % 128 == 0 and L % chunk_size == 0
     )
+
+
+def _cute_bwd_supported(query: Tensor, value: Tensor, chunk_size: int, ortho: bool, memory: Optional[Tensor],
+                        prev_key: Optional[Tensor]) -> bool:
+    """Shapes handled by the CuTe DSL backward kernels: the forward's, V a multiple of S, and the training case
+    without an input memory / previous chunk (context-parallel rank 0)."""
+    S, V = query.shape[3], value.shape[3]
+    return _cute_supported(query, value, chunk_size, ortho) and memory is None and prev_key is None and V % S == 0
 
 
 def adaptive_working_memory_accum_fwd(

@@ -1102,6 +1102,35 @@ def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
     return dqk, dk, dv
 
 
+def awm_bwd_prepare(query, qkey, key, value, chunk_size, segment_idx=None, recompute_out=False):
+    """First half of the backward (training case: no input memory / previous chunk): the forward's phases 1
+    and 2 with the save option. Returns the state for awm_bwd_finish and, with ``recompute_out``, the forward
+    output [B, H, L, V] (a view of [B, L, H, V] storage), else None."""
+    B, H, L, S = query.shape
+    K, V = value.shape[1], value.shape[3]
+    has_seg = segment_idx is not None
+    w = _phases12(qkey, key, value, segment_idx, None, None, None, None, None, None, chunk_size, save=True)
+    state = dict(w=w, q=_blhs(query), qk=_blhs(qkey), k=_blhs(key), v=_blhs(value), H=H, K=K, S=S, V=V, C=chunk_size,
+                 has_seg=has_seg)
+    out = None
+    if recompute_out:
+        out, _ = _out_gemm(state["q"], w["MT"], w["seg"], w["prev_cnt"], w["dead"], w["seg_off"], w["seg_stride"], H, K, S, V,
+                           chunk_size, False, has_seg)
+        out = out.transpose(1, 2)
+    return state, out
+
+
+def awm_bwd_finish(state, out_grad, memory_grad=None, log_norm_term_grad=None):
+    """Second half: phases 3', 2' and 1'. Returns dq [B, H, L, S], dqk / dk [B, K, L, S], dv [B, K, L, V] (bf16,
+    views of [B, L, *, D] storage) and None, None for the gradients of the absent input memory / normalizer."""
+    w, H, K, S, V, C, has_seg = (state[n] for n in ("w", "H", "K", "S", "V", "C", "has_seg"))
+    dout = _blhs(out_grad.to(torch.bfloat16))
+    dq, out_mask, dMo = _phase3_bwd(dout, state["q"], w, H, K, S, V, C, False, has_seg)
+    dB16, dA16, delta, dlse, _, _ = _phase2_bwd(w, dMo, memory_grad, log_norm_term_grad, K, S, V, C, False, has_seg)
+    dqk, dk, dv = _phase1_bwd(w, dA16, dB16, delta, dlse, state["qk"], state["k"], state["v"], K, S, V, C, has_seg)
+    return dq.transpose(1, 2), dqk.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), None, None
+
+
 def adaptive_working_memory_bwd(out_grad, memory_grad, log_norm_term_grad, query, qkey, key, value, chunk_size,
                                 segment_idx=None):
     """Backward of adaptive_working_memory_fwd for the training case without an input memory / previous chunk:
@@ -1110,14 +1139,5 @@ def adaptive_working_memory_bwd(out_grad, memory_grad, log_norm_term_grad, query
     storage), and the gradients of the (absent) input memory and log normalizer as None.
 
     The forward's phases 1 and 2 are recomputed with the save option (cheaper than keeping the workspaces)."""
-    B, H, L, S = query.shape
-    K, V = value.shape[1], value.shape[3]
-    C = chunk_size
-    has_seg = segment_idx is not None
-    w = _phases12(qkey, key, value, segment_idx, None, None, None, None, None, None, C, save=True)
-    q, qk, k, v = _blhs(query), _blhs(qkey), _blhs(key), _blhs(value)
-    dout = _blhs(out_grad.to(torch.bfloat16))
-    dq, out_mask, dMo = _phase3_bwd(dout, q, w, H, K, S, V, C, False, has_seg)
-    dB16, dA16, delta, dlse, _, _ = _phase2_bwd(w, dMo, memory_grad, log_norm_term_grad, K, S, V, C, False, has_seg)
-    dqk, dk, dv = _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg)
-    return dq.transpose(1, 2), dqk.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), None, None
+    state, _ = awm_bwd_prepare(query, qkey, key, value, chunk_size, segment_idx)
+    return awm_bwd_finish(state, out_grad, memory_grad, log_norm_term_grad)
