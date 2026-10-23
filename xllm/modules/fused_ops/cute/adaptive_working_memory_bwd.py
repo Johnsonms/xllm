@@ -352,7 +352,7 @@ class AwmRecurrenceBwd:
         self.has_prev, self.has_seg, self.has_dmem = has_prev, has_seg, has_dmem
         self.VT = VT
         self.KB = 32
-        self.stages = 4
+        self.stages = 8
         self.halves = S // 128
         self.n_vt = V // VT
         self.num_upd_warps = 4 * self.halves
@@ -387,6 +387,18 @@ class AwmRecurrenceBwd:
         grid = B * K * n_vt
         self.kernel(tm1, tma_a, mA_t, mDMo, mR, mD, tSeg.iterator, tPrevCount.iterator, mDMem, mDB, mDrp, mGout, a_layout,
                     rgt_layout, nc, nu, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.jit
+    def _keep(self, pSeg: cute.Pointer, pPrevCount: cute.Pointer, b, c, seg_off, seg_stride):
+        """0 when the memory resets before the update at chunk c (the chunks before it end in different segments),
+        else 1."""
+        keep = Float32(1.0)
+        if const_expr(self.has_seg):
+            if c >= 2 or const_expr(self.has_prev):
+                if _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C) != \
+                        _seg_anchor(pSeg, pPrevCount, b, c - 1, seg_off, seg_stride, self.C):
+                    keep = Float32(0.0)
+        return keep
 
     @cute.kernel
     def kernel(self, tm1: cute.TiledMma, tma_a: cute.CopyAtom, mA: cute.Tensor, mDMo: cute.Tensor, mR: cute.Tensor,
@@ -493,40 +505,39 @@ class AwmRecurrenceBwd:
             tTR1 = t2r1.get_slice(tidx % 128).partition_S(acc1_epi)
             regs = cute.make_rmem_tensor(t2r1.get_slice(tidx % 128).partition_D(cute.make_identity_tensor((128, 32))).shape, Float32)
             rg8 = cute.make_rmem_tensor((8,), BFloat16)
+            # per-update scalars, loaded one update ahead (the next update's are fetched while this one runs)
+            r_next = mR[srow, nu - 1, k, b]
+            keep_next = self._keep(pSeg, pPrevCount, b, nu - 1 + first, seg_off, seg_stride)
             for ur in cutlass.range(nu):
                 u = nu - 1 - ur
                 c = u + first
-                r = mR[srow, u, k, b]
-                reset = False
-                if const_expr(self.has_seg):
-                    if c >= 2 or const_expr(self.has_prev):
-                        reset = _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C) != \
-                            _seg_anchor(pSeg, pPrevCount, b, c - 1, seg_off, seg_stride, self.C)
-                keep = Float32(1.0)  # 0 on a reset: no gradient flows to the state before it
-                if reset:
-                    keep = Float32(0.0)
-                dvec = cute.make_tensor((mD.iterator + mD.layout((v0, srow, u, k, b))).align(16), cute.make_layout(VT)).load()
-                dmo = cute.make_tensor((mDMo.iterator + mDMo.layout((v0, srow, c, k, b))).align(16), cute.make_layout(VT)).load()
+                r = r_next
+                keep = keep_next  # 0 on a reset: no gradient flows to the state before it
+                if ur + 1 < nu:
+                    r_next = mR[srow, u - 1, k, b]
+                    keep_next = self._keep(pSeg, pPrevCount, b, c - 1, seg_off, seg_stride)
                 hmp = m_prod.acquire_and_advance()
-                # rG into the operand buffer and dB; dr partial
+                # rG into the operand buffer and dB; dr partial (D streamed in 8-element pieces)
                 dot = Float32(0.0)
                 for j in cutlass.range_constexpr(VT // 8):
+                    d8 = cute.make_tensor((mD.iterator + mD.layout((v0 + 8 * j, srow, u, k, b))).align(16), cute.make_layout(8)).load()
                     for e in cutlass.range_constexpr(8):
                         v = 8 * j + e
                         rg8[e] = (r * G[v]).to(BFloat16)
-                        dot = dot + G[v] * dvec[v]
+                        dot = dot + G[v] * d8[e]
                         pRGT[rgt_x[v % 8] + 64 * v] = rg8[e]
                     cute.make_tensor((mDB.iterator + mDB.layout((v0 + 8 * j, srow, u, k, b))).align(16), cute.make_layout(8)).store(rg8.load())
                 mDrp[srow, vt, u, k, b] = dot
                 cute.arch.fence_view_async_shared()
                 hmp.commit()
-                # G <- (1 - r) G - X + dMo_c, or dMo_c on a reset
+                # G <- (1 - r) G - X + dMo_c, or dMo_c on a reset (dMo streamed in 32-element pieces)
                 f1 = acc_cons.wait_and_advance()
                 for ch in cutlass.range_constexpr(VT // 32):
+                    dmo = cute.make_tensor((mDMo.iterator + mDMo.layout((v0 + ch * 32, srow, c, k, b))).align(16), cute.make_layout(32)).load()
                     cute.copy(t2r1, tTR1[(None, None, None, 0, ch)], regs)
                     for e in cutlass.range_constexpr(32):
                         v = ch * 32 + e
-                        G[v] = keep * ((1.0 - r) * G[v] - regs[e]) + dmo[v]
+                        G[v] = keep * ((1.0 - r) * G[v] - regs[e]) + dmo[e]
                 with cute.arch.elect_one():
                     f1.release()
             cute.make_tensor((mGout.iterator + mGout.layout((v0, srow, k, b))).align(16), cute.make_layout(VT)).store(G.load())
