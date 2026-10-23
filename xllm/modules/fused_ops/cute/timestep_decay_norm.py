@@ -107,7 +107,10 @@ class TimestepDecayNormFwd:
         # one may already write the moments of tile i+1 while another still reads the statistics of
         # tile i-D (stored in place of its moments): NB must not divide D+1.
         self.NB = self.D + 2
-        self.NA = self.D + 2  # aggregate -> resolve hand-off buffers
+        # two resolve warps take alternate tiles (the look-back latency of one overlaps the other); the
+        # aggregate -> resolve hand-off buffers come in pairs so that each resolve warp owns its barrier ids
+        self.NRW = 2
+        self.NA = (self.D + 2 + self.NRW - 1) // self.NRW * self.NRW
         self.min_ctas_per_sm = min_ctas_per_sm
 
         width = max(dtype.width, w_dtype.width)
@@ -116,11 +119,11 @@ class TimestepDecayNormFwd:
         self.TPG = self.Dg // self.VEC  # threads per (row, group)
         self.TPR = self.W // self.VEC  # threads per row
         # warp roles: NCW compute warps (moments, normalization), an aggregate warp (local scan,
-        # aggregate publish), a resolve warp (look-back, per-row statistics) and a producer warp
+        # aggregate publish), NRW resolve warps (look-back, per-row statistics) and a producer warp
         # (tickets, TMA loads of x, TMA stores of y)
         self.NC = num_threads
         self.NCW = self.NC // 32
-        self.NT = self.NC + 96
+        self.NT = self.NC + 32 * (2 + self.NRW)
         self.R = self.NC // self.TPR  # rows per pass of the compute warps
         self.RPT = self.T // self.R  # rows per compute thread
         self.LPR = self.T // 32  # rows per lane of the scan warp
@@ -278,8 +281,8 @@ class TimestepDecayNormFwd:
         sRow = smem.allocate_tensor(Int32, cute.make_layout((self.NA, self.T), stride=(self.T, 1)), byte_alignment=16)
         sTk = smem.allocate_tensor(Int32, cute.make_layout(self.NA), byte_alignment=8)
         sTkInfo = smem.allocate_tensor(Int32, cute.make_layout((self.NA, 4), stride=(4, 1)), byte_alignment=16)
-        sIn = smem.allocate_tensor(Float32, cute.make_layout((self.Gt, 2), stride=(2, 1)), byte_alignment=16)
-        sInC = smem.allocate_tensor(Int32, cute.make_layout(1))
+        sIn = smem.allocate_tensor(Float32, cute.make_layout((self.NRW, self.Gt, 2), stride=(2 * self.Gt, 2, 1)), byte_alignment=16)
+        sInC = smem.allocate_tensor(Int32, cute.make_layout((self.NRW, 1), stride=(1, 1)))
 
         one_minus_beta1 = 1.0 - beta1
         one_minus_beta2 = 1.0 - beta2
@@ -359,14 +362,20 @@ class TimestepDecayNormFwd:
                     sTkInfo[abuf, lane] = sTile[jt % stages, lane]
                 if tk >= num_tiles:
                     running = Int32(0)
+                    # also stop the other resolve warp, which waits for the following tile
+                    nbuf = (jt + 1) % na
+                    if lane == 0:
+                        sTk[nbuf] = tk
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + nbuf, number_of_threads=64)
                 else:
                     self._aggregate_tile(tk, jt % nb, abuf, jt % stages, lane, mAggW, sCode, sCm, sRs, sRow,
                                          sAgg, sAggMaskI, beta1, beta2, one_minus_beta1, one_minus_beta2)
                     jt = jt + 1
                 cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
-        elif warp == self.NCW + 1:
+        elif warp <= self.NCW + self.NRW:
             # ================================ resolve warp =================================================
-            jt = Int32(0)
+            rw = warp - self.NCW - 1
+            jt = rw
             running = Int32(1)
             while running != 0:
                 abuf = jt % na
@@ -377,10 +386,10 @@ class TimestepDecayNormFwd:
                 else:
                     self._resolve_tile(tk, sTkInfo, jt % nb, abuf, num_chains, num_segs, L, lane,
                                        mAggW, mIncW, mPrevCount, mPrevMean, mPrevVar, mCount, mMean, mVar,
-                                       sRow, sAgg, sAggMaskI, sIn, sInC, sCm, sRs, sInfo,
+                                       sRow, sAgg, sAggMaskI, sIn[rw, None, None], sInC[rw, None], sCm, sRs, sInfo,
                                        log2_beta1, log2_beta2, eps, rsqrt_eps)
                     cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff)
-                    jt = jt + 1
+                    jt = jt + self.NRW
         else:
             # ================================ producer warp ================================================
             # tickets, row codes, TMA loads of x and TMA stores of y (once the compute warps release a stage)
@@ -633,6 +642,10 @@ class TimestepDecayNormFwd:
                        sAgg[a, None, None], sAggMaskI[a, None], sIn, sInC, log2_beta1, log2_beta2)
         cute.arch.sync_warp()
         c0 = sInC[0]
+        # beta^count = beta^k * beta^c0 unless the row's prefix contains a reset (then beta^k)
+        c0f = Int32(c0).to(Float32)
+        b1c0 = cute.math.exp2(c0f * log2_beta1, fastmath=True)
+        b2c0 = cute.math.exp2(c0f * log2_beta2, fastmath=True)
         info = cute.local_tile(sRow[a, None], (self.LPR,), (lane,)).load()
         rcm = cute.make_rmem_tensor((self.LPR,), Float32)
         rrs = cute.make_rmem_tensor((self.LPR,), Float32)
@@ -647,11 +660,12 @@ class TimestepDecayNormFwd:
             reset = (info[jj] >> 1) & 1
             cnt = k + (1 - reset) * c0
             kf = Int32(k).to(Float32)
-            cf = Int32(cnt).to(Float32)
-            dec1.append(cutlass.select_(reset != 0, Float32(0.0), cute.math.exp2(kf * log2_beta1, fastmath=True)))
-            dec2.append(cutlass.select_(reset != 0, Float32(0.0), cute.math.exp2(kf * log2_beta2, fastmath=True)))
-            corr1.append(cute.arch.rcp_approx(1.0 - cute.math.exp2(cf * log2_beta1, fastmath=True)))
-            corr2.append(cute.arch.rcp_approx(1.0 - cute.math.exp2(cf * log2_beta2, fastmath=True)))
+            p1 = cute.math.exp2(kf * log2_beta1, fastmath=True)
+            p2 = cute.math.exp2(kf * log2_beta2, fastmath=True)
+            dec1.append(cutlass.select_(reset != 0, Float32(0.0), p1))
+            dec2.append(cutlass.select_(reset != 0, Float32(0.0), p2))
+            corr1.append(cute.arch.rcp_approx(1.0 - cutlass.select_(reset != 0, p1, p1 * b1c0)))
+            corr2.append(cute.arch.rcp_approx(1.0 - cutlass.select_(reset != 0, p2, p2 * b2c0)))
             counts.append(cnt)
             rinfo[jj] = (cnt << 1) | (info[jj] & 1)
         for g in cutlass.range_constexpr(self.Gt):
@@ -961,11 +975,11 @@ SMEM_PER_SM = 227 * 1024  # usable shared memory per SM on sm_90 / sm_100 (1 KiB
 def _fwd_smem_bytes(esize: int, Dg: int, gt: int, tile_len: int, prefetch: int, lag: int) -> int:
     """Shared memory of one CTA (mirrors the allocations in the kernel, plus alignment slack)."""
     T, W = tile_len, gt * Dg
-    S, NB, NA = lag + 1 + prefetch, lag + 2, lag + 2
+    S, NB, NA = lag + 1 + prefetch, lag + 2, (lag + 3) // 2 * 2
     x_ring = S * T * W * esize
     moments = 2 * NB * gt * T * 4 + NB * T * 4
     handoff = NA * (gt * 2 * 4 + 2 * 4 + T * 4 + 4)
-    return x_ring + moments + handoff + S * (T + 4 + 8) + gt * 8 + 4 + 1024
+    return x_ring + moments + handoff + S * (T + 4 + 8) + 2 * (gt * 8 + 4) + 1024
 
 
 @lru_cache(maxsize=None)
