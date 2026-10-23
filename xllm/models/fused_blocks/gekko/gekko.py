@@ -359,7 +359,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle9 = None
 
         if not recompute_sca and sca_for_save is None:
-            assert sca_backend == 'swift'
+            assert sca_backend in ('swift', 'cute')  # cute falls back to swift for unsupported shapes
             sca_for_save = sca_out
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')

@@ -32,11 +32,13 @@ _CUTE_FALLBACK_WARNED = set()
 
 
 def cute_sca_supported(q: Tensor, v: Tensor, chunk_size: int, prev_k: Optional[Tensor], dropout: float) -> bool:
-    """The CuTe kernels take head dims up to 256 (multiples of 64), chunks of multiples of 128, no previous chunk
-    (context parallel ranks > 0) and no attention dropout."""
+    """The CuTe kernels take qk head dims up to 256 (multiples of 64), v head dims that are multiples of 64 up to
+    256 or of 256 beyond, chunks of multiples of 128, no previous chunk (context parallel ranks > 0) and no attention
+    dropout."""
     S, V = q.shape[3], v.shape[3]
     return (CUTE_SCA_ENABLED and prev_k is None and dropout == 0.0 and S % 64 == 0 and S <= 256 and V % 64 == 0
-            and V <= 256 and chunk_size % 128 == 0 and q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10)
+            and (V <= 256 or V % 256 == 0) and chunk_size % 128 == 0 and q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] >= 10)
 
 
 def _resolve_backend(backend: str, q: Tensor, v: Tensor, chunk_size: int, prev_k: Optional[Tensor], dropout: float) -> str:
