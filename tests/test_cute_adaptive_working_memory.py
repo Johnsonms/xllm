@@ -136,6 +136,10 @@ _REF_PATH = Path(__file__).resolve().parents[1] / "xllm/modules/fused_ops/cute/a
 _ref_spec = importlib.util.spec_from_file_location("cute_awm_reference", _REF_PATH)
 awm_ref = importlib.util.module_from_spec(_ref_spec)
 _ref_spec.loader.exec_module(awm_ref)
+_BWD_PATH = Path(__file__).resolve().parents[1] / "xllm/modules/fused_ops/cute/adaptive_working_memory_bwd.py"
+_bwd_spec = importlib.util.spec_from_file_location("cute_awm_bwd", _BWD_PATH)
+awm_bwd = importlib.util.module_from_spec(_bwd_spec)
+_bwd_spec.loader.exec_module(awm_bwd)
 
 
 @pytest.mark.parametrize("B,H,K,S,V,L,C,seg_rate", [
@@ -162,3 +166,49 @@ def test_phased_backward_matches_autograd(B, H, K, S, V, L, C, seg_rate):
     assert rel_err(out2, out.detach()) < 1e-12 and rel_err(memory2, memory.detach()) < 1e-12
     for got, leaf in zip(grads, (q, qk, k, v)):
         assert rel_err(got, leaf.grad) < 1e-12
+
+
+@pytest.mark.parametrize("B,H,K,S,V,L,C,seg_rate,with_dmem", [
+    (2, 4, 2, 128, 128, 1024, 256, 0.0, False),
+    (2, 4, 2, 128, 128, 1024, 256, 0.6, True),
+    (1, 4, 2, 256, 256, 2048, 512, 1.5, False),  # many segment boundaries
+    (1, 2, 1, 256, 512, 1536, 512, 0.3, True),
+    (2, 8, 4, 256, 256, 16384, 4096, 0.3, False),  # gekko-0.9B
+    (1, 32, 8, 128, 128, 16384, 4096, 0.3, False),  # gekko-4B
+    (1, 4, 4, 256, 2048, 16384, 4096, 0.3, False),  # gekko-7.1B (streamed dq GEMM, tcgen05 recurrence)
+])
+def test_backward_matches_autograd(B, H, K, S, V, L, C, seg_rate, with_dmem):
+    """The CuTe backward (bf16 inputs and outputs) against FP64 autograd through the reference forward."""
+    q, qk, k, v, _, _, _, _, _, seg, _ = make_inputs(B, H, K, S, V, L, C, False, seg_rate)
+    leaves = [t.double().requires_grad_() for t in (q, qk, k, v)]
+    out, _, memory, lnt = reference_fwd(*leaves, C, None, None, None, None, None, seg, None)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    dout = torch.randn(B, L, H, V, device="cuda", generator=gen).to(torch.bfloat16).transpose(1, 2)
+    dmem = (torch.randn(B, K, S, V, device="cuda", generator=gen) * 0.1).to(torch.bfloat16) if with_dmem else None
+    dlnt = torch.randn(B, K, S, device="cuda", generator=gen) if with_dmem else None
+    loss = (out * dout.double()).sum()
+    if with_dmem:
+        loss = loss + (memory * dmem.double()).sum() + (lnt * dlnt.double()).sum()
+    loss.backward()
+    grads = awm_bwd.adaptive_working_memory_bwd(dout, dmem, dlnt, q, qk, k, v, C, seg)
+    torch.cuda.synchronize()
+    for name, got, leaf in zip(("dq", "dqk", "dk", "dv"), grads[:4], leaves):
+        assert got.shape == leaf.shape and got.dtype == torch.bfloat16
+        assert rel_err(got, leaf.grad) < 1.5e-2, (name, rel_err(got, leaf.grad))
+
+
+def test_backward_from_saved_workspace():
+    """awm_bwd_prepare from the forward's workspace gives the same gradients as the recomputing path."""
+    B, H, K, S, V, L, C = 2, 4, 2, 128, 128, 1024, 256
+    q, qk, k, v, _, _, _, _, _, seg, _ = make_inputs(B, H, K, S, V, L, C, False, 0.5)
+    out, mask, memory, lnt, ws = awm.adaptive_working_memory_fwd(q, qk, k, v, C, None, None, None, None, None, seg, None,
+                                                                return_workspace=True)
+    out2, mask2, _, _ = awm.adaptive_working_memory_fwd(q, qk, k, v, C, None, None, None, None, None, seg, None)
+    assert torch.equal(out, out2) and torch.equal(mask, mask2)
+    dout = torch.randn(B, L, H, V, device="cuda").to(torch.bfloat16).transpose(1, 2)
+    state, out3 = awm_bwd.awm_bwd_prepare(q, qk, k, v, C, seg, True, ws)
+    assert torch.equal(out3, out)
+    g1 = awm_bwd.awm_bwd_finish(state, dout)
+    g2 = awm_bwd.adaptive_working_memory_bwd(dout, None, None, q, qk, k, v, C, seg)
+    for a, b in zip(g1[:4], g2[:4]):  # the split-K reduce-adds are not bitwise deterministic
+        assert rel_err(a, b.double()) < 1e-2

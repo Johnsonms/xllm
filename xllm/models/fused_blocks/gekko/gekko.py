@@ -16,6 +16,7 @@ from xllm.modules.fused_ops import (
     adaptive_working_memory_fwd,
     adaptive_working_memory_accum_fwd,
     adaptive_working_memory_bwd,
+    awm_cute_bwd_supported,
 )
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
@@ -311,6 +312,7 @@ class GekkoBlockFunction(torch.autograd.Function):
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
                 awm_orthogonal_update, rmsnorm_eps, awm_backend
             )
+            awm_workspace = ()
 
             _, handle8 = send_memory_to_next(new_memory)
             _, handle9 = send_log_norm_term_to_next(new_lnt)
@@ -339,17 +341,25 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, awm_backend
-            )
+            if awm_backend == 'cute' and awm_cute_bwd_supported(aq, av, attention_chunk_size, awm_orthogonal_update, memory, prev_akk):
+                # CuTe DSL kernels: keep the workspaces of the forward for the backward
+                from xllm.modules.fused_ops.cute.adaptive_working_memory import adaptive_working_memory_fwd as cute_awm_fwd
+                awk_out, awk_mask, new_memory, new_lnt, awm_workspace = cute_awm_fwd(
+                    aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
+                    prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count, return_workspace=True
+                )
+            else:
+                awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
+                    aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
+                    prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
+                    awm_orthogonal_update, rmsnorm_eps, awm_backend
+                )
 
             handle8 = None
             handle9 = None
 
         if not recompute_sca and sca_for_save is None:
-            assert sca_backend == 'swift'
+            assert sca_backend in ('swift', 'cute')  # cute falls back to swift for unsupported shapes
             sca_for_save = sca_out
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
@@ -437,6 +447,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
+            *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
         ctx.local_kv_heads = local_kv_heads
@@ -446,6 +457,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.rope_head_dim = rope_head_dim
         ctx.attn_gate_func = attn_gate_func
         ctx.awm_orthogonal_update = awm_orthogonal_update
+        ctx.awm_backend = awm_backend
         ctx.causal_conv_backend = causal_conv_backend
         ctx.causal_conv_weight_normalization = causal_conv_weight_normalization
         ctx.dropout = dropout
@@ -527,6 +539,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1,  # (bsz*slen, v/MP)
             h3,  # (bsz*slen, v/MP)
+            *awm_workspace,
         ) = ctx.saved_tensors
 
         bsz, seq_len, _ = x.size()
@@ -554,6 +567,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             "softplus": partial(torch.ops.aten.softplus_backward, beta=math.log(2), threshold=20)
         }[attn_gate_func]
         awm_orthogonal_update = ctx.awm_orthogonal_update
+        awm_backend = ctx.awm_backend
         causal_conv_backend = ctx.causal_conv_backend
         causal_conv_weight_normalization = ctx.causal_conv_weight_normalization
 
@@ -719,15 +733,26 @@ class GekkoBlockFunction(torch.autograd.Function):
         aqk = aqk.transpose(1, 2)
         akk = akk.transpose(1, 2)
         av = xv_.transpose(1, 2)
-        memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
-            aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
-            segment_idx, prev_segment_count, awm_orthogonal_update, rmsnorm_eps, awk_out is None
+        use_cute_awm = awm_backend == 'cute' and awm_cute_bwd_supported(
+            aq, av, attention_chunk_size, awm_orthogonal_update, memory, prev_akk
         )
-        accum_memory, memory_residual, memory_mask = memory_outs
-        log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
-        awk_kkey, awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue, awk_out_rec, awk_out_mask = kv_outs
-        ak_fp32, akk_fp32, awk_key_mask = kk_outs
-        prev_kkey, prev_k_fp32, prev_kk_fp32, prev_k_mask = prev_outs
+        if use_cute_awm:
+            # CuTe DSL kernels: the forward's phases are recomputed here, the gradients after the output gradient
+            from xllm.modules.fused_ops.cute.adaptive_working_memory_bwd import awm_bwd_prepare, awm_bwd_finish
+            awm_cute_state, awk_out_rec = awm_bwd_prepare(
+                aq, aqk, akk, av, attention_chunk_size, segment_idx, awk_out is None,
+                tuple(awm_workspace) if awm_workspace else None
+            )
+        else:
+            memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
+                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term, prev_aqk, prev_akk, prev_av,
+                segment_idx, prev_segment_count, awm_orthogonal_update, rmsnorm_eps, awk_out is None
+            )
+            accum_memory, memory_residual, memory_mask = memory_outs
+            log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio = lnt_outs
+            awk_kkey, awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue, awk_out_rec, awk_out_mask = kv_outs
+            ak_fp32, akk_fp32, awk_key_mask = kk_outs
+            prev_kkey, prev_k_fp32, prev_kk_fp32, prev_k_mask = prev_outs
 
         if awk_out is None:
             awk_out = rearrange(awk_out_rec, 'b h l v -> b l (h v)')
@@ -807,20 +832,26 @@ class GekkoBlockFunction(torch.autograd.Function):
                 handle_memory.wait()
                 handle_lnt.wait()
 
-            (
-                aq_grad, aqk_grad, akk_grad, av_grad,
-                memory_grad, log_norm_term_grad,
-                prev_aqk_grad, prev_akk_grad, prev_av_grad
-            ) = adaptive_working_memory_bwd(
-                awk_out_grad, memory_grad, log_norm_term_grad,
-                aq, aqk, awk_kkey, av, attention_chunk_size,
-                awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
-                ak_fp32, akk_fp32, awk_key_mask,
-                accum_memory, memory_residual, memory_mask,
-                log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
-                awk_out_mask, prev_aqk, prev_kkey, prev_av,
-                prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
-            )
+            if use_cute_awm:
+                (
+                    aq_grad, aqk_grad, akk_grad, av_grad, memory_grad, log_norm_term_grad
+                ) = awm_bwd_finish(awm_cute_state, awk_out_grad, memory_grad, log_norm_term_grad)
+                prev_aqk_grad = prev_akk_grad = prev_av_grad = None
+            else:
+                (
+                    aq_grad, aqk_grad, akk_grad, av_grad,
+                    memory_grad, log_norm_term_grad,
+                    prev_aqk_grad, prev_akk_grad, prev_av_grad
+                ) = adaptive_working_memory_bwd(
+                    awk_out_grad, memory_grad, log_norm_term_grad,
+                    aq, aqk, awk_kkey, av, attention_chunk_size,
+                    awk_rvalue, awk_rvalue_rstd, awk_vvalue, awk_avalue,
+                    ak_fp32, akk_fp32, awk_key_mask,
+                    accum_memory, memory_residual, memory_mask,
+                    log_norm_term, curr_log_norm_term, accum_log_norm_term, ratio,
+                    awk_out_mask, prev_aqk, prev_kkey, prev_av,
+                    prev_k_fp32, prev_kk_fp32, prev_k_mask, awm_orthogonal_update
+                )
 
             handle5 = None
             handle6 = None

@@ -119,7 +119,7 @@ class ModelConf(Config):
     apply_attn_gate: bool = False  # Whether to apply gating to attention output in Transformer
     attn_gate_func: str = 'softplus'  # silu or softplus
     causal_attn_backend: Optional[str] = None  # Attention operator backend: None = regular implementation, or choose between swift/flash/xattn
-    sca_backend: str = 'swift'  # Sliding Chunk Attention (SCA) operator backend (swift/flash/xattn).
+    sca_backend: str = 'swift'  # Sliding Chunk Attention (SCA) operator backend (swift/flash/xattn/cute). cute: CuTe DSL kernels (Blackwell), no attention matrix materialized.
     apply_bias_term: bool = False  # Whether the Gekko attention output gating projection W_r includes a bias term.
     ffn_hidden_dim: int = 2048  # Hidden dimension in dense FFN. MoE expert dimensions is set by expert_inter_dim.
     # Adaptive Working Memory (AWM)
@@ -194,7 +194,7 @@ class ModelConf(Config):
         assert self.ddp_backend in ['fsdp1', 'fsdp2']
 
         assert self.causal_attn_backend in [None, "swift", "flash", 'xattn']
-        assert self.sca_backend in ["swift", "flash", 'xattn']
+        assert self.sca_backend in ["swift", "flash", 'xattn', 'cute']
         assert self.mova_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']

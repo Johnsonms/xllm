@@ -80,7 +80,8 @@ def awm_fwd_saved(q, qk, k, v, C, memory, lnt, prev_qk, prev_k, prev_v, segment_
     return rearrange(out, "b h n c v -> b h (n c) v"), M, lt, saved
 
 
-def awm_bwd_phased(dout, dM_fin, dlnt_fin, q, qk, k, v, C, saved):
+def awm_bwd_phased(dout, dM_fin, dlnt_fin, q, qk, k, v, C, saved, intermediates=None):
+    """``intermediates``: a dict that receives dq, dMo, dA, dB, dr, dlse, delta and the final G / g when given."""
     B, H, L, S = q.shape
     K, V = v.shape[1], v.shape[3]
     nc, n_rep = L // C, H // K
@@ -97,6 +98,7 @@ def awm_bwd_phased(dout, dM_fin, dlnt_fin, q, qk, k, v, C, saved):
     dA = torch.zeros_like(A)
     dB = torch.zeros_like(Bm)
     dlse = torch.zeros_like(lse)
+    drs = torch.zeros_like(lse)
     for u in reversed(range(nu)):
         c = u + 1
         M = saved["Mpre"][u]
@@ -104,6 +106,7 @@ def awm_bwd_phased(dout, dM_fin, dlnt_fin, q, qk, k, v, C, saved):
         lt_old, lt_new = saved["lts"][u]
         D = Bm[:, :, u] - A[:, :, u] @ M - M
         dr = (G * D).sum(-1)  # B K S
+        drs[:, :, u] = dr
         rG = r * G
         dB[:, :, u] = rG
         dA[:, :, u] = -rG @ M.transpose(-1, -2)
@@ -128,7 +131,10 @@ def awm_bwd_phased(dout, dM_fin, dlnt_fin, q, qk, k, v, C, saved):
     dqk_ch = torch.einsum("bknts,bknsu->bkntu", P, dA)
     dv_ch = torch.einsum("bknts,bknsv->bkntv", P, dB)
     dP = torch.einsum("bknsu,bkntu->bknts", dA, qkch) + torch.einsum("bknsv,bkntv->bknts", dB, vch)
-    dk_ch = P * (dP - (P * dP).sum(3, keepdim=True)) + P * dlse.unsqueeze(3)
+    delta = (dA * A).sum(-1) + (dB * Bm).sum(-1)  # = sum_t P dP: rowsum of P * dP without forming dP
+    dk_ch = P * (dP - delta.unsqueeze(3)) + P * dlse.unsqueeze(3)
+    if intermediates is not None:
+        intermediates.update(dq=dq, dMo=dMo, dA=dA, dB=dB, dr=drs, dlse=dlse, delta=delta, G=G, g=g, dqk_ch=dqk_ch, dv_ch=dv_ch, dk_ch=dk_ch)
     dqk = torch.zeros_like(qk)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
