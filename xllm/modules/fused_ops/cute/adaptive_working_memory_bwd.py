@@ -691,14 +691,17 @@ class AwmChunkBwd:
         dk[t, :] = P^T[t, :] (dP^T[t, :] - delta + dlse),   dqk = P^T dA (K = S),   dv = P^T dB (K = S, V/S tiles)
 
     Persistent: every CTA takes the tiles bidx, bidx + grid, ... of the update chunks. Warps 0-3 (one row t per
-    thread): the P^T transform of the raw key tile (TMA ring) into the resident bf16 A operand, then the
-    epilogues (TMEM -> registers -> bf16 -> global); warp 4 the tcgen05 MMAs; warp 5 the TMA loads. Operand tiles are 128 x 64 (A, K-major) and S x 64 (B; K-major for dP^T,
-    MN-major for dqk / dv), 64 = one 128-byte K block. The two 128 x S TMEM accumulators alternate between
-    dP^T, dqk and the dv tiles, so the next tile's dP^T GEMM runs while the epilogues of this one drain."""
+    thread): the P^T transform of the raw key tile (TMA ring, 128 x 64 blocks) into the resident bf16 A
+    operand, then the epilogues (TMEM -> registers -> bf16 -> global); warp 4 the tcgen05 MMAs; warp 5 the TMA
+    loads. GEMM operand tiles are 128 x 64 (A, K-major) and S x 64 (B; K-major for dP^T, MN-major for dqk /
+    dv), 64 = one 128-byte K block, in rings of 3 and 2 stages. The two
+    128 x S TMEM accumulators alternate between dP^T, dqk and the dv tiles, so the next tile's dP^T GEMM runs
+    while the epilogues of this one drain."""
 
     def __init__(self, K: int, S: int, V: int, C: int, R: int, has_seg: bool):
         self.K, self.S, self.V, self.C, self.R, self.has_seg = K, S, V, C, R, has_seg
-        self.KB = 64
+        self.KB = 64  # raw key blocks (one 128-byte swizzle row)
+        self.KBG = 64  # K blocks of the GEMM operand rings (32-row blocks hung: not understood)
         self.a_stages = 3
         self.b_stages = 2
         self.raw_stages = 2
@@ -708,7 +711,8 @@ class AwmChunkBwd:
         self.threads = 32 * 6
         self.n_vtiles = V // S
         self.kb_s = S // self.KB
-        self.kb_v = V // self.KB
+        self.kbg_s = S // self.KBG
+        self.kbg_v = V // self.KBG
         self.tmem_cols = max(32, 1 << (2 * S - 1).bit_length())
         assert S % 128 == 0 and S <= 256 and V % S == 0 and C % 128 == 0
 
@@ -716,7 +720,7 @@ class AwmChunkBwd:
     def __call__(self, tQK: cute.Tensor, tK: cute.Tensor, tV: cute.Tensor, tDA: cute.Tensor, tDB: cute.Tensor, tPart: cute.Tensor,
                  tDelta: cute.Tensor, tDlse: cute.Tensor, tSeg: cute.Tensor, tDQK: cute.Tensor, tDK: cute.Tensor, tDV: cute.Tensor,
                  B: Int32, L: Int32, nu: Int32, seg_off: Int32, seg_stride: Int32, num_ctas: Int32, stream: cuda.CUstream):
-        K, S, V, R, KB = self.K, self.S, self.V, self.R, self.KB
+        K, S, V, R, KB, KBG = self.K, self.S, self.V, self.R, self.KB, self.KBG
         # inputs [B, L, K, *] as (M = t, K = col, k, b), K-major
         mQK = cute.make_tensor(tQK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
         mK = cute.make_tensor(tK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
@@ -740,22 +744,22 @@ class AwmChunkBwd:
                                       tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN)
         tm_kk = cute.make_tiled_mma(op_kk)
         tm_kmn = cute.make_tiled_mma(op_kmn)
-        a_layout = sm100_utils.make_smem_layout_a(tm_kk, (128, S, KB), BFloat16, self.a_stages)
+        a_layout = sm100_utils.make_smem_layout_a(tm_kk, (128, S, KBG), BFloat16, self.a_stages)
         raw_layout = sm100_utils.make_smem_layout_a(tm_kk, (128, S, KB), BFloat16, self.raw_stages)
         p_layout = sm100_utils.make_smem_layout_a(tm_kmn, (128, S, S), BFloat16, 1)
-        bk_layout = sm100_utils.make_smem_layout_b(tm_kk, (128, S, KB), BFloat16, self.b_stages)
-        bmn_layout = sm100_utils.make_smem_layout_b(tm_kmn, (128, S, KB), BFloat16, self.b_stages)
+        bk_layout = sm100_utils.make_smem_layout_b(tm_kk, (128, S, KBG), BFloat16, self.b_stages)
+        bmn_layout = sm100_utils.make_smem_layout_b(tm_kmn, (128, S, KBG), BFloat16, self.b_stages)
         tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         a_one = cute.slice_(a_layout, (None, None, None, 0))
-        tma_qk, mQK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mQK, a_one, (128, S, KB), tm_kk)
-        tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mV, a_one, (128, S, KB), tm_kk)
+        tma_qk, mQK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mQK, a_one, (128, S, KBG), tm_kk)
+        tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mV, a_one, (128, S, KBG), tm_kk)
         tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mK, cute.slice_(raw_layout, (None, None, None, 0)), (128, S, KB), tm_kk)
         bk_one = cute.slice_(bk_layout, (None, None, None, 0))
         bmn_one = cute.slice_(bmn_layout, (None, None, None, 0))
-        tma_dak, mDAk_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDAk, bk_one, (128, S, KB), tm_kk)
-        tma_dbk, mDBk_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBk, bk_one, (128, S, KB), tm_kk)
-        tma_damn, mDAmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDAmn, bmn_one, (128, S, KB), tm_kmn)
-        tma_dbmn, mDBmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBmn, bmn_one, (128, S, KB), tm_kmn)
+        tma_dak, mDAk_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDAk, bk_one, (128, S, KBG), tm_kk)
+        tma_dbk, mDBk_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBk, bk_one, (128, S, KBG), tm_kk)
+        tma_damn, mDAmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDAmn, bmn_one, (128, S, KBG), tm_kmn)
+        tma_dbmn, mDBmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBmn, bmn_one, (128, S, KBG), tm_kmn)
         num_tiles = B * K * nu * (self.C // 128)
         self.kernel(tm_kk, tm_kmn, tma_qk, mQK_t, tma_v, mV_t, tma_k, mK_t, tma_dak, mDAk_t, tma_dbk, mDBk_t, tma_damn, mDAmn_t,
                     tma_dbmn, mDBmn_t, mPart, mDelta, mDlse, tSeg.iterator, mDQK, mDK, mDV, a_layout, raw_layout, p_layout,
@@ -785,9 +789,9 @@ class AwmChunkBwd:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         nctas, _, _ = cute.arch.grid_dim()
-        S, V, KB = self.S, self.V, self.KB
+        S, V, KB, KBG = self.S, self.V, self.KB, self.KBG
         tiles_per_chunk = self.C // 128
-        kb_total = self.kb_s + self.kb_v  # K blocks of dP^T
+        kb_total = self.kbg_s + self.kbg_v  # K blocks of dP^T
 
         if warp == self.tma_warp:
             cpasync.prefetch_descriptor(tma_qk)
@@ -842,13 +846,13 @@ class AwmChunkBwd:
         sCorr = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)  # dlse - delta
         sKeep = smem.allocate_tensor(Uint8, cute.make_layout(128), byte_alignment=16)
 
-        gQK = cute.local_tile(mQK, (128, KB), (None, None, None, None))
-        gV = cute.local_tile(mV, (128, KB), (None, None, None, None))
+        gQK = cute.local_tile(mQK, (128, KBG), (None, None, None, None))
+        gV = cute.local_tile(mV, (128, KBG), (None, None, None, None))
         gK = cute.local_tile(mK, (128, KB), (None, None, None, None))
-        gDAk = cute.local_tile(mDAk, (S, KB), (None, None, None, None, None))
-        gDBk = cute.local_tile(mDBk, (S, KB), (None, None, None, None, None))
-        gDAmn = cute.local_tile(mDAmn, (S, KB), (None, None, None, None, None))
-        gDBmn = cute.local_tile(mDBmn, (S, KB), (None, None, None, None, None))
+        gDAk = cute.local_tile(mDAk, (S, KBG), (None, None, None, None, None))
+        gDBk = cute.local_tile(mDBk, (S, KBG), (None, None, None, None, None))
+        gDAmn = cute.local_tile(mDAmn, (S, KBG), (None, None, None, None, None))
+        gDBmn = cute.local_tile(mDBmn, (S, KBG), (None, None, None, None, None))
         thr_kk = tm_kk.get_slice(0)
         thr_kmn = tm_kmn.get_slice(0)
         tQKs, tQKg = cpasync.tma_partition(tma_qk, 0, cute.make_layout(1), cute.group_modes(sA, 0, 3), cute.group_modes(thr_kk.partition_A(gQK), 0, 3))
@@ -869,24 +873,29 @@ class AwmChunkBwd:
                 tb, u, k, b = self._decode(t, nu)
                 if True:
                     row_block = u * tiles_per_chunk + tb
-                    # raw key tile first (the transform runs beside the dP^T GEMM)
-                    for kb in cutlass.range(self.kb_s):
+                    # the first raw key blocks (the transform runs beside the dP^T GEMM), then the dP^T operands,
+                    # then the remaining raw blocks (the ring is shallow: do not stall the GEMM loads behind them)
+                    raw_first = min(self.raw_stages, self.kb_s)
+                    for kb in cutlass.range_constexpr(raw_first):
                         hr = raw_prod.acquire_and_advance()
                         cute.copy(tma_k, tKg[(None, row_block, kb, k, b)], tKs[(None, hr.index)], tma_bar_ptr=hr.barrier)
                     for kb in cutlass.range(kb_total):
                         ha = a_prod.acquire_and_advance()
                         hb = b_prod.acquire_and_advance()
-                        if kb < self.kb_s:
+                        if kb < self.kbg_s:
                             cute.copy(tma_qk, tQKg[(None, row_block, kb, k, b)], tQKs[(None, ha.index)], tma_bar_ptr=ha.barrier)
                             cute.copy(tma_dak, tDAkg[(None, 0, kb, u, k, b)], tDAks[(None, hb.index)], tma_bar_ptr=hb.barrier)
                         else:
-                            cute.copy(tma_v, tVg[(None, row_block, kb - self.kb_s, k, b)], tVs[(None, ha.index)], tma_bar_ptr=ha.barrier)
-                            cute.copy(tma_dbk, tDBkg[(None, 0, kb - self.kb_s, u, k, b)], tDBks[(None, hb.index)], tma_bar_ptr=hb.barrier)
-                    for kb in cutlass.range(self.kb_s):
+                            cute.copy(tma_v, tVg[(None, row_block, kb - self.kbg_s, k, b)], tVs[(None, ha.index)], tma_bar_ptr=ha.barrier)
+                            cute.copy(tma_dbk, tDBkg[(None, 0, kb - self.kbg_s, u, k, b)], tDBks[(None, hb.index)], tma_bar_ptr=hb.barrier)
+                    for kb in cutlass.range_constexpr(raw_first, self.kb_s):
+                        hr = raw_prod.acquire_and_advance()
+                        cute.copy(tma_k, tKg[(None, row_block, kb, k, b)], tKs[(None, hr.index)], tma_bar_ptr=hr.barrier)
+                    for kb in cutlass.range(self.kbg_s):
                         hb = b_prod.acquire_and_advance()
                         cute.copy(tma_damn, tDAmng[(None, 0, kb, u, k, b)], tDAmns[(None, hb.index)], tma_bar_ptr=hb.barrier)
                     for nt in cutlass.range(self.n_vtiles):
-                        for kb in cutlass.range(self.kb_s):
+                        for kb in cutlass.range(self.kbg_s):
                             hb = b_prod.acquire_and_advance()
                             cute.copy(tma_dbmn, tDBmng[(None, nt, kb, u, k, b)], tDBmns[(None, hb.index)], tma_bar_ptr=hb.barrier)
             raw_prod.tail()
@@ -896,7 +905,7 @@ class AwmChunkBwd:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
-            kpb = cute.size(tCrA, mode=[2])  # k steps per 64-wide block
+            kpb = cute.size(tCrA, mode=[2])  # k steps per operand block
             for t in cutlass.range(bidx, num_tiles, nctas):
                 tb, u, k, b = self._decode(t, nu)
                 if True:
@@ -918,7 +927,7 @@ class AwmChunkBwd:
                     for g in cutlass.range(1 + self.n_vtiles):
                         e_o = acc_prod.acquire_and_advance()
                         acc_g = acc[(None, None, None, e_o.index)]
-                        for kb in cutlass.range(self.kb_s):
+                        for kb in cutlass.range(self.kbg_s):
                             hb = b_cons.wait_and_advance()
                             tm_kmn.set(tcgen05.Field.ACCUMULATE, kb > 0)
                             for kk in cutlass.range_constexpr(kpb):
