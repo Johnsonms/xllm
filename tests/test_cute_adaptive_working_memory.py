@@ -114,7 +114,8 @@ CASES = [  # B, H, K, S, V, L, C, with_memory, seg_rate
     (2, 4, 4, 128, 256, 512, 256, False, 0.5),  # two chunks: a single update
     (1, 4, 2, 256, 256, 2048, 512, True, 1.5),  # many segment boundaries
     (2, 8, 4, 256, 256, 16384, 4096, False, 0.3),  # gekko-0.9B
-    (1, 4, 4, 256, 2048, 16384, 4096, False, 0.3),  # gekko-7.1B
+    (1, 4, 4, 256, 2048, 16384, 4096, False, 0.3),  # gekko-7.1B (tcgen05 recurrence)
+    (1, 2, 2, 256, 1024, 4096, 1024, True, 0.5),  # tcgen05 recurrence with memory, previous chunk, segments
 ]
 
 
