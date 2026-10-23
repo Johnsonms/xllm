@@ -3,7 +3,7 @@
 This handoff covers two tasks:
 
 - `TimestepDecayNorm` (TSDN): forward and backward are done.
-- `AdaptiveWorkingMemory` (AWM): the forward is done; the backward is next.
+- `AdaptiveWorkingMemory` (AWM): forward and backward are done (section 6 has what is left).
 
 Both are written in the CuTe Python DSL (nvidia-cutlass-dsl 4.8.1) and target B200 (sm_100a).
 
@@ -14,7 +14,7 @@ The original request came from Max: replace the CUB/torch implementations with F
 | Branch | Content |
 |---|---|
 | `cute-timestep-decay-norm` | TSDN fwd+bwd kernels, tests, and the `timenorm_backend='cute'` wiring (10 commits on `main`). |
-| `cute-adaptive-working-memory` | The TSDN branch plus the AWM forward kernels, tests, `awm_backend='cute'` wiring, and the backward spec. Head `1165bc7`. **This is the working branch.** |
+| `cute-adaptive-working-memory` | The TSDN branch plus the AWM forward and backward kernels, tests and the `awm_backend='cute'` wiring. **This is the working branch.** |
 | `cute-kernels-handoff` | `cute-adaptive-working-memory` plus this `handoff/` directory (dev scripts, notes, venv freeze). Do not merge it; it is for reference only. |
 
 Commit convention (no git identity is configured on the machines):
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 ## 2. Environment setup on a new node
 
-The steps below assume 8× B200, driver with CUDA 13, and system python 3.10. The repo lives at `~/xllm` and the venv at `~/xllm-venv`. Many scratch scripts hardcode `/home/johnson/xllm`; clone there, or symlink it.
+The steps below assume 8× B200, driver with CUDA 13, and system python 3.10. (On slinky-0 the system CUDA 13.1 nvcc and ncu in /usr/local/cuda/bin work directly: no pip toolchain or ncu download needed; `xllm_extension` built with `CUDA_HOME=/usr/local/cuda`.) The repo lives at `~/xllm` and the venv at `~/xllm-venv`. Many scratch scripts hardcode `/home/johnson/xllm`; clone there, or symlink it.
 
 ```bash
 git clone https://github.com/Johnsonms/xllm.git ~/xllm && cd ~/xllm && git checkout cute-adaptive-working-memory
@@ -95,7 +95,7 @@ They hold the detailed lessons: DSL pitfalls, perf studies, and failed experimen
 
 ```bash
 cd ~/xllm
-~/xllm-venv/bin/python -m pytest tests/test_cute_adaptive_working_memory.py -q          # 12 pass (9 fwd + 3 phased-bwd spec)
+~/xllm-venv/bin/python -m pytest tests/test_cute_adaptive_working_memory.py -q          # 20 pass
 ~/xllm-venv/bin/python -m pytest tests/normalization/test_cute_timestep_decay_norm.py -q # 27 pass
 cd handoff/scripts/awm
 ~/xllm-venv/bin/python bench_awm_ev.py 2,8,4,256,256,16384,4096 1,32,8,128,128,16384,4096 1,4,4,256,2048,16384,4096
@@ -181,31 +181,66 @@ Real training shapes are listed in `handoff/memory/xllm-cute-awm.md`:
 
 `AwmRecurrenceUmma` on 7.1B: every CTA exits at about 40 µs, but the loops end at 22–32 µs. About 10–15 µs of tail time is unexplained: it is not the Mᵀ writes, and the mem_out store and TMEM free are suspects. The globaltimer probe for this is `handoff/scripts/awm/recprobe/`.
 
-## 6. Next step: AWM backward kernels
+## 6. AWM backward: done (2026-10-23, node slinky-0)
 
-Training currently spends about 36 ms per step on the torch recompute (`_accum_fwd`) and about 59 ms on the torch backward (0.9B). Follow `awm_bwd_phased` in `adaptive_working_memory_reference.py`, and the prototype `handoff/scripts/awm/awm_bwd_proto.py`:
+Files:
 
-- **3′. `dq_c = dOut_c · M_cᵀ` and `dMo_c = Σ_h q_cᵀ · dOut_c`.** These are parallel over chunks and have the same structure as `AwmOutGemm`, so reuse it. M_c must be saved by the forward (or recomputed by the recurrence), so the forward needs a "save M sequence" option.
-- **2′. Reverse recurrence over the updates.** Set D = B − A·M − M and dr = Σ_v G∘D. Then:
-  - dB = r·G
-  - dA = −(r·G)·Mᵀ
-  - G_prev = (1−r)·G − Aᵀ·(r·G) + dMo
-  - the lse and lnt chain through logaddexp, plus memory-reset masking.
+- `xllm/modules/fused_ops/cute/adaptive_working_memory_bwd.py`: the backward kernels and host side. Its docstring
+  lists the kernels and the performance table.
+- The forward (`adaptive_working_memory.py`) gained `return_workspace=True` (the tensors in `WORKSPACE_KEYS`:
+  lse partials, [A | B], bf16 A, M sequence, D, r, -M, dead flags, M^T; ~29 MB per layer on 0.9B, ~90 MB on
+  7.1B) and the recurrence kernels a `save` mode; the host side is split into `_phases12` / `_out_gemm`.
+- Wiring: `AdaptiveWorkingMemoryFunc` saves the workspace and calls `awm_bwd_prepare` / `awm_bwd_finish`; the
+  fused Gekko block does the same (it recomputes the AWM output between the two halves). `awm_backend='cute'`
+  falls back to the torch recompute + backward when an input memory / previous chunk is given (context-parallel
+  ranks > 0) or V is not a multiple of S.
+- Tests: `tests/test_cute_adaptive_working_memory.py` (20: forward, phased-backward spec, backward vs FP64
+  autograd on the Gekko shapes, saved-workspace path).
 
-  This is sequential like the forward recurrence, so the two `AwmRecurrence*` kernels are the template.
-- **1′. Per-chunk kernel, parallel.** Compute:
-  - dqk = Pᵀ·dA
-  - dv = Pᵀ·dB
-  - dP = dA·qkᵀ + dB·vᵀ
-  - dk = P∘(dP − rowsum(P∘dP)) + P·dlse
+Algorithm: the mirror of the forward phases (spec in `adaptive_working_memory_reference.py::awm_bwd_phased`):
+3' dq = dOut M_c^T (the forward output GEMM with S and V swapped, streamed memory tile when it does not fit) and
+dMo = sum_h q_c^T dOut_c (split-K GEMM, masked time tiles skipped); 2' reverse recurrence G <- (1 - r) G -
+A^T (rG) + dMo with dB = rG written and dr partials, dA = dB (-M)^T as a batched matmul afterwards, then delta =
+rowdot(dA, A) + rowdot(dB, B) (= sum_t P dP) and the lse chain; 1' per 128 time rows: dP^T = qk dA^T + v dB^T,
+P^T = exp(k - lse), dk = P^T (dP^T - delta + dlse), dqk = P^T dA, dv = P^T dB.
 
-  P is recomputed from k and lse, as in the forward. Use the `AwmChunkGemm` structure for this.
-- Then wire it as `awm_backend='cute'` in the backward of `AdaptiveWorkingMemoryFunc` and the fused block, and validate the end-to-end loss and gradients with `run_gekko.py`.
+GPU time per call (bf16, L = 16384, with segments, saved workspaces):
+
+| Model | CuTe backward | Torch recompute + backward |
+|---|---|---|
+| gekko-0.9B | 236 us (chunk 88, dq 49, dMo 48, recurrence 30) | ~3.5 ms |
+| gekko-4B | 142 us | ~2.5 ms |
+| gekko-7.1B | 400 us (chunk 181, dq 72, dMo 72, recurrence 30) | ~3.1 ms |
+
+Training step on 1 GPU (`run_gekko.py`): AWM backward 99 -> 6 ms per step (0.9B, B2 L16K, step 1409 -> 1262 ms),
+98 -> 11 ms (7.1B, B1, step 1274 -> 1149 ms); gradient norms match the torch backend.
+
+### Where the time goes and what was tried
+
+- `AwmChunkBwd` (persistent, 2 epilogue warp groups, TMA-store epilogues, 32-row operand blocks in 4-stage
+  rings): per 128-row tile ~15 us = dP^T GEMM phase ~7 us (bound by ring bytes / TMA round trip: the dA | dB
+  operand, 256 KB per tile, is re-streamed by every tile) and the three epilogues ~7 us, which cannot overlap the
+  next tile's GEMM with only two TMEM accumulators. Tried: separate dP^T / dqk-dv pipelines (the next dP^T starts
+  after the dk epilogue, but dv then waits for the dqk epilogue: slower, 95 us); dqk / dv in two TMEM halves
+  placed with pointer offsets (wrong results: the second use of a half read the first use's data - avoid
+  `tmem_ptr + offset`, use a stacked fragment); issuing the last raw key blocks before the GEMM loads (slower).
+  Next: a 2-CTA (cta_group::2) dP^T GEMM halves the B bytes per CTA; 7.1B (K = 2304) would gain most.
+- `AwmDmoGemm` is at ~56% of HBM SOL; `AwmOutGemm` (dq) is the forward kernel.
+- `AwmRecurrenceBwd`: ~10 us per update; the dA GEMM was moved out of the chain (batched matmul).
+- Feature gap: context-parallel ranks > 0 (input memory and previous chunk) use the torch backward. The kernels
+  have the hooks (`first`, `has_prev`, `has_dmem`, `_seg_anchor`) but the chunk kernel reads the update chunk
+  from the current sequence only and the previous-chunk gradients are not produced.
 
 ## 7. Dev scripts (`handoff/scripts/`)
 
 These were copied from the session scratchpad and are not polished. Most assume the repo is at `/home/johnson/xllm`.
 
+- **`awm/bwd/`** (backward; they import the tests' `make_inputs`): `check_bwd.py <phases>` checks phases 3, 2
+  (`dmem`), 1 against the FP64 spec; `prof_bwd.py <shape>` per-kernel GPU times (torch.profiler) of the saved-
+  workspace path; `bench_bwd.py` event timing; `diag_dk2.py` repeated-run determinism; `ncu_bwd.py` +
+  `ncu_lines.py` per-source-line stall samples (`ncu --page source --print-source cuda,sass --csv` with
+  `CUTE_DSL_LINEINFO=1`); `recprobe/` globaltimer timeline probes (they need a copy of the module with the probe
+  lines; the generators lived in the session, see the memory notes).
 - **`awm/`**
   - `check_awm_fwd.py` provides `make` and `as_blhs_views` and is imported by the others.
   - `bench_awm_ev.py` measures back-to-back event time; `bench_awm_fwd.py` and `breakdown_awm.py` give the per-kernel split.
