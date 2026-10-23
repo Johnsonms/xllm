@@ -23,7 +23,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import BFloat16, Float32, Int32, Uint8, const_expr
+from cutlass import BFloat16, Float32, Int32, Int64, Uint8, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 
@@ -39,8 +39,9 @@ class AwmOutGemm:
     range, so the memory tile (VT x S, resident in shared memory) is reloaded only when the group changes.
     """
 
-    def __init__(self, H: int, K: int, S: int, V: int, C: int, a_stages: int = 4):
+    def __init__(self, H: int, K: int, S: int, V: int, C: int, has_prev: bool, has_seg: bool, a_stages: int = 4):
         self.H, self.K, self.S, self.V, self.C = H, K, S, V, C
+        self.has_prev, self.has_seg = has_prev, has_seg
         self.n_rep = H // K
         self.TM = 128
         self.VT = min(V, 256)
@@ -61,18 +62,20 @@ class AwmOutGemm:
         self.k_tiles = S // self.KB
 
     @cute.jit
-    def __call__(self, tQ: cute.Tensor, tMT: cute.Tensor, tOut: cute.Tensor, tMask: cute.Tensor,
-                 B: Int32, L: Int32, num_ctas: Int32, stream: cuda.CUstream):
+    def __call__(self, tQ: cute.Tensor, tMT: cute.Tensor, tOut: cute.Tensor, tSeg: cute.Tensor, tPrevCount: cute.Tensor,
+                 tDead: cute.Tensor, tOutMask: cute.Tensor, B: Int32, L: Int32, seg_off: Int32, seg_stride: Int32,
+                 num_ctas: Int32, stream: cuda.CUstream):
         H, K, S, V = self.H, self.K, self.S, self.V
         nc = L // self.C
-        pQ, pMT, pOut, pMask = tQ.iterator, tMT.iterator, tOut.iterator, tMask.iterator
+        pQ, pMT, pOut = tQ.iterator, tMT.iterator, tOut.iterator
         # q [B, L, H, S] as (M = L, K = S, H, B)
         mQ = cute.make_tensor(pQ, cute.make_layout((L, S, H, B), stride=(H * S, 1, S, L * H * S)))
         # MT [(b, k, c), V, S] as (N = V, K = S, (c, k, b))
         mMT = cute.make_tensor(pMT, cute.make_layout((V, S, B * K * nc), stride=(S, 1, V * S)))
         # out [B, L, H, V] as (M = L, N = V, H, B)
         mOut = cute.make_tensor(pOut, cute.make_layout((L, V, H, B), stride=(H * V, 1, V, L * H * V)))
-        mMask = cute.make_tensor(pMask, cute.make_layout((L, B), stride=(1, L)))
+        mOutMask = cute.make_tensor(tOutMask.iterator, cute.make_layout((L, B), stride=(1, L)))
+        mDead = cute.make_tensor(tDead.iterator, cute.make_layout((nc, B), stride=(1, nc)))
 
         op = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, self.VT, 16), tcgen05.CtaGroup.ONE,
                                   tcgen05.OperandSource.SMEM, tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
@@ -92,16 +95,17 @@ class AwmOutGemm:
             cpasync.CopyBulkTensorTileS2GOp(), mOut, cute.slice_(epi_smem_layout, (None, None, 0)), epi_tile)
 
         num_tiles = self.n_vt * B * K * nc * self.n_rep * self.row_tiles
-        self.kernel(tiled_mma, tma_a, mQ_tma, tma_b, mMT_tma, tma_c, mOut_tma, mMask,
-                    a_smem_layout, b_smem_layout, epi_smem_layout, epi_tile, c_layout_kind,
-                    B, nc, num_tiles).launch(grid=[num_ctas, 1, 1], block=[self.threads, 1, 1], stream=stream)
+        self.kernel(tiled_mma, tma_a, mQ_tma, tma_b, mMT_tma, tma_c, mOut_tma, tSeg.iterator, tPrevCount.iterator,
+                    mDead, mOutMask, a_smem_layout, b_smem_layout, epi_smem_layout, epi_tile, c_layout_kind,
+                    B, nc, num_tiles, seg_off, seg_stride).launch(grid=[num_ctas, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, tiled_mma: cute.TiledMma, tma_a: cute.CopyAtom, mQ: cute.Tensor, tma_b: cute.CopyAtom,
-               mMT: cute.Tensor, tma_c: cute.CopyAtom, mOut: cute.Tensor, mMask: cute.Tensor,
-               a_smem_layout: cute.ComposedLayout, b_smem_layout: cute.ComposedLayout,
-               epi_smem_layout: cute.ComposedLayout, epi_tile: cute.Tile, c_layout_kind: cutlass.Constexpr,
-               B: Int32, nc: Int32, num_tiles: Int32):
+               mMT: cute.Tensor, tma_c: cute.CopyAtom, mOut: cute.Tensor, pSeg: cute.Pointer, pPrevCount: cute.Pointer,
+               mDead: cute.Tensor, mOutMask: cute.Tensor, a_smem_layout: cute.ComposedLayout,
+               b_smem_layout: cute.ComposedLayout, epi_smem_layout: cute.ComposedLayout, epi_tile: cute.Tile,
+               c_layout_kind: cutlass.Constexpr, B: Int32, nc: Int32, num_tiles: Int32, seg_off: Int32,
+               seg_stride: Int32):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -230,8 +234,17 @@ class AwmOutGemm:
                 rt, hr, c, k, b, vt = self._decode(t, B, nc)
                 row_block = c * self.row_tiles + rt
                 h = k * self.n_rep + hr
-                # this thread's row of the tile (TMEM lane = row for M = 128) and its mask
-                keep = Float32(1.0) - Int32(mMask[row_block * self.TM + tidx, b]).to(Float32)
+                # this thread's row of the tile (TMEM lane = row for M = 128) and its mask: the chunk's memory is
+                # empty, or the row is not in the segment that the memory ends in (that of chunk c - 2)
+                row = row_block * self.TM + tidx
+                masked = mDead[c, b] != 0
+                if const_expr(self.has_seg):
+                    if c >= 2 or const_expr(self.has_prev):
+                        seg_row = cute.make_tensor(pSeg + (b * seg_stride + seg_off + row), cute.make_layout(1))[0]
+                        masked = masked | (seg_row != _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C))
+                keep = cutlass.select_(masked, Float32(0.0), Float32(1.0))
+                if hr == 0 and vt == 0 and k == 0:
+                    mOutMask[row, b] = cutlass.select_(masked, Uint8(1), Uint8(0))
                 acc_full = acc_cons.wait_and_advance()
                 tCtAcc = tCtAcc_base[(None, None, None, acc_full.index)]
                 tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
@@ -289,37 +302,44 @@ LOG2E = math.log2(math.e)
 NEG_BIG = -1.0e30  # finite stand-in for -inf in running maxima (exp2 of differences stays 0, never NaN)
 
 
-class AwmKeyLse:
-    """Phase 1a: lse[b, k, j, s] = logsumexp over the rows t of update chunk j of k[b, t, k, s], rows with
-    kmask[b, t] != 0 excluded. k is read as [B, L, K, S].
+class AwmKeyLsePart:
+    """Phase 1a: partial base-2 log-sum-exp of the keys over time. For update chunk j (output index
+    j + j_off) and row split rs (C / R rows), part[b, k, j + j_off, rs, s] = (m, l) with
+    log2 sum_t 2^(k[t, s] log2 e) = m + log2 l over the split's rows; rows outside the segment of their chunk's
+    last row are excluded (segment ids read from seg[b * seg_stride + seg_off + t] when has_seg).
+    The consumers combine the R partials. k is read as [B, L, K, S].
 
-    One CTA per (b, k, j, 64 columns of s), 256 threads = 8 column groups (8 columns, one 16-byte load each)
-    x 32 row groups; online base-2 log-sum-exp in fp32, rescaled once per 4 rows; the 32 row groups are
-    combined through shared memory."""
+    One CTA per (b, k, j, 64 columns of s, row split), 256 threads = 8 column groups (8 columns, one 16-byte
+    load each) x 32 row groups; online in fp32, rescaled once per 4 rows; row groups combined in shared memory."""
 
-    def __init__(self, K: int, S: int, C: int):
-        self.K, self.S, self.C = K, S, C
+    def __init__(self, K: int, S: int, C: int, R: int, has_seg: bool):
+        self.K, self.S, self.C, self.R, self.has_seg = K, S, C, R, has_seg
         self.SB = 64
         self.RG = 32
         self.UNROLL = 4
-        assert S % self.SB == 0 and C % (self.RG * self.UNROLL) == 0
+        assert S % self.SB == 0 and C % (R * self.RG * self.UNROLL) == 0
 
     @cute.jit
-    def __call__(self, tK: cute.Tensor, tMask: cute.Tensor, tLse: cute.Tensor, B: Int32, L: Int32, nu: Int32,
-                 stream: cuda.CUstream):
-        mK = cute.make_tensor(tK.iterator, cute.make_layout((self.S, L, self.K, B), stride=(1, self.K * self.S, self.S, L * self.K * self.S)))
-        mMask = cute.make_tensor(tMask.iterator, cute.make_layout((L, B), stride=(1, L)))
-        mLse = cute.make_tensor(tLse.iterator, cute.make_layout((self.S, nu, self.K, B), stride=(1, self.S, nu * self.S, self.K * nu * self.S)))
-        grid = B * self.K * nu * (self.S // self.SB)
-        self.kernel(mK, mMask, mLse, nu).launch(grid=[grid, 1, 1], block=[8 * self.RG, 1, 1], stream=stream)
+    def __call__(self, tK: cute.Tensor, tSeg: cute.Tensor, tPart: cute.Tensor, B: Int32, L: Int32, nu: Int32,
+                 j_off: Int32, nu_tot: Int32, seg_off: Int32, seg_stride: Int32, stream: cuda.CUstream):
+        K, S, R = self.K, self.S, self.R
+        mK = cute.make_tensor(tK.iterator, cute.make_layout((S, L, K, B), stride=(1, K * S, S, L * K * S)))
+        mPart = cute.make_tensor(tPart.iterator, cute.make_layout((2, S, R, nu_tot, K, B), stride=(
+            1, 2, 2 * S, 2 * S * R, 2 * S * R * nu_tot, 2 * S * R * nu_tot * K)))
+        grid = B * K * nu * (S // self.SB) * R
+        self.kernel(mK, tSeg.iterator, mPart, nu, j_off, seg_off, seg_stride).launch(
+            grid=[grid, 1, 1], block=[8 * self.RG, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, mK: cute.Tensor, mMask: cute.Tensor, mLse: cute.Tensor, nu: Int32):
+    def kernel(self, mK: cute.Tensor, pSeg: cute.Pointer, mPart: cute.Tensor, nu: Int32, j_off: Int32,
+               seg_off: Int32, seg_stride: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         nsb = self.S // self.SB
-        sb = bidx % nsb
-        rest = bidx // nsb
+        rs = bidx % self.R
+        rest = bidx // self.R
+        sb = rest % nsb
+        rest = rest // nsb
         j = rest % nu
         rest = rest // nu
         k = rest % self.K
@@ -327,16 +347,23 @@ class AwmKeyLse:
         sg = tidx % 8
         rg = tidx // 8
         s0 = sb * self.SB + sg * 8
+        rows = self.C // self.R
+        seg_last = Int64(0)
+        if const_expr(self.has_seg):
+            seg_last = cute.make_tensor(pSeg + (b * seg_stride + seg_off + j * self.C + self.C - 1), cute.make_layout(1))[0]
         m = [Float32(NEG_BIG) for _ in range(8)]
         acc = [Float32(0.0) for _ in range(8)]
-        r_base = j * self.C + rg
-        for it in cutlass.range(self.C // (self.RG * self.UNROLL)):
+        r_base = j * self.C + rs * rows + rg
+        for it in cutlass.range(rows // (self.RG * self.UNROLL)):
             xs = []
             for u in cutlass.range_constexpr(self.UNROLL):
                 r = r_base + (it * self.UNROLL + u) * self.RG
                 v = cute.make_tensor((mK.iterator + mK.layout((s0, r, k, b))).align(16), cute.make_layout(8)).load().to(Float32)
-                masked = mMask[r, b] != 0
-                xs.append([cutlass.select_(masked, Float32(NEG_BIG), v[e] * LOG2E) for e in range(8)])
+                if const_expr(self.has_seg):
+                    masked = cute.make_tensor(pSeg + (b * seg_stride + seg_off + r), cute.make_layout(1))[0] != seg_last
+                    xs.append([cutlass.select_(masked, Float32(NEG_BIG), v[e] * LOG2E) for e in range(8)])
+                else:
+                    xs.append([v[e] * LOG2E for e in range(8)])
             for e in cutlass.range_constexpr(8):
                 bmax = xs[0][e]
                 for u in cutlass.range_constexpr(1, self.UNROLL):
@@ -361,7 +388,32 @@ class AwmKeyLse:
             tot = Float32(0.0)
             for g in cutlass.range_constexpr(self.RG):
                 tot = tot + sL[tidx, g] * cute.math.exp2(sM[tidx, g] - mm, fastmath=True)
-            mLse[sb * self.SB + tidx, j, k, b] = (mm + cute.math.log2(tot, fastmath=True)) * (1.0 / LOG2E)
+            mPart[0, sb * self.SB + tidx, rs, j + j_off, k, b] = mm
+            mPart[1, sb * self.SB + tidx, rs, j + j_off, k, b] = tot
+
+
+@cute.jit
+def _seg_anchor(pSeg: cute.Pointer, pPrevCount: cute.Pointer, b, x, seg_off, seg_stride, C: cutlass.Constexpr):
+    """Segment id at the end of chunk x: the last row of chunk x for x >= 0, of the previous call's last chunk for
+    x = -1 (stored in front of the current rows), the previous segment count for x = -2."""
+    val = Int64(0)
+    if x == -2:
+        val = cute.make_tensor(pPrevCount + b, cute.make_layout(1))[0]
+    else:
+        val = cute.make_tensor(pSeg + (b * seg_stride + seg_off + x * C + C - 1), cute.make_layout(1))[0]
+    return val
+
+
+@cute.jit
+def _combine_lse2(mPart: cute.Tensor, s, j, k, b, R: cutlass.Constexpr):
+    """log2 sum over the R partials (m, l) of row s: max m + log2 sum l 2^(m - max m)."""
+    mm = mPart[0, s, 0, j, k, b]
+    for r in cutlass.range_constexpr(1, R):
+        mm = cute.arch.fmax(mm, mPart[0, s, r, j, k, b])
+    tot = Float32(0.0)
+    for r in cutlass.range_constexpr(R):
+        tot = tot + mPart[1, s, r, j, k, b] * cute.math.exp2(mPart[0, s, r, j, k, b] - mm, fastmath=True)
+    return mm + cute.math.log2(tot, fastmath=True)
 
 
 def chunk_gemm_tiling(S: int, V: int) -> Tuple[int, int, int]:
@@ -394,8 +446,8 @@ class AwmChunkGemm:
       warp 4:    tcgen05 MMAs, one fp32 accumulator of NS TMEM columns per sub-tile
     """
 
-    def __init__(self, K: int, S: int, V: int, C: int, splits: int, stages: int = 4):
-        self.K, self.S, self.V, self.C = K, S, V, C
+    def __init__(self, K: int, S: int, V: int, C: int, splits: int, R: int, has_seg: bool, stages: int = 4):
+        self.K, self.S, self.V, self.C, self.R, self.has_seg = K, S, V, C, R, has_seg
         self.NS, self.nsub, self.n_blocks = chunk_gemm_tiling(S, V)
         self.TM = 128
         self.KB = 32
@@ -413,17 +465,19 @@ class AwmChunkGemm:
         assert self.nsub * self.NS <= 512
 
     @cute.jit
-    def __call__(self, tK: cute.Tensor, tQK: cute.Tensor, tV: cute.Tensor, tMask: cute.Tensor, tLse: cute.Tensor,
-                 tAB: cute.Tensor, B: Int32, L: Int32, nu: Int32, stream: cuda.CUstream):
+    def __call__(self, tK: cute.Tensor, tQK: cute.Tensor, tV: cute.Tensor, tSeg: cute.Tensor, tPart: cute.Tensor,
+                 tAB: cute.Tensor, B: Int32, L: Int32, nu: Int32, j_off: Int32, nu_tot: Int32, seg_off: Int32,
+                 seg_stride: Int32, stream: cuda.CUstream):
         K, S, V = self.K, self.S, self.V
         # operands as (MN, K = time, kv head, batch), MN contiguous
         mK = cute.make_tensor(tK.iterator, cute.make_layout((S, L, K, B), stride=(1, K * S, S, L * K * S)))
         mQK = cute.make_tensor(tQK.iterator, cute.make_layout((S, L, K, B), stride=(1, K * S, S, L * K * S)))
         mV = cute.make_tensor(tV.iterator, cute.make_layout((V, L, K, B), stride=(1, K * V, V, L * K * V)))
-        mMask = cute.make_tensor(tMask.iterator, cute.make_layout((L, B), stride=(1, L)))
-        mLse = cute.make_tensor(tLse.iterator, cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S)))
-        mAB = cute.make_tensor(tAB.iterator, cute.make_layout((self.NAB, S, nu, K, B),
-                                                              stride=(1, self.NAB, S * self.NAB, nu * S * self.NAB, K * nu * S * self.NAB)))
+        R = self.R
+        mPart = cute.make_tensor(tPart.iterator, cute.make_layout((2, S, R, nu_tot, K, B), stride=(
+            1, 2, 2 * S, 2 * S * R, 2 * S * R * nu_tot, 2 * S * R * nu_tot * K)))
+        mAB = cute.make_tensor(tAB.iterator, cute.make_layout((self.NAB, S, nu_tot, K, B), stride=(
+            1, self.NAB, S * self.NAB, nu_tot * S * self.NAB, K * nu_tot * S * self.NAB)))
 
         op = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, self.NS, 16), tcgen05.CtaGroup.ONE,
                                   tcgen05.OperandSource.SMEM, tcgen05.OperandMajorMode.MN, tcgen05.OperandMajorMode.MN)
@@ -437,13 +491,14 @@ class AwmChunkGemm:
         tma_qk, mQK_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mQK, b_one, tiler, tiled_mma)
         tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mV, b_one, tiler, tiled_mma)
         grid = B * K * nu * self.m_blocks * self.n_blocks * self.splits
-        self.kernel(tiled_mma, tma_k, mK_t, tma_qk, mQK_t, tma_v, mV_t, mMask, mLse, mAB, a_layout, b_layout,
-                    B, nu).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+        self.kernel(tiled_mma, tma_k, mK_t, tma_qk, mQK_t, tma_v, mV_t, tSeg.iterator, mPart, mAB, a_layout, b_layout,
+                    B, nu, j_off, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, tiled_mma: cute.TiledMma, tma_k: cute.CopyAtom, mK: cute.Tensor, tma_qk: cute.CopyAtom,
-               mQK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor, mMask: cute.Tensor, mLse: cute.Tensor,
-               mAB: cute.Tensor, a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout, B: Int32, nu: Int32):
+               mQK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor, pSeg: cute.Pointer, mPart: cute.Tensor,
+               mAB: cute.Tensor, a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout, B: Int32, nu: Int32,
+               j_off: Int32, seg_off: Int32, seg_stride: Int32):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -565,14 +620,21 @@ class AwmChunkGemm:
             g = tidx % 16  # 8 consecutive s rows: 8g .. 8g + 7 of the CTA's 128
             kq = tidx // 16  # time rows kq + 8 r of a stage
             s_base = mb * self.TM + 8 * g
-            lse2 = [mLse[s_base + e, j, k, b] * LOG2E for e in range(8)]
+            lse2 = [_combine_lse2(mPart, s_base + e, j + j_off, k, b, self.R) for e in range(8)]
+            seg_row0 = b * seg_stride + seg_off + row0
+            seg_last = Int64(0)
+            if const_expr(self.has_seg):
+                seg_last = cute.make_tensor(pSeg + (b * seg_stride + seg_off + j * self.C + self.C - 1), cute.make_layout(1))[0]
             stage_elems = self.TM * self.KB
             for t in cutlass.range(n_kt):
                 hk = k_cons.wait_and_advance()
                 hp = p_prod.acquire_and_advance()
                 for r in cutlass.range_constexpr(self.KB // 8):
                     kk = kq + 8 * r
-                    keep = Float32(1.0) - Int32(mMask[row0 + t * self.KB + kk, b]).to(Float32)
+                    keep = Float32(1.0)
+                    if const_expr(self.has_seg):
+                        seg_r = cute.make_tensor(pSeg + (seg_row0 + t * self.KB + kk), cute.make_layout(1))[0]
+                        keep = cutlass.select_(seg_r != seg_last, Float32(0.0), Float32(1.0))
                     off = ((8 * g) % 64 + ((8 * g) // 64) * (64 * self.KB) + (kk % 16) * 64 + (kk // 16) * 1024) * 2
                     off = off ^ (((off >> 7) & 7) << 4)
                     elem = hk.index * stage_elems + off // 2
@@ -604,7 +666,7 @@ class AwmChunkGemm:
                         quad = cute.make_rmem_tensor((4,), Float32)
                         for e in cutlass.range_constexpr(4):
                             quad[e] = regs[q4 * 4 + e]
-                        dst = mAB.iterator + mAB.layout((col_base + cchunk * 32 + q4 * 4, s_row, j, k, b))
+                        dst = mAB.iterator + mAB.layout((col_base + cchunk * 32 + q4 * 4, s_row, j + j_off, k, b))
                         cute.arch.red(dst.llvm_ptr, quad.load(), op="add", dtype=Float32, sem="relaxed", scope="gpu")
             with cute.arch.elect_one():
                 acc_full.release()
@@ -627,8 +689,10 @@ class AwmRecurrence:
     product A M runs on tensor cores (mma.sync, bf16 operands, fp32 accumulation) with A staged in shared memory
     KB columns at a time and M^T kept in shared memory as bf16."""
 
-    def __init__(self, K: int, S: int, V: int, C: int, has_memory: bool, VT: int = 64):
-        self.K, self.S, self.V, self.C, self.has_memory = K, S, V, C, has_memory
+    def __init__(self, K: int, S: int, V: int, C: int, R: int, has_memory: bool, has_prev: bool, has_seg: bool,
+                 VT: int = 64):
+        self.K, self.S, self.V, self.C, self.R = K, S, V, C, R
+        self.has_memory, self.has_prev, self.has_seg = has_memory, has_prev, has_seg
         self.VT = min(VT, V)
         self.KB = 64
         self.NAB = S + V
@@ -637,30 +701,33 @@ class AwmRecurrence:
         assert V % self.VT == 0 and S % self.KB == 0 and S % 128 == 0 and self.VT % 16 == 0
 
     @cute.jit
-    def __call__(self, tLse: cute.Tensor, tAB: cute.Tensor, tMemIn: cute.Tensor, tLntIn: cute.Tensor,
-                 tMemMask: cute.Tensor, tOutMask: cute.Tensor, tMT: cute.Tensor, tMemOut: cute.Tensor,
-                 tLntOut: cute.Tensor, B: Int32, nc: Int32, nu: Int32, first: Int32, stream: cuda.CUstream):
+    def __call__(self, tPart: cute.Tensor, tAB: cute.Tensor, tMemIn: cute.Tensor, tLntIn: cute.Tensor,
+                 tSeg: cute.Tensor, tPrevCount: cute.Tensor, tDead: cute.Tensor, tMT: cute.Tensor, tMemOut: cute.Tensor,
+                 tLntOut: cute.Tensor, B: Int32, nc: Int32, nu: Int32, seg_off: Int32, seg_stride: Int32,
+                 stream: cuda.CUstream):
         K, S, V = self.K, self.S, self.V
-        mLse = cute.make_tensor(tLse.iterator, cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S)))
+        R = self.R
+        mPart = cute.make_tensor(tPart.iterator, cute.make_layout((2, S, R, nu, K, B), stride=(
+            1, 2, 2 * S, 2 * S * R, 2 * S * R * nu, 2 * S * R * nu * K)))
         mAB = cute.make_tensor(tAB.iterator, cute.make_layout((self.NAB, S, nu, K, B), stride=(
             1, self.NAB, S * self.NAB, nu * S * self.NAB, K * nu * S * self.NAB)))
         mMemIn = cute.make_tensor(tMemIn.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
         mLntIn = cute.make_tensor(tLntIn.iterator, cute.make_layout((S, K, B), stride=(1, S, K * S)))
-        mMemMask = cute.make_tensor(tMemMask.iterator, cute.make_layout((nc, B), stride=(1, nc)))
-        mOutMask = cute.make_tensor(tOutMask.iterator, cute.make_layout((self.C, nc, B), stride=(1, self.C, nc * self.C)))
+        mDead = cute.make_tensor(tDead.iterator, cute.make_layout((nc, B), stride=(1, nc)))
         mMT = cute.make_tensor(tMT.iterator, cute.make_layout((S, V, nc, K, B), stride=(1, S, V * S, nc * V * S, K * nc * V * S)))
         mMemOut = cute.make_tensor(tMemOut.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
         mLntOut = cute.make_tensor(tLntOut.iterator, cute.make_layout((S, K, B), stride=(1, S, K * S)))
         op = cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
         tiled_mma = cute.make_tiled_mma(op, cute.make_layout((8, 1, 1)), permutation_mnk=(128, 16, 16))
         grid = B * K * (V // self.VT)
-        self.kernel(tiled_mma, mLse, mAB, mMemIn, mLntIn, mMemMask, mOutMask, mMT, mMemOut, mLntOut, nc, first).launch(
+        self.kernel(tiled_mma, mPart, mAB, mMemIn, mLntIn, tSeg.iterator, tPrevCount.iterator, mDead, mMT, mMemOut,
+                    mLntOut, nc, seg_off, seg_stride).launch(
             grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, tiled_mma: cute.TiledMma, mLse: cute.Tensor, mAB: cute.Tensor, mMemIn: cute.Tensor,
-               mLntIn: cute.Tensor, mMemMask: cute.Tensor, mOutMask: cute.Tensor, mMT: cute.Tensor,
-               mMemOut: cute.Tensor, mLntOut: cute.Tensor, nc: Int32, first: Int32):
+    def kernel(self, tiled_mma: cute.TiledMma, mPart: cute.Tensor, mAB: cute.Tensor, mMemIn: cute.Tensor,
+               mLntIn: cute.Tensor, pSeg: cute.Pointer, pPrevCount: cute.Pointer, mDead: cute.Tensor, mMT: cute.Tensor,
+               mMemOut: cute.Tensor, mLntOut: cute.Tensor, nc: Int32, seg_off: Int32, seg_stride: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         S, VT, KB = self.S, self.VT, self.KB
@@ -673,7 +740,6 @@ class AwmRecurrence:
         sA = smem.allocate_tensor(BFloat16, cute.make_layout((S, KB), stride=(KB + self.PAD, 1)), byte_alignment=16)
         sMT = smem.allocate_tensor(BFloat16, cute.make_layout((VT, S), stride=(S + self.PAD, 1)), byte_alignment=16)
         sR = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
-        sDead = smem.allocate_tensor(Int32, cute.make_layout(1), byte_alignment=4)
 
         thr_mma = tiled_mma.get_slice(tidx)
         coords = thr_mma.partition_C(cute.make_identity_tensor((S, VT)))
@@ -692,27 +758,28 @@ class AwmRecurrence:
             if const_expr(self.has_memory):
                 lnt = mLntIn[tidx, k, b]
 
+        first = 0 if const_expr(self.has_prev) else 1  # first chunk with an update
         for c in cutlass.range(nc):
             for i in cutlass.range_constexpr(n_frag):
                 s2, v2 = coords[i]
                 mMT[s2, v0 + v2, c, k, b] = m[i].to(BFloat16)
             # outputs of a chunk whose memory is still empty are masked (lnt[b, 0, 0] = -inf)
-            if k == 0 and vt == 0:
-                if tidx == 0:
-                    sDead[0] = cutlass.select_(lnt == Float32(-math.inf), Int32(1), Int32(0))
-                cute.arch.barrier()
-                if sDead[0] != 0:
-                    for row in cutlass.range(tidx, self.C, self.threads):
-                        mOutMask[row, c, b] = Uint8(1)
+            if k == 0 and vt == 0 and tidx == 0:
+                mDead[c, b] = cutlass.select_(lnt == Float32(-math.inf), Uint8(1), Uint8(0))
             if c >= first:
                 u = c - first
-                reset = mMemMask[c, b] != 0
+                reset = False
+                if const_expr(self.has_seg):
+                    # the memory restarts when the chunks before the update's chunk end in different segments
+                    if c >= 2 or const_expr(self.has_prev):
+                        reset = _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C) != \
+                            _seg_anchor(pSeg, pPrevCount, b, c - 1, seg_off, seg_stride, self.C)
                 if reset:
                     m.fill(0.0)
                 if tidx < S:
                     if reset:
                         lnt = Float32(-math.inf)
-                    l_cur = mLse[tidx, u, k, b]
+                    l_cur = _combine_lse2(mPart, tidx, u, k, b, self.R) * (1.0 / LOG2E)
                     hi = cute.arch.fmax(l_cur, lnt)
                     new_lnt = hi + cute.math.log(cute.math.exp(l_cur - hi) + cute.math.exp(lnt - hi))
                     sR[tidx] = cute.math.exp(l_cur - new_lnt)
@@ -790,22 +857,34 @@ def _blhs(t: torch.Tensor) -> torch.Tensor:
     return t if t.is_contiguous() else t.contiguous()
 
 
-def _chunk_ab(k, qk, v, kmask, K, S, V, C, nu):
-    """Phase 1 on [B, L, K, *] tensors: lse [B, K, nu, S] and AB [B, K, nu, S, S + V] (fp32) of chunks 0..nu-1."""
+_DUMMY = {}
+
+
+def _dummy(dtype, device):
+    """A 1-element tensor standing in for an absent optional input (never read)."""
+    key = (dtype, device)
+    if key not in _DUMMY:
+        _DUMMY[key] = torch.zeros(1, dtype=dtype, device=device)
+    return _DUMMY[key]
+
+
+def _chunk_ab(k, qk, v, seg, part, AB, K, S, V, C, R, nu, j_off, seg_off, has_seg):
+    """Phase 1 on [B, L, K, *] tensors for update chunks 0..nu-1 (written at chunk index j_off + j of the
+    workspaces): lse partials [B, K, nu_tot, R, S, 2] and AB [B, K, nu_tot, S, S + V] (fp32, zeroed)."""
     B, L = k.shape[0], k.shape[1]
-    lse = torch.empty(B, K, nu, S, dtype=torch.float32, device=k.device)
-    AB = torch.zeros(B, K, nu, S, S + V, dtype=torch.float32, device=k.device)
-    f_lse = _compiled(("lse", K, S, C), lambda: AwmKeyLse(K, S, C), lambda: (
-        _fake(BFloat16), _fake(_U8, 1), _fake(Float32), Int32(0), Int32(0), Int32(0)))
-    f_lse(k.reshape(-1), kmask.reshape(-1), lse.reshape(-1), B, L, nu)
+    nu_tot = part.shape[2]
+    seg_stride = seg.shape[1] if has_seg else 0
+    f_lse = _compiled(("lse", K, S, C, R, has_seg), lambda: AwmKeyLsePart(K, S, C, R, has_seg), lambda: (
+        _fake(BFloat16), _fake(Int64, 8), _fake(Float32), *([Int32(0)] * 7)))
+    f_lse(k.reshape(-1), seg.reshape(-1), part.reshape(-1), B, L, nu, j_off, nu_tot, seg_off, seg_stride)
     _, _, n_blocks = chunk_gemm_tiling(S, V)
     base = B * K * nu * (S // 128) * n_blocks
     splits = max(1, min(C // 32, round(_sm_count(k.device) / base)))
-    f_ab = _compiled(("ab", K, S, V, C, splits), lambda: AwmChunkGemm(K, S, V, C, splits), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(_U8, 1), _fake(Float32), _fake(Float32),
-        Int32(0), Int32(0), Int32(0)))
-    f_ab(k.reshape(-1), qk.reshape(-1), v.reshape(-1), kmask.reshape(-1), lse.reshape(-1), AB.reshape(-1), B, L, nu)
-    return lse, AB
+    f_ab = _compiled(("ab", K, S, V, C, splits, R, has_seg), lambda: AwmChunkGemm(K, S, V, C, splits, R, has_seg),
+                     lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int64, 8), _fake(Float32),
+                              _fake(Float32), *([Int32(0)] * 7)))
+    f_ab(k.reshape(-1), qk.reshape(-1), v.reshape(-1), seg.reshape(-1), part.reshape(-1), AB.reshape(-1),
+         B, L, nu, j_off, nu_tot, seg_off, seg_stride)
 
 
 def adaptive_working_memory_fwd(
@@ -815,77 +894,60 @@ def adaptive_working_memory_fwd(
     """Drop-in for xllm.modules.fused_ops.adaptive_working_memory._adaptive_working_memory_fwd (ortho=False):
     query [B, H, L, S], qkey / key [B, K, L, S], value [B, K, L, V] (views of [B, L, *, D] storage are read
     without copies). Returns out [B, H, L, V] (a view of [B, L, H, V] storage), out_mask [B, L],
-    memory [B, K, S, V] (dtype of query) and log_norm_term [B, K, S] (fp32)."""
+    memory [B, K, S, V] (dtype of query) and log_norm_term [B, K, S] (fp32). All masks are derived from
+    segment_idx inside the kernels."""
     assert not ortho, "orthogonal update is not supported by the CuTe kernels"
     B, H, L, S = query.shape
     K, V = value.shape[1], value.shape[3]
     C = chunk_size
-    assert L % C == 0 and query.dtype == torch.bfloat16
+    assert L % C == 0 and C % 128 == 0 and query.dtype == torch.bfloat16
     nc = L // C
     dev = query.device
     has_prev = prev_key is not None
-    if memory is None:
-        assert log_norm_term is None and not has_prev
-
-    q, qk, k, v = _blhs(query), _blhs(qkey), _blhs(key), _blhs(value)
-
-    # masks (as in the reference): key rows outside the segment of their chunk's last row, memory resets, outputs
-    prev_seg = None
-    if segment_idx is not None and has_prev:
-        prev_seg, segment_idx = segment_idx[:, :C], segment_idx[:, C:]
-    out_mask = torch.zeros(B, nc, C, dtype=torch.bool, device=dev)
-    memory_mask = torch.zeros(B, nc, dtype=torch.bool, device=dev)
-    if segment_idx is not None:
-        seg = segment_idx.view(B, nc, C)
-        kmask = (seg != seg[:, :, -1:]).reshape(B, L)
-        memory_mask[:, 2:] = seg[:, :-2, -1] != seg[:, 1:-1, -1]
-        out_mask[:, 2:] = seg[:, 2:] != seg[:, :-2, -1:]
-        if has_prev:
-            prev_kmask = prev_seg != prev_seg[:, -1:]
-            memory_mask[:, 0] = prev_segment_count != prev_seg[:, -1]
-            memory_mask[:, 1] = prev_seg[:, -1] != seg[:, 0, -1]
-            out_mask[:, 0] = seg[:, 0] != prev_segment_count.view(B, 1)
-            out_mask[:, 1] = seg[:, 1] != prev_seg[:, -1:]
-    else:
-        kmask = torch.zeros(B, L, dtype=torch.bool, device=dev)
-        prev_kmask = torch.zeros(B, C, dtype=torch.bool, device=dev) if has_prev else None
-
-    # phase 1: update chunks (chunk c - 1 updates the memory at chunk c; the previous call's last chunk at c = 0)
-    nu = nc - 1
-    lse = torch.empty(B, K, 0, S, device=dev)
-    AB = torch.empty(B, K, 0, S, S + V, device=dev)
-    if nu > 0:
-        lse, AB = _chunk_ab(k, qk, v, kmask.view(torch.uint8), K, S, V, C, nu)
-    if has_prev:
-        lse0, AB0 = _chunk_ab(_blhs(prev_key), _blhs(prev_qkey), _blhs(prev_value), prev_kmask.view(torch.uint8),
-                              K, S, V, C, 1)
-        lse, AB = torch.cat([lse0, lse], dim=2), torch.cat([AB0, AB], dim=2)
-
-    # phase 2: recurrence (fp32); also masks the outputs of chunks whose memory is still empty
-    first = 0 if has_prev else 1  # first chunk with an update (chunk c - 1 updates the memory at chunk c)
     has_mem = memory is not None
+    has_seg = segment_idx is not None
+    if not has_mem:
+        assert log_norm_term is None and not has_prev
+    q, qk, k, v = _blhs(query), _blhs(qkey), _blhs(key), _blhs(value)
+    seg = segment_idx.contiguous() if has_seg else _dummy(torch.int64, dev)
+    prev_cnt = prev_segment_count.contiguous() if (has_seg and has_prev) else _dummy(torch.int64, dev)
+    seg_off = C if (has_seg and has_prev) else 0  # segment ids of the current rows start after the previous chunk
+    seg_stride = seg.shape[1] if has_seg else 0
+    R = min(8, C // 128)
+
+    # phase 1: update chunks (the previous call's last chunk at index 0 when given, then chunks 0 .. nc-2)
+    nu_tot = nc - 1 + int(has_prev)
+    part = torch.empty(B, K, max(nu_tot, 1), R, S, 2, dtype=torch.float32, device=dev)
+    AB = torch.zeros(B, K, max(nu_tot, 1), S, S + V, dtype=torch.float32, device=dev)
+    if nc > 1:
+        _chunk_ab(k, qk, v, seg, part, AB, K, S, V, C, R, nc - 1, int(has_prev), seg_off, has_seg)
+    if has_prev:
+        _chunk_ab(_blhs(prev_key), _blhs(prev_qkey), _blhs(prev_value), seg, part, AB, K, S, V, C, R, 1, 0, 0, has_seg)
+
+    # phase 2: recurrence (fp32), memory resets, chunks whose memory is still empty
     MT = torch.empty(B, K, nc, V, S, dtype=torch.bfloat16, device=dev)
     mem_out = torch.empty(B, K, S, V, dtype=query.dtype, device=dev)
     lnt_out = torch.empty(B, K, S, dtype=torch.float32, device=dev)
-    out_mask_u8 = out_mask.view(torch.uint8)
-    if not has_mem:
-        out_mask_u8[:, 0] = 1
+    dead = torch.empty(B, nc, dtype=torch.uint8, device=dev)
     rec_vt = next((vt for vt in (64, 32, 16) if V % vt == 0 and B * K * (V // vt) >= 128), 16)
-    f_rec = _compiled(("rec", K, S, V, C, has_mem, rec_vt), lambda: AwmRecurrence(K, S, V, C, has_mem, rec_vt), lambda: (
-        _fake(Float32), _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(_U8, 1), _fake(_U8, 1),
-        _fake(BFloat16), _fake(BFloat16), _fake(Float32), Int32(0), Int32(0), Int32(0), Int32(0)))
-    f_rec(lse.reshape(-1), AB.reshape(-1), (memory if has_mem else mem_out).reshape(-1),
-          (log_norm_term.float() if has_mem else lnt_out).reshape(-1), memory_mask.view(torch.uint8).reshape(-1),
-          out_mask_u8.reshape(-1), MT.reshape(-1), mem_out.reshape(-1), lnt_out.reshape(-1), B, nc, lse.shape[2], first)
-    out_mask = out_mask.view(B, L)
+    rec_key = ("rec", K, S, V, C, R, has_mem, has_prev, has_seg, rec_vt)
+    f_rec = _compiled(rec_key, lambda: AwmRecurrence(K, S, V, C, R, has_mem, has_prev, has_seg, rec_vt), lambda: (
+        _fake(Float32), _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(Int64, 8), _fake(Int64, 8),
+        _fake(_U8, 1), _fake(BFloat16), _fake(BFloat16), _fake(Float32), *([Int32(0)] * 5)))
+    f_rec(part.reshape(-1), AB.reshape(-1), (memory if has_mem else mem_out).reshape(-1),
+          (log_norm_term.float() if has_mem else lnt_out).reshape(-1), seg.reshape(-1), prev_cnt.reshape(-1),
+          dead.reshape(-1), MT.reshape(-1), mem_out.reshape(-1), lnt_out.reshape(-1), B, nc, max(nu_tot, 1),
+          seg_off, seg_stride)
 
-    # phase 3: outputs
+    # phase 3: outputs and the output mask
     out = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
-    op_args = (H, K, S, V, C)
-    f_out = _compiled(("out",) + op_args, lambda: AwmOutGemm(*op_args), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(_U8, 1), Int32(0), Int32(0), Int32(0)))
+    out_mask = torch.empty(B, L, dtype=torch.bool, device=dev)
+    out_key = ("out", H, K, S, V, C, has_prev, has_seg)
+    f_out = _compiled(out_key, lambda: AwmOutGemm(H, K, S, V, C, has_prev, has_seg), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int64, 8), _fake(Int64, 8), _fake(_U8, 1),
+        _fake(_U8, 1), *([Int32(0)] * 5)))
     vt = min(V, 256)
     num_tiles = (V // vt) * B * K * nc * (H // K) * (C // 128)
-    f_out(q.reshape(-1), MT.reshape(-1), out.reshape(-1), out_mask.view(torch.uint8).reshape(-1), B, L,
-          min(_sm_count(dev), num_tiles))
+    f_out(q.reshape(-1), MT.reshape(-1), out.reshape(-1), seg.reshape(-1), prev_cnt.reshape(-1), dead.reshape(-1),
+          out_mask.view(torch.uint8).reshape(-1), B, L, seg_off, seg_stride, min(_sm_count(dev), num_tiles))
     return out.transpose(1, 2), out_mask, mem_out, lnt_out
