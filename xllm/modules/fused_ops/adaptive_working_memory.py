@@ -36,11 +36,12 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         segment_idx: Optional[Tensor] = None,
         prev_segment_count: Optional[Tensor] = None,
         ortho: bool = False,
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        backend: str = 'torch',
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        y, mask, mem, lnt = _adaptive_working_memory_fwd(
+        y, mask, mem, lnt = adaptive_working_memory_fwd(
             q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
-            segment_idx, prev_segment_count, ortho, eps
+            segment_idx, prev_segment_count, ortho, eps, backend
         )
         ctx.save_for_backward(
             q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
@@ -90,7 +91,7 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         )
 
         return (q_grad, qk_grad, k_grad, v_grad, None, mem_grad, lnt_grad,
-                prev_qk_grad, prev_k_grad, prev_v_grad, None, None, None, None)
+                prev_qk_grad, prev_k_grad, prev_v_grad, None, None, None, None, None)
 
 
 adaptive_working_memory = AdaptiveWorkingMemoryFunc.apply
@@ -622,12 +623,29 @@ def adaptive_working_memory_fwd(
     segment_idx: Optional[Tensor] = None,
     prev_segment_count: Optional[Tensor] = None,
     ortho: bool = False,
-    eps: float = 1e-6
+    eps: float = 1e-6,
+    backend: str = 'torch',
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    if backend == 'cute' and _cute_supported(query, value, chunk_size, ortho):
+        from .cute.adaptive_working_memory import adaptive_working_memory_fwd as cute_fwd
+        return cute_fwd(
+            query, qkey, key, value, chunk_size, memory, log_norm_term,
+            prev_qkey, prev_key, prev_value, segment_idx, prev_segment_count
+        )
     return _adaptive_working_memory_fwd(
         query, qkey, key, value, chunk_size, memory, log_norm_term,
         prev_qkey, prev_key, prev_value,
         segment_idx, prev_segment_count, ortho, eps
+    )
+
+
+def _cute_supported(query: Tensor, value: Tensor, chunk_size: int, ortho: bool) -> bool:
+    """Shapes handled by the CuTe DSL forward kernels (bf16, no orthogonal update, Blackwell)."""
+    S, V, L = query.shape[3], value.shape[3], query.shape[2]
+    return (
+        not ortho and query.dtype == torch.bfloat16 and query.is_cuda
+        and torch.cuda.get_device_capability(query.device)[0] == 10
+        and S in (128, 256) and V % 64 == 0 and chunk_size % 128 == 0 and L % chunk_size == 0
     )
 
 

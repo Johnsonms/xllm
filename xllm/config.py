@@ -124,6 +124,7 @@ class ModelConf(Config):
     ffn_hidden_dim: int = 2048  # Hidden dimension in dense FFN. MoE expert dimensions is set by expert_inter_dim.
     # Adaptive Working Memory (AWM)
     awm_orthogonal_update: bool = False  # Whether to apply orthogonal update when updating the memory in AWM
+    awm_backend: str = 'torch'  # AWM forward operator: torch (reference) or cute (CuTe DSL kernels, falls back to torch when unsupported)
     # MoE & MoVA
     num_values: int = 0  # Num of value projections available for routing to in MoVA. 0 means MoVA off. Requires using MoE as well when using MoVA.
     num_activated_values: int = 0  # Num of activated value projections per token (top-k) in MoVA
@@ -198,6 +199,7 @@ class ModelConf(Config):
         assert self.moe_expert_backend in ['sequential', 'nested', 'torch', 'te']
         assert self.moe_permutation_backend in ['torch', 'triton']
         assert self.timenorm_backend in ['cub', 'chunkwise', 'cute']
+        assert self.awm_backend in ['torch', 'cute']
         assert self.causal_conv_backend in ['fla', 'triton']
 
         if self.fused_block:

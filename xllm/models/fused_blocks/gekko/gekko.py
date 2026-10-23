@@ -111,6 +111,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         attn_gate_func: str,
         sca_backend: str,
         awm_orthogonal_update: bool,
+        awm_backend: str,
         attn_res_w: Optional[torch.Tensor],  # (d/MP, c)
         ffn_norm_w: torch.Tensor,  # (d)
         ffn_norm_b: torch.Tensor,  # (d)
@@ -308,7 +309,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
                 aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps
+                awm_orthogonal_update, rmsnorm_eps, awm_backend
             )
 
             _, handle8 = send_memory_to_next(new_memory)
@@ -341,7 +342,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
                 aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps
+                awm_orthogonal_update, rmsnorm_eps, awm_backend
             )
 
             handle8 = None
@@ -1026,6 +1027,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             None,  # attn gate func
             None,  # sca backend
             None,  # awm_orthogonal_update
+            None,  # awm_backend
             None,  # attn_res_w
             ffn_norm_w_grad,
             ffn_norm_b_grad,
