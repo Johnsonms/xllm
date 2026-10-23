@@ -692,9 +692,9 @@ class AwmChunkBwd:
 
     Persistent: every CTA takes the tiles bidx, bidx + grid, ... of the update chunks. Warps 0-3 (one row t per
     thread): the P^T transform of the raw key tile (TMA ring, 128 x 64 blocks) into the resident bf16 A
-    operand, then the epilogues (TMEM -> registers -> bf16 -> global); warp 4 the tcgen05 MMAs; warp 5 the TMA
-    loads. GEMM operand tiles are 128 x 64 (A, K-major) and S x 64 (B; K-major for dP^T, MN-major for dqk /
-    dv), 64 = one 128-byte K block, in rings of 3 and 2 stages. The two
+    operand, then the epilogues (TMEM -> registers -> bf16 -> shared memory -> TMA store, 128 x 32 pieces);
+    warp 4 the tcgen05 MMAs; warp 5 the TMA loads. GEMM operand tiles are 128 x 64 (A, K-major) and S x 64 (B;
+    K-major for dP^T, MN-major for dqk / dv), 64 = one 128-byte K block, in 2-stage rings. The two
     128 x S TMEM accumulators alternate between dP^T, dqk and the dv tiles, so the next tile's dP^T GEMM runs
     while the epilogues of this one drain."""
 
@@ -702,8 +702,9 @@ class AwmChunkBwd:
         self.K, self.S, self.V, self.C, self.R, self.has_seg = K, S, V, C, R, has_seg
         self.KB = 64  # raw key blocks (one 128-byte swizzle row)
         self.KBG = 64  # K blocks of the GEMM operand rings (32-row blocks hung: not understood)
-        self.a_stages = 3
+        self.a_stages = 2
         self.b_stages = 2
+        self.epi_stages = 2
         self.raw_stages = 2
         self.num_epi_warps = 4
         self.mma_warp = 4
@@ -734,9 +735,10 @@ class AwmChunkBwd:
             1, 2, 2 * S, 2 * S * R, 2 * S * R * nu, 2 * S * R * nu * K)))
         mDelta = cute.make_tensor(tDelta.iterator, cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S)))
         mDlse = cute.make_tensor(tDlse.iterator, cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S)))
-        mDQK = cute.make_tensor(tDQK.iterator, cute.make_layout((S, L, K, B), stride=(1, K * S, S, L * K * S)))
-        mDK = cute.make_tensor(tDK.iterator, cute.make_layout((S, L, K, B), stride=(1, K * S, S, L * K * S)))
-        mDV = cute.make_tensor(tDV.iterator, cute.make_layout((V, L, K, B), stride=(1, K * V, V, L * K * V)))
+        # outputs [B, L, K, *] as (M = t, N = col, k, b)
+        mDQK = cute.make_tensor(tDQK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mDK = cute.make_tensor(tDK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mDV = cute.make_tensor(tDV.iterator, cute.make_layout((L, V, K, B), stride=(K * V, 1, V, L * K * V)))
 
         op_kk = tcgen05.MmaF16BF16Op(BFloat16, Float32, (128, S, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
                                      tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
@@ -760,10 +762,17 @@ class AwmChunkBwd:
         tma_dbk, mDBk_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBk, bk_one, (128, S, KBG), tm_kk)
         tma_damn, mDAmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDAmn, bmn_one, (128, S, KBG), tm_kmn)
         tma_dbmn, mDBmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBmn, bmn_one, (128, S, KBG), tm_kmn)
+        # epilogue: 128 x 32 bf16 pieces staged in shared memory, TMA stores
+        epi_tile = (128, 32)
+        epi_layout = sm100_utils.make_smem_layout_epi(BFloat16, utils.LayoutEnum.ROW_MAJOR, epi_tile, self.epi_stages)
+        epi_one = cute.slice_(epi_layout, (None, None, 0))
+        tma_oqk, mDQK_t = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mDQK, epi_one, epi_tile)
+        tma_ok, mDK_t = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mDK, epi_one, epi_tile)
+        tma_ov, mDV_t = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mDV, epi_one, epi_tile)
         num_tiles = B * K * nu * (self.C // 128)
         self.kernel(tm_kk, tm_kmn, tma_qk, mQK_t, tma_v, mV_t, tma_k, mK_t, tma_dak, mDAk_t, tma_dbk, mDBk_t, tma_damn, mDAmn_t,
-                    tma_dbmn, mDBmn_t, mPart, mDelta, mDlse, tSeg.iterator, mDQK, mDK, mDV, a_layout, raw_layout, p_layout,
-                    bk_layout, bmn_layout, nu, num_tiles, seg_off, seg_stride).launch(
+                    tma_dbmn, mDBmn_t, mPart, mDelta, mDlse, tSeg.iterator, tma_oqk, mDQK_t, tma_ok, mDK_t, tma_ov, mDV_t,
+                    a_layout, raw_layout, p_layout, bk_layout, bmn_layout, epi_layout, nu, num_tiles, seg_off, seg_stride).launch(
             grid=[num_ctas, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.jit
@@ -782,9 +791,10 @@ class AwmChunkBwd:
                mV: cute.Tensor, tma_k: cute.CopyAtom, mK: cute.Tensor, tma_dak: cute.CopyAtom, mDAk: cute.Tensor,
                tma_dbk: cute.CopyAtom, mDBk: cute.Tensor, tma_damn: cute.CopyAtom, mDAmn: cute.Tensor, tma_dbmn: cute.CopyAtom,
                mDBmn: cute.Tensor, mPart: cute.Tensor, mDelta: cute.Tensor, mDlse: cute.Tensor, pSeg: cute.Pointer,
-               mDQK: cute.Tensor, mDK: cute.Tensor, mDV: cute.Tensor, a_layout: cute.ComposedLayout, raw_layout: cute.ComposedLayout,
+               tma_oqk: cute.CopyAtom, mDQK: cute.Tensor, tma_ok: cute.CopyAtom, mDK: cute.Tensor, tma_ov: cute.CopyAtom,
+               mDV: cute.Tensor, a_layout: cute.ComposedLayout, raw_layout: cute.ComposedLayout,
                p_layout: cute.ComposedLayout, bk_layout: cute.ComposedLayout, bmn_layout: cute.ComposedLayout,
-               nu: Int32, num_tiles: Int32, seg_off: Int32, seg_stride: Int32):
+               epi_layout: cute.ComposedLayout, nu: Int32, num_tiles: Int32, seg_off: Int32, seg_stride: Int32):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -801,6 +811,10 @@ class AwmChunkBwd:
             cpasync.prefetch_descriptor(tma_dbk)
             cpasync.prefetch_descriptor(tma_damn)
             cpasync.prefetch_descriptor(tma_dbmn)
+        if warp == 0:
+            cpasync.prefetch_descriptor(tma_oqk)
+            cpasync.prefetch_descriptor(tma_ok)
+            cpasync.prefetch_descriptor(tma_ov)
 
         @cute.struct
         class SharedStorage:
@@ -842,6 +856,7 @@ class AwmChunkBwd:
         sBmn = cute.make_tensor(cute.recast_ptr(pB, swizzle_=bmn_layout.inner), bmn_layout.outer)
         pP = smem.allocate_array(BFloat16, cute.cosize(p_layout.outer), byte_alignment=1024)
         sP = cute.make_tensor(cute.recast_ptr(pP, swizzle_=p_layout.inner), p_layout.outer)
+        sC = smem.allocate_tensor(BFloat16, epi_layout.outer, byte_alignment=1024, swizzle=epi_layout.inner)
         sLse2 = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
         sCorr = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)  # dlse - delta
         sKeep = smem.allocate_tensor(Uint8, cute.make_layout(128), byte_alignment=16)
@@ -867,6 +882,13 @@ class AwmChunkBwd:
         tCrP = tm_kmn.make_fragment_A(sP)
         tCrBmn = tm_kmn.make_fragment_B(sBmn)
         acc_fake = tm_kk.make_fragment_C(cute.append(tm_kk.partition_shape_C((128, S)), 2))
+        # output pieces (128, 32, L/128, cols/32, K, B)
+        gOQK = cute.local_tile(mDQK, (128, 32), (None, None, None, None))
+        gOK = cute.local_tile(mDK, (128, 32), (None, None, None, None))
+        gOV = cute.local_tile(mDV, (128, 32), (None, None, None, None))
+        tOQKs, tOQKg = cpasync.tma_partition(tma_oqk, 0, cute.make_layout(1), cute.group_modes(sC, 0, 2), cute.group_modes(gOQK, 0, 2))
+        tOKs, tOKg = cpasync.tma_partition(tma_ok, 0, cute.make_layout(1), cute.group_modes(sC, 0, 2), cute.group_modes(gOK, 0, 2))
+        tOVs, tOVg = cpasync.tma_partition(tma_ov, 0, cute.make_layout(1), cute.group_modes(sC, 0, 2), cute.group_modes(gOV, 0, 2))
 
         if warp == self.tma_warp:
             for t in cutlass.range(bidx, num_tiles, nctas):
@@ -950,7 +972,14 @@ class AwmChunkBwd:
             t2r = [tcgen05.make_tmem_copy(copy_atom, acc_r[i][(None, None, 0, 0)]) for i in range(2)]
             tTR = [t2r[i].get_slice(tidx).partition_S(acc_r[i]) for i in range(2)]
             regs = cute.make_rmem_tensor(t2r[0].get_slice(tidx).partition_D(cute.make_identity_tensor((128, 32))).shape, Float32)
-            o8 = cute.make_rmem_tensor((8,), Float32)
+            rbf = cute.make_rmem_tensor(regs.shape, BFloat16)
+            r2s = cute.make_tiled_copy_D(sm100_utils.get_smem_store_op(utils.LayoutEnum.ROW_MAJOR, BFloat16, Float32, t2r[0]), t2r[0])
+            tRS_sC = r2s.get_slice(tidx).partition_D(sC)
+            tRS_r = r2s.retile(rbf)
+            epi_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 * self.num_epi_warps)
+            epi_pipe = pipeline.PipelineTmaStore.create(
+                num_stages=self.epi_stages, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * self.num_epi_warps))
+            n_epi = Int32(0)
             pv = cute.make_rmem_tensor((8,), Float32)
             for t in cutlass.range(bidx, num_tiles, nctas):
                 tb, u, k, b = self._decode(t, nu)
@@ -1003,25 +1032,33 @@ class AwmChunkBwd:
                                 cute.copy(t2r[0], tTR[0][(None, None, None, 0, ch)], regs)
                             else:
                                 cute.copy(t2r[1], tTR[1][(None, None, None, 0, ch)], regs)
-                            for q8 in cutlass.range_constexpr(4):
-                                s0 = ch * 32 + q8 * 8
-                                if g == 0:
+                            if g == 0:  # dk = P^T (dP^T + dlse - delta)
+                                for q8 in cutlass.range_constexpr(4):
+                                    s0 = ch * 32 + q8 * 8
                                     p8 = cute.make_tensor((pP + _kmajor_off(trow, s0, 128)).align(16), cute.make_layout(8)).load()
                                     for e in cutlass.range_constexpr(8):
-                                        o8[e] = p8[e].to(Float32) * (regs[q8 * 8 + e] + sCorr[s0 + e])
-                                    cute.make_tensor((mDK.iterator + mDK.layout((s0, grow, k, b))).align(16), cute.make_layout(8)).store(o8.load().to(BFloat16))
+                                        regs[q8 * 8 + e] = p8[e].to(Float32) * (regs[q8 * 8 + e] + sCorr[s0 + e])
+                            rbf.store(regs.load().to(BFloat16))
+                            buf = n_epi % self.epi_stages
+                            cute.copy(r2s, tRS_r, tRS_sC[(None, None, None, buf)])
+                            cute.arch.fence_view_async_shared()
+                            epi_bar.arrive_and_wait()
+                            if warp == 0:
+                                if g == 0:
+                                    cute.copy(tma_ok, tOKs[(None, buf)], tOKg[(None, row_block, ch, k, b)])
                                 elif g == 1:
-                                    for e in cutlass.range_constexpr(8):
-                                        o8[e] = regs[q8 * 8 + e]
-                                    cute.make_tensor((mDQK.iterator + mDQK.layout((s0, grow, k, b))).align(16), cute.make_layout(8)).store(o8.load().to(BFloat16))
+                                    cute.copy(tma_oqk, tOQKs[(None, buf)], tOQKg[(None, row_block, ch, k, b)])
                                 else:
-                                    for e in cutlass.range_constexpr(8):
-                                        o8[e] = regs[q8 * 8 + e]
-                                    cute.make_tensor((mDV.iterator + mDV.layout(((g - 2) * S + s0, grow, k, b))).align(16), cute.make_layout(8)).store(o8.load().to(BFloat16))
+                                    cute.copy(tma_ov, tOVs[(None, buf)], tOVg[(None, row_block, (g - 2) * (S // 32) + ch, k, b)])
+                                epi_pipe.producer_commit()
+                                epi_pipe.producer_acquire()
+                            epi_bar.arrive_and_wait()
+                            n_epi += 1
                         with cute.arch.elect_one():
                             f.release()
                     # sLse2 / sCorr / sKeep are rewritten for the next tile after everyone is done with them
                     cute.arch.barrier(barrier_id=3, number_of_threads=32 * self.num_epi_warps)
+            epi_pipe.producer_tail()
             tmem.relinquish_alloc_permit()
             cute.arch.barrier(barrier_id=2, number_of_threads=32 * self.num_epi_warps)
             tmem.free(tmem_ptr)
