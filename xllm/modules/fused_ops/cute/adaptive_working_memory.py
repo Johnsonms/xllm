@@ -750,23 +750,24 @@ class AwmRecurrence:
     chunks whose memory is still empty (lnt[b, 0, 0] = -inf).
 
     One CTA (8 warps) per (b, k, VT columns of V). M stays in fp32 registers in the warp-MMA accumulator layout;
-    A M runs as tf32 warp MMAs straight from fp32 shared memory. The A blocks (S x KB) of all updates do not
-    depend on M, so they stream through a double buffer with cp.async, the next block always in flight."""
+    A M runs as bf16 warp MMAs (fp32 accumulation) on a bf16 copy of A (half the L2 traffic of the n_vt CTAs
+    that each read all of A). The A blocks (S x KB) of all updates do not depend on M, so they stream through
+    a cp.async ring, STAGES - 1 blocks in flight."""
 
     def __init__(self, K: int, S: int, V: int, C: int, R: int, has_memory: bool, has_prev: bool, has_seg: bool,
                  VT: int = 64):
         self.K, self.S, self.V, self.C, self.R = K, S, V, C, R
         self.has_memory, self.has_prev, self.has_seg = has_memory, has_prev, has_seg
         self.VT = min(VT, V)
-        self.KB = 32
+        self.KB = 64
         self.STAGES = 4  # A blocks in flight: STAGES - 1
         self.NAB = S + V
         self.threads = 256
-        self.PAD = 4  # fp32 elements of row padding in shared memory (bank conflicts of the fragment loads)
+        self.PAD = 8  # bf16 elements of row padding in shared memory (bank conflicts of the fragment loads)
         assert V % self.VT == 0 and S % self.KB == 0 and S % 128 == 0 and self.VT % 16 == 0
 
     @cute.jit
-    def __call__(self, tPart: cute.Tensor, tAB: cute.Tensor, tMemIn: cute.Tensor, tLntIn: cute.Tensor,
+    def __call__(self, tPart: cute.Tensor, tAB: cute.Tensor, tA16: cute.Tensor, tMemIn: cute.Tensor, tLntIn: cute.Tensor,
                  tSeg: cute.Tensor, tPrevCount: cute.Tensor, tDead: cute.Tensor, tMT: cute.Tensor, tMemOut: cute.Tensor,
                  tLntOut: cute.Tensor, B: Int32, nc: Int32, nu: Int32, seg_off: Int32, seg_stride: Int32,
                  stream: cuda.CUstream):
@@ -775,38 +776,40 @@ class AwmRecurrence:
             1, 2, 2 * S, 2 * S * R, 2 * S * R * nu, 2 * S * R * nu * K)))
         mAB = cute.make_tensor(tAB.iterator, cute.make_layout((self.NAB, S, nu, K, B), stride=(
             1, self.NAB, S * self.NAB, nu * S * self.NAB, K * nu * S * self.NAB)))
+        # bf16 copy of A: [B, K, nu, S, S] (t contiguous)
+        mA16 = cute.make_tensor(tA16.iterator, cute.make_layout((S, S, nu, K, B), stride=(1, S, S * S, nu * S * S, K * nu * S * S)))
         mMemIn = cute.make_tensor(tMemIn.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
         mLntIn = cute.make_tensor(tLntIn.iterator, cute.make_layout((S, K, B), stride=(1, S, K * S)))
         mDead = cute.make_tensor(tDead.iterator, cute.make_layout((nc, B), stride=(1, nc)))
         mMT = cute.make_tensor(tMT.iterator, cute.make_layout((S, V, nc, K, B), stride=(1, S, V * S, nc * V * S, K * nc * V * S)))
         mMemOut = cute.make_tensor(tMemOut.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
         mLntOut = cute.make_tensor(tLntOut.iterator, cute.make_layout((S, K, B), stride=(1, S, K * S)))
-        op = cute.nvgpu.warp.MmaTF32Op((16, 8, 8))
-        tiled_mma = cute.make_tiled_mma(op, cute.make_layout((8, 1, 1)), permutation_mnk=(128, 16, 8))
+        op = cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
+        tiled_mma = cute.make_tiled_mma(op, cute.make_layout((8, 1, 1)), permutation_mnk=(128, 16, 16))
         grid = B * K * (V // self.VT)
-        self.kernel(tiled_mma, mPart, mAB, mMemIn, mLntIn, tSeg.iterator, tPrevCount.iterator, mDead, mMT, mMemOut,
-                    mLntOut, nc, nu, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+        self.kernel(tiled_mma, mPart, mAB, mA16, mMemIn, mLntIn, tSeg.iterator, tPrevCount.iterator, mDead, mMT,
+                    mMemOut, mLntOut, nc, nu, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     @cute.jit
-    def _load_a_block(self, mAB: cute.Tensor, sA: cute.Tensor, atom, q, n_blocks, nkb, k, b, tidx):
+    def _load_a_block(self, mA16: cute.Tensor, sA: cute.Tensor, atom, q, n_blocks, nkb, k, b, tidx):
         """cp.async of A block q (update q // nkb, columns (q % nkb) * KB ...) into ring buffer q % STAGES; one
         commit group per call, empty past the last block (keeps the group count of the wait uniform)."""
         if q < n_blocks:
             u = q // nkb
             col0 = (q - u * nkb) * self.KB
-            rq = tidx // (self.KB // 4)
-            cq = (tidx % (self.KB // 4)) * 4
-            src0 = mAB.iterator + mAB.layout((col0 + cq, rq, u, k, b))
+            rq = tidx // (self.KB // 8)
+            cq = (tidx % (self.KB // 8)) * 8
+            src0 = mA16.iterator + mA16.layout((col0 + cq, rq, u, k, b))
             dst0 = sA.iterator + sA.layout((rq, cq, q % self.STAGES))
-            rows_per_it = self.threads * 4 // self.KB
+            rows_per_it = self.threads * 8 // self.KB
             for it in cutlass.range_constexpr(self.S // rows_per_it):
-                src = cute.make_tensor((src0 + it * rows_per_it * self.NAB).align(16), cute.make_layout(4))
-                dst = cute.make_tensor((dst0 + it * rows_per_it * (self.KB + self.PAD)).align(16), cute.make_layout(4))
+                src = cute.make_tensor((src0 + it * rows_per_it * self.S).align(16), cute.make_layout(8))
+                dst = cute.make_tensor((dst0 + it * rows_per_it * (self.KB + self.PAD)).align(16), cute.make_layout(8))
                 cute.copy(atom, src, dst)
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
-    def kernel(self, tiled_mma: cute.TiledMma, mPart: cute.Tensor, mAB: cute.Tensor, mMemIn: cute.Tensor,
+    def kernel(self, tiled_mma: cute.TiledMma, mPart: cute.Tensor, mAB: cute.Tensor, mA16: cute.Tensor, mMemIn: cute.Tensor,
                mLntIn: cute.Tensor, pSeg: cute.Pointer, pPrevCount: cute.Pointer, mDead: cute.Tensor, mMT: cute.Tensor,
                mMemOut: cute.Tensor, mLntOut: cute.Tensor, nc: Int32, nu: Int32, seg_off: Int32, seg_stride: Int32):
         tidx, _, _ = cute.arch.thread_idx()
@@ -819,16 +822,16 @@ class AwmRecurrence:
         v0 = vt * VT
         nkb = S // KB
         smem = utils.SmemAllocator()
-        sA = smem.allocate_tensor(Float32, cute.make_layout((S, KB, self.STAGES), stride=(KB + self.PAD, 1, S * (KB + self.PAD))),
+        sA = smem.allocate_tensor(BFloat16, cute.make_layout((S, KB, self.STAGES), stride=(KB + self.PAD, 1, S * (KB + self.PAD))),
                                   byte_alignment=16)
-        sMT = smem.allocate_tensor(Float32, cute.make_layout((VT, S), stride=(S + self.PAD, 1)), byte_alignment=16)
+        sMT = smem.allocate_tensor(BFloat16, cute.make_layout((VT, S), stride=(S + self.PAD, 1)), byte_alignment=16)
         sR = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
-        atom = cute.make_copy_atom(cpasync.CopyG2SOp(), Float32, num_bits_per_copy=128)
+        atom = cute.make_copy_atom(cpasync.CopyG2SOp(), BFloat16, num_bits_per_copy=128)
 
         first = 0 if const_expr(self.has_prev) else 1  # first chunk with an update
         n_blocks = nu * nkb  # A blocks of all updates, streamed in order
         for p0 in cutlass.range_constexpr(self.STAGES - 1):
-            self._load_a_block(mAB, sA, atom, Int32(p0), n_blocks, nkb, k, b, tidx)
+            self._load_a_block(mA16, sA, atom, Int32(p0), n_blocks, nkb, k, b, tidx)
 
         thr_mma = tiled_mma.get_slice(tidx)
         coords = thr_mma.partition_C(cute.make_identity_tensor((S, VT)))
@@ -875,16 +878,16 @@ class AwmRecurrence:
                     new_lnt = hi + cute.math.log(cute.math.exp(l_cur - hi) + cute.math.exp(lnt - hi))
                     sR[tidx] = cute.math.exp(l_cur - new_lnt)
                     lnt = new_lnt
-                # M^T (fp32) into shared memory: the B operand
+                # M^T (bf16) into shared memory: the B operand
                 for i in cutlass.range_constexpr(n_frag):
                     s3, v3 = coords[i]
-                    sMT[v3, s3] = m[i]
+                    sMT[v3, s3] = m[i].to(BFloat16)
                 acc.fill(0.0)
                 for kb in cutlass.range(nkb):
                     buf = q % self.STAGES
                     cute.arch.cp_async_wait_group(self.STAGES - 2)
                     cute.arch.barrier()  # block q landed for everyone; block q - 1's buffer is free; sMT / sR written
-                    self._load_a_block(mAB, sA, atom, q + self.STAGES - 1, n_blocks, nkb, k, b, tidx)
+                    self._load_a_block(mA16, sA, atom, q + self.STAGES - 1, n_blocks, nkb, k, b, tidx)
                     tCsA = thr_mma.partition_A(sA[None, None, buf])
                     tCsB = thr_mma.partition_B(cute.local_tile(sMT, (VT, KB), (0, kb)))
                     tCrA = tiled_mma.make_fragment_A(tCsA)
@@ -1127,6 +1130,33 @@ class AwmRecurrenceUmma:
             tmem.free(tmem_ptr)
 
 
+class AwmAToBf16:
+    """A16[b, k, u, s, :] = bf16(AB[b, k, u, s, :S]): the bf16 copy of A read by the warp-MMA recurrence.
+    One thread per 8 consecutive elements (32-byte load, 16-byte store)."""
+
+    def __init__(self, S: int, V: int):
+        self.S, self.NAB = S, S + V
+        self.threads = 256
+
+    @cute.jit
+    def __call__(self, tAB: cute.Tensor, tA16: cute.Tensor, rows: Int32, stream: cuda.CUstream):
+        per_row = self.S // 8
+        total = rows * per_row
+        grid = (total + self.threads - 1) // self.threads
+        self.kernel(tAB.iterator, tA16.iterator, total).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, pAB: cute.Pointer, pA16: cute.Pointer, total: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        i = bidx * self.threads + tidx
+        if i < total:
+            row = i // (self.S // 8)
+            col = (i - row * (self.S // 8)) * 8
+            x = cute.make_tensor((pAB + (row * self.NAB + col)).align(32), cute.make_layout(8)).load()
+            cute.make_tensor((pA16 + (row * self.S + col)).align(16), cute.make_layout(8)).store(x.to(BFloat16))
+
+
 # ======================================================================================================
 # Host side
 # ======================================================================================================
@@ -1253,9 +1283,16 @@ def adaptive_working_memory_fwd(
         rec_cls = AwmRecurrence
     rec_key = ("rec", rec_cls.__name__, K, S, V, C, R, has_mem, has_prev, has_seg, rec_vt)
     f_rec = _compiled(rec_key, lambda: rec_cls(K, S, V, C, R, has_mem, has_prev, has_seg, rec_vt), lambda: (
-        _fake(Float32), _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(Int64, 8), _fake(Int64, 8),
+        _fake(Float32), _fake(Float32), *([_fake(BFloat16)] if rec_cls is AwmRecurrence else []),
+        _fake(BFloat16), _fake(Float32), _fake(Int64, 8), _fake(Int64, 8),
         _fake(_U8, 1), _fake(BFloat16), _fake(BFloat16), _fake(Float32), *([Int32(0)] * 5)))
-    f_rec(part.reshape(-1), AB.reshape(-1), (memory if has_mem else mem_out).reshape(-1),
+    rec_args = [part.reshape(-1), AB.reshape(-1)]
+    if rec_cls is AwmRecurrence:
+        A16 = torch.empty(B, K, AB.shape[2], S, S, dtype=torch.bfloat16, device=dev)
+        f_cvt = _compiled(("a16", S, V), lambda: AwmAToBf16(S, V), lambda: (_fake(Float32, 32), _fake(BFloat16), Int32(0)))
+        f_cvt(AB.reshape(-1), A16.reshape(-1), B * K * AB.shape[2] * S)
+        rec_args.append(A16.reshape(-1))  # bf16 copy of A for the warp-MMA recurrence
+    f_rec(*rec_args, (memory if has_mem else mem_out).reshape(-1),
           (log_norm_term.float() if has_mem else lnt_out).reshape(-1), seg.reshape(-1), prev_cnt.reshape(-1),
           dead.reshape(-1), MT.reshape(-1), mem_out.reshape(-1), lnt_out.reshape(-1), B, nc, max(nu_tot, 1),
           seg_off, seg_stride)
