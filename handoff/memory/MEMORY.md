@@ -1,0 +1,5 @@
+- [xllm CuTe TSDN kernel](xllm-cute-tsdn.md) — CuTe DSL TimestepDecayNorm task: venv, CUB build gotchas, baseline perf
+- [xllm CuTe AWM kernel](xllm-cute-awm.md) — AWM task: real Gekko shapes, 1-GPU harness, env setup
+- [slinky GPU allocation](slinky-gpu-allocation.md) — slinky-0: started on GPUs 6,7 only; user later allowed all 8 GPUs (check nvidia-smi)
+- [Gekko step profile](xllm-gekko-step-profile.md) — where a Gekko training step spends time on B200, measured speed-up candidates (SCA kernel #1)
+- [xllm CuTe SCA kernel](xllm-cute-sca.md) — sliding chunk attention CuTe kernels: design, perf (0.9B step 1153->606 ms), pitfalls, 7.1B plan

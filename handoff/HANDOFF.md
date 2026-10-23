@@ -1,9 +1,11 @@
 # CuTe DSL kernels for xllm: handoff
 
-This handoff covers two tasks:
+This handoff covers three tasks:
 
 - `TimestepDecayNorm` (TSDN): forward and backward are done.
 - `AdaptiveWorkingMemory` (AWM): forward and backward are done (section 6 has what is left).
+- Sliding chunk attention (SCA): forward and backward are done (section 6b), after a full-step profile showed the
+  swift SCA at 58% of the 0.9B step on B200.
 
 Both are written in the CuTe Python DSL (nvidia-cutlass-dsl 4.8.1) and target B200 (sm_100a).
 
@@ -14,7 +16,7 @@ The original request came from Max: replace the CUB/torch implementations with F
 | Branch | Content |
 |---|---|
 | `cute-timestep-decay-norm` | TSDN fwd+bwd kernels, tests, and the `timenorm_backend='cute'` wiring (10 commits on `main`). |
-| `cute-adaptive-working-memory` | The TSDN branch plus the AWM forward and backward kernels, tests and the `awm_backend='cute'` wiring. **This is the working branch.** |
+| `cute-adaptive-working-memory` | The TSDN branch plus the AWM forward and backward kernels and the SCA kernels, tests and the `awm_backend='cute'` / `sca_backend='cute'` wiring. **This is the working branch.** |
 | `cute-kernels-handoff` | `cute-adaptive-working-memory` plus this `handoff/` directory (dev scripts, notes, venv freeze). Do not merge it; it is for reference only. |
 
 Commit convention (no git identity is configured on the machines):
@@ -222,14 +224,84 @@ Training step on 1 GPU (`run_gekko.py`): AWM backward 99 -> 6 ms per step (0.9B,
   operand, 256 KB per tile, is re-streamed by every tile) and the three epilogues ~7 us, which cannot overlap the
   next tile's GEMM with only two TMEM accumulators. Tried: separate dP^T / dqk-dv pipelines (the next dP^T starts
   after the dk epilogue, but dv then waits for the dqk epilogue: slower, 95 us); dqk / dv in two TMEM halves
-  placed with pointer offsets (wrong results: the second use of a half read the first use's data - avoid
-  `tmem_ptr + offset`, use a stacked fragment); issuing the last raw key blocks before the GEMM loads (slower).
+  placed with pointer offsets (wrong results, cause not found - note that the SCA kernels and the official FMHA
+  example use `tmem_ptr + offset` / `recast_ptr` for every TMEM region without trouble, so the earlier advice
+  to avoid pointer offsets was a misdiagnosis); issuing the last raw key blocks before the GEMM loads (slower).
   Next: a 2-CTA (cta_group::2) dP^T GEMM halves the B bytes per CTA; 7.1B (K = 2304) would gain most.
 - `AwmDmoGemm` is at ~56% of HBM SOL; `AwmOutGemm` (dq) is the forward kernel.
 - `AwmRecurrenceBwd`: ~10 us per update; the dA GEMM was moved out of the chain (batched matmul).
 - Feature gap: context-parallel ranks > 0 (input memory and previous chunk) use the torch backward. The kernels
   have the hooks (`first`, `has_prev`, `has_dmem`, `_seg_anchor`) but the chunk kernel reads the update chunk
   from the current sequence only and the previous-chunk gradients are not produced.
+
+## 6b. Step profile and sliding chunk attention (SCA): done (2026-10-23/24, slinky-0)
+
+### Where a Gekko step went (before SCA)
+
+Full-step profiles (`handoff/scripts/profile/prof_step.py`, `prof_stack2.py` + `attrib.py`: per-kernel times
+attributed to python call sites through the chrome trace; `fsdp_step.py`: 8-GPU FSDP2 steps). 1 GPU, L = 16384,
+cub timestep norm, cute AWM:
+
+| | gekko-0.9B B2 (1258 ms/step) | gekko-7.1B B1 (1150 ms/step) |
+|---|---|---|
+| swift sliding chunk attention (fwd + bwd) | 671 ms (58%) | 265 ms (23%) |
+| dense GEMMs | ~260 ms | ~580 ms (54%) |
+| timestep norm (CUB) | ~120 ms | ~130 ms |
+| cross-entropy grad GEMM (fp32 SIMT in the harness; TF32 in train.py) | 64 ms | 67 ms |
+| rope (cat + complex), norms | ~70, ~65 ms | ~18, ~45 ms |
+| AWM (cute) | ~10 ms | ~23 ms |
+
+The swift SCA is cuBLAS batched GEMMs plus a materialized bf16 attention matrix (~105 GB of the 139 GB peak on
+0.9B) and ~300 ms of contiguous copies. xattn (the flash-style SCA used on H200) does not support SM100.
+`timenorm_backend='cute'` alone saves 8.5% (loss / grad parity verified in the model). On one node FSDP2
+communication was fully hidden at 8 GPUs.
+
+### SCA kernels
+
+- `xllm/modules/fused_ops/cute/sliding_chunk_attention.py`: `ScaFwd`, `ScaBwdDv`, `ScaBwdDk`, `ScaBwdDq`,
+  `RowDot` (delta), `ChunkMajorCopy`; host `sca_fwd` / `sca_bwd`, helpers `segment_starts` (kmin[b, t]) and
+  `query_limits` (qmax[b, k]), a dense `sca_reference`. Wired as `sca_backend='cute'` in
+  `xllm/modules/fused_ops/attention/sca.py` (`cute_sca_supported`: qk dim <= 256, v dim multiple of 64 up to 256
+  or multiple of 256, chunk multiple of 128, no previous chunk, no dropout; otherwise swift with a one-time
+  warning). Tests: `tests/test_cute_sliding_chunk_attention.py` (19).
+- Design: flash-attention style. Forward per (b, h, chunk, 128-row q tile[, 256-wide v slab]): q tile resident in
+  smem, 64-key K / V blocks through 2-stage TMA rings, S in TMEM (2 x 64 columns), P bf16 stored into TMEM as the
+  A operand of the PV MMA (as the CuTeDSL fmha example does), O 256 columns; 4 softmax warps (thread = row), lazy
+  O rescale (threshold 8 in log2 units, warp-uniform via `vote_any_sync`). The mask is the per-row key range
+  [segment start, row] (segment ids are nondecreasing); blocks outside it are skipped, so documents shorter than
+  the window cut the work. Saved for the backward: y and lse2 (log2 domain, scale folded).
+- Backward: `ScaBwdDv` per key tile (loops over the heads of the kv group x the 64-query blocks up to
+  `query_limits`; P^T into TMEM, dV += P^T dO), `ScaBwdDk` per key tile (V tile in TMEM as the A operand of
+  dP^T = V dO^T; the Q block's bytes serve as K-major B of S^T and MN-major B of dK += dS^T Q, the two SW128
+  layouts are identical), `ScaBwdDq` per q tile (mirror, dO in TMEM). For V > 256 (7.1B) the forward / dV run
+  per 256-wide v slab (each slab CTA recomputes S) and dK / dQ read dP from fp32 cuBLAS GEMMs
+  (`torch.bmm(..., out_dtype=float32)` on chunk-major copies). A dS-materialized variant (write dS^T, dq by
+  cuBLAS) was slower (zero fill + transposed copies) and needed 4.3 GB.
+
+Per layer, B200, L = 16384 (bf16, segments every ~3000 tokens):
+
+| Model | cute fwd | cute bwd | swift fwd | swift bwd | step 1 GPU | peak memory |
+|---|---|---|---|---|---|---|
+| gekko-0.9B B2 | 0.83 ms | 3.0 ms | ~12 ms | ~11 ms | 1151 -> 590 ms | 139 -> 40 GB |
+| gekko-4B B1 L8192 | | | | | 967 -> 455 ms | 142 -> 37 GB |
+| gekko-7.1B B1 | 0.77 ms | 3.4 ms | ~3.8 ms | ~4.5 ms | 1050 -> 968 ms | 98 -> 81 GB |
+
+Losses and gradient norms match swift to bf16 noise (`handoff/scripts/profile/parity_sca.py`). 8 GPUs FSDP2
+(`fsdp_step.py`, all cute backends): 0.9B fwd+bwd 605 ms (communication hidden), 7.1B 1043 ms and 4B (L8192)
+565 ms against 968 / 455 ms on 1 GPU: with the compute this much shorter, the FSDP all-gathers / reduce-scatters
+are no longer hidden on those two (nccl 481 ms on 7.1B; busy(non-nccl) 991 of a 1039 ms span, and the step is
+longer than on 1 GPU). That is the next thing to look at for multi-GPU training (reshard_after_forward=False,
+prefetching, or bucketing).
+
+### Open items
+
+- The S = 128 shape (4B) is MUFU bound (exp2); FA4-style exp2 emulation on the FMA units for part of the
+  elements would help. For S = 256 the kernels are near the MMA rate (~1.4 PFLOPS effective incl. masked waste).
+- 7.1B backward: dP GEMM 1.2 ms + dV 1.1 ms per layer dominate; a fused dP (streaming V and dO slabs) would
+  exceed the L2 bandwidth, so it stays a GEMM.
+- Context-parallel ranks > 0 (previous chunk) fall back to swift, as for AWM.
+- Remaining step time (0.9B, 590 ms): dense GEMMs ~250, fused-block elementwise ~90, cross-entropy ~85 (TF32 in
+  train.py makes it ~5), swiglu ~90, rope ~70, norms ~65, SCA ~115, AWM ~10.
 
 ## 7. Dev scripts (`handoff/scripts/`)
 
@@ -248,6 +320,15 @@ These were copied from the session scratchpad and are not polished. Most assume 
   - `ncu_awm.py` is the driver for ncu.
   - `awm_proto.py` and `awm_bwd_proto.py` are the phase-decomposition prototypes.
   - `recprobe/` holds the globaltimer timeline probe.
+- **`sca/`**: `test_fwd.py` / `test_bwd.py <B,H,K,S,V,L,C,seg_p[,nocheck]> ...` check the SCA kernels against
+  the dense reference (autograd for the backward) and time them; `prof_bwd.py <shape>` per-kernel times of the
+  backward; `layout_check.py` prints the K-major and MN-major SW128 smem layouts (they coincide).
+- **`profile/`**: `prof_step.py <preset> <B> <L> [trace.json]` per-category kernel times of a training step;
+  `prof_stack2.py <preset> <B> <L> [kernel regex]` writes a chrome trace with python stacks and `attrib.py
+  <trace> <regex> <depth>` attributes kernel time to xllm call sites (launches via cuda_runtime and cuda_driver);
+  `fsdp_step.py` (torchrun) FSDP2 steps with clip + optimizer and a kernel-class breakdown on rank 0;
+  `parity_sca.py <preset> <B> <L>` swift vs cute SCA losses / grad norms / step time / peak memory. Env:
+  `TN_BACKEND`, `AWM_BACKEND`, `CFG_<model field>=value`.
 - **`tsdn/`**: check, bench, sweep and profile scripts for TSDN. `cubext/` builds the CUB baseline.
 - **`common/ncu_src.sh <tag> [shape] [cfg]`**: source-level ncu stall breakdown. Set `NCU`, `KNAME` (kernel regex) and `SCRIPT` (a driver such as `../awm/ncu_awm.py`), plus `SRC` and `NLINES`. It uses `CUTE_DSL_LINEINFO=1` and `--import-source yes`. `src_an.py` aggregates per source line.
 
