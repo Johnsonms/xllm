@@ -357,9 +357,16 @@ class AwmKeyLsePart:
         rg = tidx // 8
         s0 = sb * self.SB + sg * 8
         rows = self.C // self.R
-        seg_last = Int64(0)
+        smem = utils.SmemAllocator()
+        sKeep = smem.allocate_tensor(Uint8, cute.make_layout(rows), byte_alignment=16)
         if const_expr(self.has_seg):
-            seg_last = cute.make_tensor(pSeg + (b * seg_stride + seg_off + j * self.C + self.C - 1), cute.make_layout(1))[0]
+            # keep flags of the CTA's rows (inside the segment of the chunk's last row), once
+            seg0 = b * seg_stride + seg_off + j * self.C
+            seg_last = cute.make_tensor(pSeg + (seg0 + self.C - 1), cute.make_layout(1))[0]
+            for i in cutlass.range(tidx, rows, 8 * self.RG):
+                seg_r = cute.make_tensor(pSeg + (seg0 + rs * rows + i), cute.make_layout(1))[0]
+                sKeep[i] = cutlass.select_(seg_r != seg_last, Uint8(0), Uint8(1))
+            cute.arch.sync_threads()
         m = [Float32(NEG_BIG) for _ in range(8)]
         acc = [Float32(0.0) for _ in range(8)]
         r_base = j * self.C + rs * rows + rg
@@ -369,7 +376,7 @@ class AwmKeyLsePart:
                 r = r_base + (it * self.UNROLL + u) * self.RG
                 v = cute.make_tensor((mK.iterator + mK.layout((s0, r, k, b))).align(16), cute.make_layout(8)).load().to(Float32)
                 if const_expr(self.has_seg):
-                    masked = cute.make_tensor(pSeg + (b * seg_stride + seg_off + r), cute.make_layout(1))[0] != seg_last
+                    masked = sKeep[r - j * self.C - rs * rows] == 0
                     xs.append([cutlass.select_(masked, Float32(NEG_BIG), v[e] * LOG2E) for e in range(8)])
                 else:
                     xs.append([v[e] * LOG2E for e in range(8)])
@@ -383,7 +390,6 @@ class AwmKeyLsePart:
                     a = a + cute.math.exp2(xs[u][e] - m_new, fastmath=True)
                 acc[e] = a
                 m[e] = m_new
-        smem = utils.SmemAllocator()
         sM = smem.allocate_tensor(Float32, cute.make_layout((self.SB, self.RG), stride=(1, self.SB)), byte_alignment=16)
         sL = smem.allocate_tensor(Float32, cute.make_layout((self.SB, self.RG), stride=(1, self.SB)), byte_alignment=16)
         for e in cutlass.range_constexpr(8):
