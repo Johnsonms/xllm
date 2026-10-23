@@ -242,15 +242,21 @@ class AwmOutGemm:
                 # this thread's row of the tile (TMEM lane = row for M = 128) and its mask: the chunk's memory is
                 # empty, or the row is not in the segment that the memory ends in (that of chunk c - 2)
                 row = row_block * self.TM + etid
-                masked = mDead[c, b] != 0
+                # mask inputs loaded before waiting for the accumulator (their latency hides behind the wait)
+                dead = mDead[c, b]
+                seg_row = Int64(0)
+                anchor = Int64(0)
                 if const_expr(self.has_seg):
+                    seg_row = cute.make_tensor(pSeg + (b * seg_stride + seg_off + row), cute.make_layout(1))[0]
                     if c >= 2 or const_expr(self.has_prev):
-                        seg_row = cute.make_tensor(pSeg + (b * seg_stride + seg_off + row), cute.make_layout(1))[0]
-                        masked = masked | (seg_row != _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C))
+                        anchor = _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C)
+                    else:
+                        anchor = seg_row
+                acc_full = acc_cons.wait_and_advance()
+                masked = (dead != 0) | (seg_row != anchor)
                 keep = cutlass.select_(masked, Float32(0.0), Float32(1.0))
                 if hr == 0 and vt == 0 and k == 0 and grp == 0:
                     mOutMask[row, b] = cutlass.select_(masked, Uint8(1), Uint8(0))
-                acc_full = acc_cons.wait_and_advance()
                 tCtAcc = tCtAcc_base[(None, None, None, acc_full.index)]
                 tCtAcc_epi = cute.flat_divide(tCtAcc[((None, None), 0, 0)], epi_tile)
                 tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, row_block, vt, h, b)], epi_tile)
