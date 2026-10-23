@@ -17,6 +17,38 @@ try:
     XATTN_SCA_ENABLED = True
 except ImportError:
     XATTN_SCA_ENABLED = False
+try:
+    from ..cute.sliding_chunk_attention import (
+        sca_fwd as cute_sca_fwd,
+        sca_bwd as cute_sca_bwd,
+        segment_starts as cute_segment_starts,
+        query_limits as cute_query_limits,
+    )
+    CUTE_SCA_ENABLED = True
+except ImportError:
+    CUTE_SCA_ENABLED = False
+
+_CUTE_FALLBACK_WARNED = set()
+
+
+def cute_sca_supported(q: Tensor, v: Tensor, chunk_size: int, prev_k: Optional[Tensor], dropout: float) -> bool:
+    """The CuTe kernels take head dims up to 256 (multiples of 64), chunks of multiples of 128, no previous chunk
+    (context parallel ranks > 0) and no attention dropout."""
+    S, V = q.shape[3], v.shape[3]
+    return (CUTE_SCA_ENABLED and prev_k is None and dropout == 0.0 and S % 64 == 0 and S <= 256 and V % 64 == 0
+            and V <= 256 and chunk_size % 128 == 0 and q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 10)
+
+
+def _resolve_backend(backend: str, q: Tensor, v: Tensor, chunk_size: int, prev_k: Optional[Tensor], dropout: float) -> str:
+    if backend == 'cute' and not cute_sca_supported(q, v, chunk_size, prev_k, dropout):
+        key = (tuple(q.shape[2:]), v.shape[3], chunk_size, prev_k is not None, dropout)
+        if key not in _CUTE_FALLBACK_WARNED:
+            _CUTE_FALLBACK_WARNED.add(key)
+            import warnings
+            warnings.warn(f"cute SCA unsupported for head dims {q.shape[3]}/{v.shape[3]}, chunk {chunk_size}, "
+                          f"prev_k={prev_k is not None}, dropout={dropout}: falling back to swift", stacklevel=3)
+        return 'swift'
+    return backend
 
 
 class SlidingChunkAttentionFunc(torch.autograd.Function):
@@ -237,6 +269,7 @@ def sliding_chunk_attention_fwd(
     backend: str = 'xattn',
     requires_grad: bool = False
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    backend = _resolve_backend(backend, q, v, chunk_size, prev_k, dropout)
     if backend in ['xattn', 'flash']:
         assert XATTN_SCA_ENABLED, "xattn was not installed."
         assert dropout == 0.0, f"xattn SCA does not support attention dropout: {dropout}"
@@ -251,6 +284,16 @@ def sliding_chunk_attention_fwd(
         lse = lse if requires_grad else None
         y_for_bwd = (y if high_precision_level == 0 else y_fp32) if requires_grad else None
         return y, y_for_bwd, lse
+    elif backend == 'cute':
+        assert CUTE_SCA_ENABLED, "the CuTe DSL (nvidia-cutlass-dsl) is not installed."
+        assert prev_k is None and prev_v is None, "cute SCA: the previous chunk (context parallel ranks > 0) is not supported."
+        assert dropout == 0.0, f"cute SCA does not support attention dropout: {dropout}"
+        if segment_idx is None and bos_mask is not None:
+            segment_idx = torch.cumsum(bos_mask.long(), dim=1) - 1
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        kmin = cute_segment_starts(segment_idx, q.shape[0], q.shape[1], q.device)
+        y, lse2 = cute_sca_fwd(q, k, v, chunk_size, scale, kmin)
+        return y, (y if requires_grad else None), (lse2 if requires_grad else None)
     elif backend == 'swift':
         if segment_idx is not None and prev_k is not None:
             assert segment_idx.shape[1] == q.shape[1] + chunk_size
@@ -284,6 +327,7 @@ def sliding_chunk_attention_bwd(
     deterministic: bool = False,
     backend: str = 'xattn',
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    backend = _resolve_backend(backend, q, v, chunk_size, prev_k, 0.0)
     if backend in ['xattn', 'flash']:
         assert XATTN_SCA_ENABLED, "xattn was not installed."
         if bos_mask is not None:
@@ -295,6 +339,15 @@ def sliding_chunk_attention_bwd(
             high_precision_level=high_precision_level,
             deterministic=deterministic,
         )
+    elif backend == 'cute':
+        assert prev_k is None and prev_v is None
+        if segment_idx is None and bos_mask is not None:
+            segment_idx = torch.cumsum(bos_mask.long(), dim=1) - 1
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        kmin = cute_segment_starts(segment_idx, q.shape[0], q.shape[1], q.device)
+        qmax = cute_query_limits(kmin)
+        dq, dk, dv = cute_sca_bwd(q, k, v, y, aux, y_grad, chunk_size, scale, kmin, qmax)
+        return dq, dk, dv, None, None
     elif backend == 'swift':
         return _sequential_sliding_chunk_attention_bwd(
             y_grad, q, k, v, aux, chunk_size, scale, prev_k, prev_v
