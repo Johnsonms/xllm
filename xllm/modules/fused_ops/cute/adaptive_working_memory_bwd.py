@@ -690,26 +690,29 @@ class AwmChunkBwd:
         dP^T = qk dA^T + v dB^T  (128 x S, K = S + V)
         dk[t, :] = P^T[t, :] (dP^T[t, :] - delta + dlse),   dqk = P^T dA (K = S),   dv = P^T dB (K = S, V/S tiles)
 
-    Persistent: every CTA takes the tiles bidx, bidx + grid, ... of the update chunks. Warps 0-3 (one row t per
-    thread): the P^T transform of the raw key tile (TMA ring, 128 x 64 blocks) into the resident bf16 A
-    operand, then the epilogues (TMEM -> registers -> bf16 -> shared memory -> TMA store, 128 x 32 pieces);
-    warp 4 the tcgen05 MMAs; warp 5 the TMA loads. GEMM operand tiles are 128 x 64 (A, K-major) and S x 64 (B;
-    K-major for dP^T, MN-major for dqk / dv), 64 = one 128-byte K block, in 2-stage rings. The two
+    Persistent: every CTA takes the tiles bidx, bidx + grid, ... of the update chunks. Warps 0-7 in two groups
+    (thread = one row t of the tile; the groups take alternate rows of the transform and alternate 32-column
+    pieces of the epilogues): the P^T transform of the raw key tile (TMA ring, 128 x 64 blocks) into the resident
+    bf16 A operand, then the epilogues (TMEM -> registers -> bf16 -> shared memory -> TMA store); warp 8 the
+    tcgen05 MMAs; warp 9 the TMA loads. GEMM operand tiles are 128 x 32 (A, K-major) and S x 32 (B; K-major
+    for dP^T, MN-major for dqk / dv) in 4-stage rings: the loads come from L2 and are latency bound, so several
+    blocks are kept in flight. The two
     128 x S TMEM accumulators alternate between dP^T, dqk and the dv tiles, so the next tile's dP^T GEMM runs
     while the epilogues of this one drain."""
 
     def __init__(self, K: int, S: int, V: int, C: int, R: int, has_seg: bool):
         self.K, self.S, self.V, self.C, self.R, self.has_seg = K, S, V, C, R, has_seg
         self.KB = 64  # raw key blocks (one 128-byte swizzle row)
-        self.KBG = 64  # K blocks of the GEMM operand rings (32-row blocks hung: not understood)
-        self.a_stages = 2
-        self.b_stages = 2
-        self.epi_stages = 2
+        self.KBG = 32  # K blocks of the GEMM operand rings
+        self.a_stages = 4
+        self.b_stages = 4
+        self.epi_groups = 2
+        self.epi_stages = 2  # staging buffers per group
         self.raw_stages = 2
-        self.num_epi_warps = 4
-        self.mma_warp = 4
-        self.tma_warp = 5
-        self.threads = 32 * 6
+        self.num_epi_warps = 4 * self.epi_groups
+        self.mma_warp = self.num_epi_warps
+        self.tma_warp = self.num_epi_warps + 1
+        self.threads = 32 * (self.num_epi_warps + 2)
         self.n_vtiles = V // S
         self.kb_s = S // self.KB
         self.kbg_s = S // self.KBG
@@ -764,7 +767,7 @@ class AwmChunkBwd:
         tma_dbmn, mDBmn_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDBmn, bmn_one, (128, S, KBG), tm_kmn)
         # epilogue: 128 x 32 bf16 pieces staged in shared memory, TMA stores
         epi_tile = (128, 32)
-        epi_layout = sm100_utils.make_smem_layout_epi(BFloat16, utils.LayoutEnum.ROW_MAJOR, epi_tile, self.epi_stages)
+        epi_layout = sm100_utils.make_smem_layout_epi(BFloat16, utils.LayoutEnum.ROW_MAJOR, epi_tile, self.epi_stages * self.epi_groups)
         epi_one = cute.slice_(epi_layout, (None, None, 0))
         tma_oqk, mDQK_t = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mDQK, epi_one, epi_tile)
         tma_ok, mDK_t = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), mDK, epi_one, epi_tile)
@@ -811,10 +814,11 @@ class AwmChunkBwd:
             cpasync.prefetch_descriptor(tma_dbk)
             cpasync.prefetch_descriptor(tma_damn)
             cpasync.prefetch_descriptor(tma_dbmn)
-        if warp == 0:
-            cpasync.prefetch_descriptor(tma_oqk)
-            cpasync.prefetch_descriptor(tma_ok)
-            cpasync.prefetch_descriptor(tma_ov)
+        if warp % 4 == 0:
+            if warp < self.mma_warp:
+                cpasync.prefetch_descriptor(tma_oqk)
+                cpasync.prefetch_descriptor(tma_ok)
+                cpasync.prefetch_descriptor(tma_ov)
 
         @cute.struct
         class SharedStorage:
@@ -833,6 +837,7 @@ class AwmChunkBwd:
         epi_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * self.num_epi_warps)
         a_bytes = cute.size_in_bytes(BFloat16, cute.select(a_layout, mode=[0, 1, 2]))
         b_bytes = cute.size_in_bytes(BFloat16, cute.select(bk_layout, mode=[0, 1, 2]))
+        raw_bytes = cute.size_in_bytes(BFloat16, cute.select(raw_layout, mode=[0, 1, 2]))
         a_prod, a_cons = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.a_mbar.data_ptr(), num_stages=self.a_stages, producer_group=one, consumer_group=one,
             tx_count=a_bytes).make_participants()
@@ -841,13 +846,17 @@ class AwmChunkBwd:
             tx_count=b_bytes).make_participants()
         raw_prod, raw_cons = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.raw_mbar.data_ptr(), num_stages=self.raw_stages, producer_group=one,
-            consumer_group=epi_group, tx_count=a_bytes, tidx=tidx % 32, enable_multicast_signaling=True).make_participants()
+            consumer_group=epi_group, tx_count=raw_bytes, tidx=tidx % 32, enable_multicast_signaling=True).make_participants()
         p_prod, p_cons = pipeline.PipelineAsyncUmma.create(
             barrier_storage=storage.p_mbar.data_ptr(), num_stages=1, producer_group=epi_group, consumer_group=one).make_participants()
         acc_prod, acc_cons = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar.data_ptr(), num_stages=2, producer_group=one,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epi_warps)).make_participants()
 
+        # the small per-tile arrays first: they fill the padding before the 1024-byte aligned buffers
+        sLse2 = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
+        sCorr = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)  # dlse - delta
+        sKeep = smem.allocate_tensor(Uint8, cute.make_layout(128), byte_alignment=16)
         sA = smem.allocate_tensor(BFloat16, a_layout.outer, byte_alignment=1024, swizzle=a_layout.inner)
         pRaw = smem.allocate_array(BFloat16, cute.cosize(raw_layout.outer), byte_alignment=1024)
         sRaw = cute.make_tensor(cute.recast_ptr(pRaw, swizzle_=raw_layout.inner), raw_layout.outer)
@@ -857,9 +866,6 @@ class AwmChunkBwd:
         pP = smem.allocate_array(BFloat16, cute.cosize(p_layout.outer), byte_alignment=1024)
         sP = cute.make_tensor(cute.recast_ptr(pP, swizzle_=p_layout.inner), p_layout.outer)
         sC = smem.allocate_tensor(BFloat16, epi_layout.outer, byte_alignment=1024, swizzle=epi_layout.inner)
-        sLse2 = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
-        sCorr = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)  # dlse - delta
-        sKeep = smem.allocate_tensor(Uint8, cute.make_layout(128), byte_alignment=16)
 
         gQK = cute.local_tile(mQK, (128, KBG), (None, None, None, None))
         gV = cute.local_tile(mV, (128, KBG), (None, None, None, None))
@@ -964,21 +970,23 @@ class AwmChunkBwd:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             acc = cute.make_tensor(tmem_ptr, acc_fake.layout)
-            trow = tidx  # this thread's row of the tile
-            cs = tidx % 8  # transform: 8 columns 8 cs .. 8 cs + 7 of each K block, rows rq + 16 r
-            rq = tidx // 8
+            grp = warp // 4  # epilogue group
+            trow = tidx % 128  # this thread's row of the tile (= TMEM lane)
+            cs = tidx % 8  # transform: 8 columns 8 cs .. 8 cs + 7 of each K block, rows rq + 16 r, r in the group's half
+            rq = (tidx // 8) % 16
             copy_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32, tcgen05.Pack.NONE), Float32)
             acc_r = [cute.flat_divide(acc[((None, None), 0, 0, i)], (128, 32)) for i in range(2)]
             t2r = [tcgen05.make_tmem_copy(copy_atom, acc_r[i][(None, None, 0, 0)]) for i in range(2)]
-            tTR = [t2r[i].get_slice(tidx).partition_S(acc_r[i]) for i in range(2)]
-            regs = cute.make_rmem_tensor(t2r[0].get_slice(tidx).partition_D(cute.make_identity_tensor((128, 32))).shape, Float32)
+            tTR = [t2r[i].get_slice(trow).partition_S(acc_r[i]) for i in range(2)]
+            tTR = [cute.group_modes(tTR[i], 3, cute.rank(tTR[i])) for i in range(2)]  # (.., piece)
+            regs = cute.make_rmem_tensor(t2r[0].get_slice(trow).partition_D(cute.make_identity_tensor((128, 32))).shape, Float32)
             rbf = cute.make_rmem_tensor(regs.shape, BFloat16)
             r2s = cute.make_tiled_copy_D(sm100_utils.get_smem_store_op(utils.LayoutEnum.ROW_MAJOR, BFloat16, Float32, t2r[0]), t2r[0])
-            tRS_sC = r2s.get_slice(tidx).partition_D(sC)
+            tRS_sC = r2s.get_slice(trow).partition_D(sC)
             tRS_r = r2s.retile(rbf)
-            epi_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 * self.num_epi_warps)
+            epi_bar = pipeline.NamedBarrier(barrier_id=4 + grp, num_threads=128)
             epi_pipe = pipeline.PipelineTmaStore.create(
-                num_stages=self.epi_stages, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * self.num_epi_warps))
+                num_stages=self.epi_stages, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128))
             n_epi = Int32(0)
             pv = cute.make_rmem_tensor((8,), Float32)
             for t in cutlass.range(bidx, num_tiles, nctas):
@@ -987,7 +995,7 @@ class AwmChunkBwd:
                 grow = row_block * 128 + trow  # sequence row
                 if True:
                     # per-column constants and the row keep flags of this tile
-                    for s in cutlass.range(tidx, S, 128):
+                    for s in cutlass.range(tidx, S, 32 * self.num_epi_warps):
                         sLse2[s] = _combine_lse2(mPart, s, u, k, b, self.R)
                         sCorr[s] = mDlse[s, u, k, b] - mDelta[s, u, k, b]
                     keep = Uint8(1)
@@ -1003,10 +1011,10 @@ class AwmChunkBwd:
                         hr = raw_cons.wait_and_advance()
                         lse8 = [sLse2[kb * KB + 8 * cs + e] for e in range(8)]
                         words = [cute.make_tensor(cute.recast_ptr(
-                            (pRaw + (hr.index * (128 * KB) + 64 * (rq + 16 * r) + 8 * (cs ^ ((rq + 16 * r) % 8)))).align(16), dtype=Uint32),
-                            cute.make_layout(4)).load() for r in range(8)]
-                        for r in cutlass.range_constexpr(8):
-                            row = rq + 16 * r
+                            (pRaw + (hr.index * (128 * KB) + 64 * (rq + 16 * (4 * grp + r)) + 8 * (cs ^ (rq % 8)))).align(16), dtype=Uint32),
+                            cute.make_layout(4)).load() for r in range(4)]
+                        for r in cutlass.range_constexpr(4):
+                            row = rq + 16 * (4 * grp + r)
                             for e2 in cutlass.range_constexpr(4):
                                 x0 = _u32_as_f32(words[r][e2] << 16)
                                 x1 = _u32_as_f32(words[r][e2] & Uint32(0xFFFF0000))
@@ -1015,7 +1023,7 @@ class AwmChunkBwd:
                                 pv[2 * e2 + 1] = cute.math.exp2(y1, fastmath=True)
                             if sKeep[row] == 0:
                                 pv.fill(0.0)
-                            cute.make_tensor((pP + (kb * (128 * KB) + 64 * row + 8 * (cs ^ (row % 8)))).align(16),
+                            cute.make_tensor((pP + (kb * (128 * KB) + 64 * row + 8 * (cs ^ (rq % 8)))).align(16),
                                              cute.make_layout(8)).store(pv.load().to(BFloat16))
                         cute.arch.fence_view_async_shared()
                         cute.arch.sync_warp()
@@ -1027,11 +1035,12 @@ class AwmChunkBwd:
                     # ---- epilogues: dk from the dP^T region, then dqk and the dv tiles ----
                     for g in cutlass.range(2 + self.n_vtiles):
                         f = acc_cons.wait_and_advance()
-                        for ch in cutlass.range_constexpr(S // 32):
+                        for ch2 in cutlass.range_constexpr(S // 32 // self.epi_groups):
+                            ch = ch2 * self.epi_groups + grp  # this group's pieces
                             if f.index == 0:
-                                cute.copy(t2r[0], tTR[0][(None, None, None, 0, ch)], regs)
+                                cute.copy(t2r[0], tTR[0][(None, None, None, ch)], regs)
                             else:
-                                cute.copy(t2r[1], tTR[1][(None, None, None, 0, ch)], regs)
+                                cute.copy(t2r[1], tTR[1][(None, None, None, ch)], regs)
                             if g == 0:  # dk = P^T (dP^T + dlse - delta)
                                 for q8 in cutlass.range_constexpr(4):
                                     s0 = ch * 32 + q8 * 8
@@ -1039,11 +1048,11 @@ class AwmChunkBwd:
                                     for e in cutlass.range_constexpr(8):
                                         regs[q8 * 8 + e] = p8[e].to(Float32) * (regs[q8 * 8 + e] + sCorr[s0 + e])
                             rbf.store(regs.load().to(BFloat16))
-                            buf = n_epi % self.epi_stages
+                            buf = grp * self.epi_stages + n_epi % self.epi_stages
                             cute.copy(r2s, tRS_r, tRS_sC[(None, None, None, buf)])
                             cute.arch.fence_view_async_shared()
                             epi_bar.arrive_and_wait()
-                            if warp == 0:
+                            if warp % 4 == 0:
                                 if g == 0:
                                     cute.copy(tma_ok, tOKs[(None, buf)], tOKg[(None, row_block, ch, k, b)])
                                 elif g == 1:
