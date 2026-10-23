@@ -470,7 +470,15 @@ class AwmChunkGemm:
         self.NS, self.nsub, self.n_blocks = chunk_gemm_tiling(S, V)
         self.TM = 128
         self.KB = 32
-        self.stages = stages
+        # rings: raw key tiles (cheap, deep: their TMA latency is on the transform warps' path), P tiles, and
+        # [qk | v] tiles with the shared memory left
+        stage_ab = 128 * self.KB * 2
+        stage_b = self.nsub * self.NS * self.KB * 2
+        budget = 220 * 1024 - C
+        self.p_stages = 4
+        self.b_stages = max(2, min(6, (budget - (4 + self.p_stages) * stage_ab) // stage_b))
+        self.b_stages = max(min(self.b_stages, 4), min(6, (budget - (8 + self.p_stages) * stage_ab) // stage_b))
+        self.k_stages = max(4, min(8, (budget - self.p_stages * stage_ab - self.b_stages * stage_b) // stage_ab))
         self.epi_stages = 2
         self.splits = splits
         self.m_blocks = S // self.TM
@@ -501,10 +509,11 @@ class AwmChunkGemm:
                                   tcgen05.OperandSource.SMEM, tcgen05.OperandMajorMode.MN, tcgen05.OperandMajorMode.MN)
         tiled_mma = cute.make_tiled_mma(op)
         tiler = (self.TM, self.NS, self.KB)
-        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tiler, BFloat16, self.stages)
-        b_layout = sm100_utils.make_smem_layout_b(tiled_mma, tiler, BFloat16, self.stages * self.nsub)
+        raw_layout = sm100_utils.make_smem_layout_a(tiled_mma, tiler, BFloat16, self.k_stages)
+        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tiler, BFloat16, self.p_stages)
+        b_layout = sm100_utils.make_smem_layout_b(tiled_mma, tiler, BFloat16, self.b_stages * self.nsub)
         tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
-        tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mK, cute.slice_(a_layout, (None, None, None, 0)), tiler, tiled_mma)
+        tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mK, cute.slice_(raw_layout, (None, None, None, 0)), tiler, tiled_mma)
         b_one = cute.slice_(b_layout, (None, None, None, 0))
         tma_qk, mQK_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mQK, b_one, tiler, tiled_mma)
         tma_v, mV_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mV, b_one, tiler, tiled_mma)
@@ -517,7 +526,7 @@ class AwmChunkGemm:
                                                      cute.slice_(epi_layout, (None, None, 0)), epi_tile)
         grid = B * K * nu * self.m_blocks * self.n_blocks * self.splits
         self.kernel(tiled_mma, tma_k, mK_t, tma_qk, mQK_t, tma_v, mV_t, tSeg.iterator, mPart, tma_red, mAB_t,
-                    a_layout, b_layout, epi_layout, B, nu, j_off, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+                    raw_layout, a_layout, b_layout, epi_layout, B, nu, j_off, seg_off, seg_stride).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
     def _p_offset(self, g, kk):
         """Element offset of P[8 g .. 8 g + 7, kk] in a stage of the MN-major A operand (128-byte swizzle)."""
@@ -527,7 +536,8 @@ class AwmChunkGemm:
     @cute.kernel
     def kernel(self, tiled_mma: cute.TiledMma, tma_k: cute.CopyAtom, mK: cute.Tensor, tma_qk: cute.CopyAtom,
                mQK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor, pSeg: cute.Pointer, mPart: cute.Tensor,
-               tma_red: cute.CopyAtom, mAB: cute.Tensor, a_layout: cute.ComposedLayout, b_layout: cute.ComposedLayout,
+               tma_red: cute.CopyAtom, mAB: cute.Tensor, raw_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout,
+               b_layout: cute.ComposedLayout,
                epi_layout: cute.ComposedLayout, B: Int32, nu: Int32, j_off: Int32, seg_off: Int32, seg_stride: Int32):
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -555,9 +565,9 @@ class AwmChunkGemm:
 
         @cute.struct
         class SharedStorage:
-            k_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
-            p_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
-            b_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
+            k_mbar: cute.struct.MemRange[cutlass.Int64, self.k_stages * 2]
+            p_mbar: cute.struct.MemRange[cutlass.Int64, self.p_stages * 2]
+            b_mbar: cute.struct.MemRange[cutlass.Int64, self.b_stages * 2]
             acc_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             tmem_holding: Int32
 
@@ -572,23 +582,22 @@ class AwmChunkGemm:
         tp_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * self.num_tp_warps)
         # the transform warps release a raw stage with one arrive per warp (lane 0, after a warp sync)
         k_prod, k_cons = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.k_mbar.data_ptr(), num_stages=self.stages, producer_group=one,
+            barrier_storage=storage.k_mbar.data_ptr(), num_stages=self.k_stages, producer_group=one,
             consumer_group=tp_group, tx_count=a_bytes, tidx=tidx % 32,
             enable_multicast_signaling=True).make_participants()
         p_prod, p_cons = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.p_mbar.data_ptr(), num_stages=self.stages, producer_group=tp_group,
+            barrier_storage=storage.p_mbar.data_ptr(), num_stages=self.p_stages, producer_group=tp_group,
             consumer_group=one).make_participants()
         b_prod, b_cons = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.b_mbar.data_ptr(), num_stages=self.stages, producer_group=one,
+            barrier_storage=storage.b_mbar.data_ptr(), num_stages=self.b_stages, producer_group=one,
             consumer_group=one, tx_count=b_bytes).make_participants()
         acc_prod, acc_cons = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar.data_ptr(), num_stages=1, producer_group=one,
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_tp_warps)).make_participants()
 
-        a_elems = cute.cosize(a_layout.outer)
-        pRaw = smem.allocate_array(BFloat16, a_elems, byte_alignment=1024)
-        pP = smem.allocate_array(BFloat16, a_elems, byte_alignment=1024)
-        sRaw = cute.make_tensor(cute.recast_ptr(pRaw, swizzle_=a_layout.inner), a_layout.outer)
+        pRaw = smem.allocate_array(BFloat16, cute.cosize(raw_layout.outer), byte_alignment=1024)
+        pP = smem.allocate_array(BFloat16, cute.cosize(a_layout.outer), byte_alignment=1024)
+        sRaw = cute.make_tensor(cute.recast_ptr(pRaw, swizzle_=raw_layout.inner), raw_layout.outer)
         sP = cute.make_tensor(cute.recast_ptr(pP, swizzle_=a_layout.inner), a_layout.outer)
         sB = smem.allocate_tensor(BFloat16, b_layout.outer, byte_alignment=1024, swizzle=b_layout.inner)
         sKeep = smem.allocate_tensor(Uint8, cute.make_layout(self.C), byte_alignment=16)
