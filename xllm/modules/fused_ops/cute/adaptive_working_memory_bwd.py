@@ -11,12 +11,24 @@ adaptive_working_memory_reference.py). With G = dL/dM' the gradient of the state
       dP^T = qk dA^T + v dB^T,  dk = P^T (dP^T - delta + dlse) with delta = rowdot(dA, A) + rowdot(dB, B),
       dqk = P^T dA,  dv = P^T dB
 
-Kernels (in stream order; the forward's phases 1 and 2 are recomputed first with the save option):
+Kernels (in stream order; the forward's workspaces come from adaptive_working_memory_fwd(return_workspace=True)
+or are recomputed with its save option):
+  AwmZeroTail       zero rows of the last chunk of dqk / dk / dv
   AwmOutGemm (forward kernel, roles of S and V swapped)   dq and the output row mask
-  AwmDmoGemm        split-K tcgen05 GEMM with MN-major operands, masked rows dropped, TMA reduce-add epilogue
-  AwmRecurrenceBwd  tcgen05 reverse recurrence, G in registers, rG / M as bf16 smem operands
-  AwmBwdPrep        dA partials -> bf16, delta, the lse chain -> dlse
-  AwmChunkBwd       per 128 time rows: dP^T, P^T transform, dk / dqk / dv
+  AwmDmoGemm        split-K tcgen05 GEMM with MN-major operands, masked time tiles skipped, TMA reduce-add
+  AwmRecurrenceBwd  tcgen05 reverse recurrence (one GEMM per update), G in registers, rG as bf16 smem operand
+  torch.matmul      dA = dB (-M)^T from the saved negated state
+  AwmBwdDelta       delta = rowdot(dA, A) + rowdot(dB, B);  AwmLseChain: the lse chain -> dlse
+  AwmChunkBwd       persistent, per 128 time rows: dP^T, P^T transform, dk / dqk / dv (TMA-store epilogues)
+
+Training case only (no input memory / previous chunk, V a multiple of S); the torch backward is used otherwise.
+
+bf16, L = 16384, chunk 4096, with segment_idx, B200 (GPU time per call, saved workspaces; the torch
+recompute + backward is about 3.5 ms per call):
+  gekko-0.9B (B2 H8 K4 S256 V256)   ~236us  (chunk 88, dq 49, dMo 48, recurrence 30)
+  gekko-4B   (B1 H32 K8 S128 V128)  ~142us
+  gekko-7.1B (B1 H4 K4 S256 V2048)  ~400us  (chunk 181, dq 72, dMo 72, recurrence 30)
+Training step on 1 GPU: AWM backward 99 -> 6 ms per step (0.9B, B2), 98 -> 11 ms (7.1B, B1).
 """
 
 import math
