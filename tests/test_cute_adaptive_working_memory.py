@@ -195,3 +195,20 @@ def test_backward_matches_autograd(B, H, K, S, V, L, C, seg_rate, with_dmem):
     for name, got, leaf in zip(("dq", "dqk", "dk", "dv"), grads[:4], leaves):
         assert got.shape == leaf.shape and got.dtype == torch.bfloat16
         assert rel_err(got, leaf.grad) < 1.5e-2, (name, rel_err(got, leaf.grad))
+
+
+def test_backward_from_saved_workspace():
+    """awm_bwd_prepare from the forward's workspace gives the same gradients as the recomputing path."""
+    B, H, K, S, V, L, C = 2, 4, 2, 128, 128, 1024, 256
+    q, qk, k, v, _, _, _, _, _, seg, _ = make_inputs(B, H, K, S, V, L, C, False, 0.5)
+    out, mask, memory, lnt, ws = awm.adaptive_working_memory_fwd(q, qk, k, v, C, None, None, None, None, None, seg, None,
+                                                                return_workspace=True)
+    out2, mask2, _, _ = awm.adaptive_working_memory_fwd(q, qk, k, v, C, None, None, None, None, None, seg, None)
+    assert torch.equal(out, out2) and torch.equal(mask, mask2)
+    dout = torch.randn(B, L, H, V, device="cuda").to(torch.bfloat16).transpose(1, 2)
+    state, out3 = awm_bwd.awm_bwd_prepare(q, qk, k, v, C, seg, True, ws)
+    assert torch.equal(out3, out)
+    g1 = awm_bwd.awm_bwd_finish(state, dout)
+    g2 = awm_bwd.adaptive_working_memory_bwd(dout, None, None, q, qk, k, v, C, seg)
+    for a, b in zip(g1[:4], g2[:4]):  # the split-K reduce-adds are not bitwise deterministic
+        assert rel_err(a, b.double()) < 1e-2

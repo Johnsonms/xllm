@@ -312,6 +312,7 @@ class GekkoBlockFunction(torch.autograd.Function):
                 prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
                 awm_orthogonal_update, rmsnorm_eps, awm_backend
             )
+            awm_workspace = ()
 
             _, handle8 = send_memory_to_next(new_memory)
             _, handle9 = send_log_norm_term_to_next(new_lnt)
@@ -340,11 +341,19 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = akk.transpose(1, 2)
             av = xv_.transpose(1, 2)
 
-            awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
-                aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
-                prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
-                awm_orthogonal_update, rmsnorm_eps, awm_backend
-            )
+            if awm_backend == 'cute' and awm_cute_bwd_supported(aq, av, attention_chunk_size, awm_orthogonal_update, memory, prev_akk):
+                # CuTe DSL kernels: keep the workspaces of the forward for the backward
+                from xllm.modules.fused_ops.cute.adaptive_working_memory import adaptive_working_memory_fwd as cute_awm_fwd
+                awk_out, awk_mask, new_memory, new_lnt, awm_workspace = cute_awm_fwd(
+                    aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
+                    prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count, return_workspace=True
+                )
+            else:
+                awk_out, awk_mask, new_memory, new_lnt = adaptive_working_memory_fwd(
+                    aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term,
+                    prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
+                    awm_orthogonal_update, rmsnorm_eps, awm_backend
+                )
 
             handle8 = None
             handle9 = None
@@ -438,6 +447,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
+            *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
         ctx.local_kv_heads = local_kv_heads
@@ -529,6 +539,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1,  # (bsz*slen, v/MP)
             h3,  # (bsz*slen, v/MP)
+            *awm_workspace,
         ) = ctx.saved_tensors
 
         bsz, seq_len, _ = x.size()
@@ -728,7 +739,10 @@ class GekkoBlockFunction(torch.autograd.Function):
         if use_cute_awm:
             # CuTe DSL kernels: the forward's phases are recomputed here, the gradients after the output gradient
             from xllm.modules.fused_ops.cute.adaptive_working_memory_bwd import awm_bwd_prepare, awm_bwd_finish
-            awm_cute_state, awk_out_rec = awm_bwd_prepare(aq, aqk, akk, av, attention_chunk_size, segment_idx, awk_out is None)
+            awm_cute_state, awk_out_rec = awm_bwd_prepare(
+                aq, aqk, akk, av, attention_chunk_size, segment_idx, awk_out is None,
+                tuple(awm_workspace) if awm_workspace else None
+            )
         else:
             memory_outs, lnt_outs, kv_outs, kk_outs, prev_outs = adaptive_working_memory_accum_fwd(
                 aq, aqk, akk, av, attention_chunk_size, memory, log_norm_term, prev_aqk, prev_akk, prev_av,

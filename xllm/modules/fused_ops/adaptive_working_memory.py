@@ -39,12 +39,20 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
         eps: float = 1e-6,
         backend: str = 'torch',
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        y, mask, mem, lnt = adaptive_working_memory_fwd(
-            q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
-            segment_idx, prev_segment_count, ortho, eps, backend
-        )
+        workspace = ()
+        if backend == 'cute' and _cute_bwd_supported(q, v, chunk_size, ortho, memory, prev_k):
+            from .cute.adaptive_working_memory import adaptive_working_memory_fwd as cute_fwd
+            y, mask, mem, lnt, workspace = cute_fwd(
+                q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
+                segment_idx, prev_segment_count, return_workspace=True
+            )
+        else:
+            y, mask, mem, lnt = adaptive_working_memory_fwd(
+                q, qk, k, v, chunk_size, memory, log_norm_term, prev_qk, prev_k, prev_v,
+                segment_idx, prev_segment_count, ortho, eps, backend
+            )
         ctx.save_for_backward(
-            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
+            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count, *workspace
         )
         ctx.chunk_size = chunk_size
         ctx.ortho = ortho
@@ -63,16 +71,15 @@ class AdaptiveWorkingMemoryFunc(torch.autograd.Function):
                Optional[Tensor], Optional[Tensor], Optional[Tensor],
                None, None, None, None]:
         (
-            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count
+            q, qk, k, v, memory, log_norm_term, prev_qk, prev_k, prev_v, segment_idx, prev_segment_count, *workspace
          ) = ctx.saved_tensors
         chunk_size = ctx.chunk_size
         ortho = ctx.ortho
         eps = ctx.eps
-        if ctx.backend == 'cute' and _cute_bwd_supported(q, v, chunk_size, ortho, memory, prev_k):
-            from .cute.adaptive_working_memory_bwd import adaptive_working_memory_bwd as cute_bwd
-            q_grad, qk_grad, k_grad, v_grad, _, _ = cute_bwd(
-                y_grad, mem_grad, lnt_grad, q, qk, k, v, chunk_size, segment_idx
-            )
+        if workspace:
+            from .cute.adaptive_working_memory_bwd import awm_bwd_prepare, awm_bwd_finish
+            state, _ = awm_bwd_prepare(q, qk, k, v, chunk_size, segment_idx, False, tuple(workspace))
+            q_grad, qk_grad, k_grad, v_grad, _, _ = awm_bwd_finish(state, y_grad, mem_grad, lnt_grad)
             return (q_grad, qk_grad, k_grad, v_grad, None, None, None, None, None, None, None, None, None, None, None)
         # accumulative memory
         (
