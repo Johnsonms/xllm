@@ -15,6 +15,7 @@ depend on the recurrence. This file holds the kernels; see adaptive_working_memo
 """
 
 import math
+from functools import lru_cache
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -1192,7 +1193,13 @@ _U8 = cutlass.Uint8
 
 
 def _sm_count(device) -> int:
-    return torch.cuda.get_device_properties(device).multi_processor_count
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return _sm_count_of(idx)
+
+
+@lru_cache(maxsize=None)
+def _sm_count_of(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _blhs(t: torch.Tensor) -> torch.Tensor:
