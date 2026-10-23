@@ -136,7 +136,7 @@ class TimestepDecayNormFwd:
         assert self.T % self.R == 0 and self.T % 32 == 0
         assert self.Gt <= 32 and self.D >= 1 and self.P >= 0 and self.S <= 32
         assert self.VEC % 2 == 0, "packed f32x2 arithmetic needs an even vector width"
-        assert BAR_BASE + 2 * self.NB + self.NA + self.S <= 16, "named barriers"
+        assert BAR_BASE + 2 * self.NB + self.S <= 16, "named barriers"
 
     @cute.jit
     def __call__(
@@ -262,6 +262,9 @@ class TimestepDecayNormFwd:
             self.dtype, cute.make_layout((1, self.T, self.W, self.S), stride=(self.T * self.W, self.W, 1, self.T * self.W)),
             byte_alignment=128)
         full_bar = smem.allocate_array(Int64, num_elems=self.S)
+        # aggregate -> resolve hand-off, one per buffer (slot a is reused by tile j + NA, whose aggregate
+        # starts only after tile j was resolved: NA >= D + 1)
+        agg_bar = smem.allocate_array(Int64, num_elems=self.NA)
         # per stage: the tile's ticket and its row codes (bit 0: live, bit 1: bos), written by the producer
         sTicket = smem.allocate_tensor(Int32, cute.make_layout(self.S), byte_alignment=16)
         # per stage: (b, seg, gtile) of its tile, decoded once by the producer
@@ -297,6 +300,8 @@ class TimestepDecayNormFwd:
 
         if tidx < self.S:
             cute.arch.mbarrier_init(full_bar + tidx, 1)
+        if tidx < self.NA:
+            cute.arch.mbarrier_init(agg_bar + tidx, 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
@@ -366,12 +371,16 @@ class TimestepDecayNormFwd:
                     nbuf = (jt + 1) % na
                     if lane == 0:
                         sTk[nbuf] = tk
-                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + nbuf, number_of_threads=64)
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(agg_bar + nbuf)
                 else:
                     self._aggregate_tile(tk, jt % nb, abuf, jt % stages, lane, mAggW, sCode, sCm, sRs, sRow,
                                          sAgg, sAggMaskI, beta1, beta2, one_minus_beta1, one_minus_beta2)
                     jt = jt + 1
-                cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
+                cute.arch.sync_warp()
+                if lane == 0:
+                    cute.arch.mbarrier_arrive(agg_bar + abuf)
         elif warp <= self.NCW + self.NRW:
             # ================================ resolve warp =================================================
             rw = warp - self.NCW - 1
@@ -379,7 +388,7 @@ class TimestepDecayNormFwd:
             running = Int32(1)
             while running != 0:
                 abuf = jt % na
-                cute.arch.barrier(barrier_id=BAR_BASE + self.NB + abuf, number_of_threads=64)
+                cute.arch.mbarrier_wait(agg_bar + abuf, (jt // na) % 2)
                 tk = sTk[abuf]
                 if tk >= num_tiles:
                     running = Int32(0)
@@ -388,7 +397,7 @@ class TimestepDecayNormFwd:
                                        mAggW, mIncW, mPrevCount, mPrevMean, mPrevVar, mCount, mMean, mVar,
                                        sRow, sAgg, sAggMaskI, sIn[rw, None, None], sInC[rw, None], sCm, sRs, sInfo,
                                        log2_beta1, log2_beta2, eps, rsqrt_eps)
-                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + self.NA + jt % nb, number_of_threads=handoff)
+                    cute.arch.barrier_arrive(barrier_id=BAR_BASE + self.NB + jt % nb, number_of_threads=handoff)
                     jt = jt + self.NRW
         else:
             # ================================ producer warp ================================================
@@ -423,7 +432,7 @@ class TimestepDecayNormFwd:
                         self._load_raw_masks(tk_next, rBos[1 - hh], rPad[1 - hh], mBos, mPad, num_chains, num_tiles, L, lane)
                         # reuse the stage: store the y of tile jt-S once the compute warps released it
                         if jt >= stages:
-                            cute.arch.barrier(barrier_id=BAR_BASE + 2 * self.NB + self.NA + stage, number_of_threads=handoff)
+                            cute.arch.barrier(barrier_id=BAR_BASE + 2 * self.NB + stage, number_of_threads=handoff)
                             self._store_y(sTile, stage, tma_store, tsY, tgY)
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
                         seg = tk // num_chains
@@ -451,7 +460,7 @@ class TimestepDecayNormFwd:
                 m = jt - self.S + d
                 if m >= 0:
                     mst = m % stages
-                    cute.arch.barrier(barrier_id=BAR_BASE + 2 * self.NB + self.NA + mst, number_of_threads=handoff)
+                    cute.arch.barrier(barrier_id=BAR_BASE + 2 * self.NB + mst, number_of_threads=handoff)
                     self._store_y(sTile, mst, tma_store, tsY, tgY)
             cute.arch.cp_async_bulk_wait_group(0)
 
@@ -695,7 +704,7 @@ class TimestepDecayNormFwd:
         t0 = seg * self.T
         h = j % nb
         stage = j % stages
-        cute.arch.barrier(barrier_id=BAR_BASE + self.NB + self.NA + h, number_of_threads=self.NC + 32)
+        cute.arch.barrier(barrier_id=BAR_BASE + self.NB + h, number_of_threads=self.NC + 32)
         w = rW.load().to(Float32)
         bias = rB.load().to(Float32)
         xs_base = stage * tile_elems + cidx * vec_dyn
@@ -725,7 +734,7 @@ class TimestepDecayNormFwd:
             tiles[i].store(y.load().to(self.dtype))
         # make y visible to the TMA unit, then hand the stage to the producer
         cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.barrier_arrive(barrier_id=BAR_BASE + 2 * self.NB + self.NA + stage, number_of_threads=self.NC + 32)
+        cute.arch.barrier_arrive(barrier_id=BAR_BASE + 2 * self.NB + stage, number_of_threads=self.NC + 32)
         # per-row statistics for the backward pass, coalesced across the compute threads
         g0 = gtile * self.Gt
         for k in cutlass.range_constexpr((self.Gt * self.T + self.NC - 1) // self.NC):
@@ -979,7 +988,7 @@ def _fwd_smem_bytes(esize: int, Dg: int, gt: int, tile_len: int, prefetch: int, 
     x_ring = S * T * W * esize
     moments = 2 * NB * gt * T * 4 + NB * T * 4
     handoff = NA * (gt * 2 * 4 + 2 * 4 + T * 4 + 4)
-    return x_ring + moments + handoff + S * (T + 4 + 8) + 2 * (gt * 8 + 4) + 1024
+    return x_ring + moments + handoff + S * (T + 4 + 8) + 2 * (gt * 8 + 4) + NA * 8 + 1024
 
 
 @lru_cache(maxsize=None)
