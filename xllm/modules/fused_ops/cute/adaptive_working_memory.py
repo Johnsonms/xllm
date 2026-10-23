@@ -41,22 +41,24 @@ class AwmOutGemm:
     range, so the memory tile (VT x S, resident in shared memory) is reloaded only when the group changes.
     """
 
-    def __init__(self, H: int, K: int, S: int, V: int, C: int, has_prev: bool, has_seg: bool, a_stages: int = 4):
+    def __init__(self, H: int, K: int, S: int, V: int, C: int, has_prev: bool, has_seg: bool, VT: int = 256,
+                 a_stages: int = 4):
         self.H, self.K, self.S, self.V, self.C = H, K, S, V, C
         self.has_prev, self.has_seg = has_prev, has_seg
         self.n_rep = H // K
         self.TM = 128
-        self.VT = min(V, 256)
+        self.VT = min(V, VT)
         self.KB = 64  # K block of one A stage (128 B of bf16: one swizzle atom)
         self.a_stages = a_stages
         self.acc_stages = 2
-        self.epi_stages = 2
+        self.epi_stages = 2  # per epilogue group
+        self.epi_groups = 2  # two groups of 4 warps take alternate 32-column sub-tiles of a tile
         self.mma_tiler = (self.TM, self.VT, self.KB)
         self.mma_tiler_b = (self.TM, self.VT, self.S)
-        self.num_epi_warps = 4
-        self.mma_warp = 4
-        self.tma_warp = 5
-        self.threads = 32 * 6
+        self.num_epi_warps = 4 * self.epi_groups
+        self.mma_warp = self.num_epi_warps
+        self.tma_warp = self.num_epi_warps + 1
+        self.threads = 32 * (self.num_epi_warps + 2)
         assert H % K == 0 and V % self.VT == 0 and C % self.TM == 0 and S % self.KB == 0
         assert self.VT % 16 == 0 and self.VT <= 256
         self.n_vt = V // self.VT
@@ -92,7 +94,7 @@ class AwmOutGemm:
 
         c_layout_kind = utils.LayoutEnum.ROW_MAJOR
         epi_tile = sm100_utils.compute_epilogue_tile_shape((self.TM, self.VT, self.KB), False, c_layout_kind, BFloat16)
-        epi_smem_layout = sm100_utils.make_smem_layout_epi(BFloat16, c_layout_kind, epi_tile, self.epi_stages)
+        epi_smem_layout = sm100_utils.make_smem_layout_epi(BFloat16, c_layout_kind, epi_tile, self.epi_stages * self.epi_groups)
         tma_c, mOut_tma = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(), mOut, cute.slice_(epi_smem_layout, (None, None, 0)), epi_tile)
 
@@ -127,7 +129,6 @@ class AwmOutGemm:
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        epi_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * self.num_epi_warps)
         tmem_bar = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * (self.num_epi_warps + 1))
         tmem = utils.TmemAllocator(storage.tmem_holding.ptr, barrier_for_retrieve=tmem_bar, allocator_warp_id=0)
 
@@ -227,9 +228,11 @@ class AwmOutGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(Float32)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            grp = warp // 4
+            etid = tidx % 128  # TMEM lane / row of the tile (warp % 4 selects the lanes)
+            epi_bar = pipeline.NamedBarrier(barrier_id=3 + grp, num_threads=128)
             epi_pipe = pipeline.PipelineTmaStore.create(
-                num_stages=self.epi_stages,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * self.num_epi_warps))
+                num_stages=self.epi_stages, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128))
             copy_atom_t2r = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32, tcgen05.Pack.NONE), Float32)
             t = start
             while t < end:
@@ -238,14 +241,14 @@ class AwmOutGemm:
                 h = k * self.n_rep + hr
                 # this thread's row of the tile (TMEM lane = row for M = 128) and its mask: the chunk's memory is
                 # empty, or the row is not in the segment that the memory ends in (that of chunk c - 2)
-                row = row_block * self.TM + tidx
+                row = row_block * self.TM + etid
                 masked = mDead[c, b] != 0
                 if const_expr(self.has_seg):
                     if c >= 2 or const_expr(self.has_prev):
                         seg_row = cute.make_tensor(pSeg + (b * seg_stride + seg_off + row), cute.make_layout(1))[0]
                         masked = masked | (seg_row != _seg_anchor(pSeg, pPrevCount, b, c - 2, seg_off, seg_stride, self.C))
                 keep = cutlass.select_(masked, Float32(0.0), Float32(1.0))
-                if hr == 0 and vt == 0 and k == 0:
+                if hr == 0 and vt == 0 and k == 0 and grp == 0:
                     mOutMask[row, b] = cutlass.select_(masked, Uint8(1), Uint8(0))
                 acc_full = acc_cons.wait_and_advance()
                 tCtAcc = tCtAcc_base[(None, None, None, acc_full.index)]
@@ -253,26 +256,27 @@ class AwmOutGemm:
                 tCgC_epi = cute.flat_divide(tCgC[((None, None), 0, 0, row_block, vt, h, b)], epi_tile)
                 tCgC_tma_cur = tCgC_tma[(None, None, None, row_block, vt, h, b)]
                 tiled_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tCtAcc_epi[(None, None, 0, 0)])
-                thr_t2r = tiled_t2r.get_slice(tidx)
+                thr_t2r = tiled_t2r.get_slice(etid)
                 tTR_tAcc = thr_t2r.partition_S(tCtAcc_epi)
                 tTR_gC = thr_t2r.partition_D(tCgC_epi)
                 tTR_rAcc = cute.make_rmem_tensor(tTR_gC[(None, None, None, 0, 0)].shape, Float32)
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 copy_atom_r2s = sm100_utils.get_smem_store_op(c_layout_kind, BFloat16, Float32, tiled_t2r)
                 tiled_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_t2r)
-                thr_r2s = tiled_r2s.get_slice(tidx)
+                thr_r2s = tiled_r2s.get_slice(etid)
                 tRS_sC = thr_r2s.partition_D(sC)
                 tRS_rAcc = tiled_r2s.retile(tTR_rAcc)
                 tRS_rC = cute.make_rmem_tensor(tRS_rAcc.shape, BFloat16)
                 tCgC_grouped = cute.group_modes(tCgC_tma_cur, 1, cute.rank(tCgC_tma_cur))
-                for sub in cutlass.range(cute.size(tTR_tAcc.shape, mode=[3])):
+                for sub2 in cutlass.range(cute.size(tTR_tAcc.shape, mode=[3]) // self.epi_groups):
+                    sub = sub2 * self.epi_groups + grp
                     cute.copy(tiled_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc)
-                    buf = sub % self.epi_stages
+                    buf = grp * self.epi_stages + sub2 % self.epi_stages
                     tRS_rC.store((tRS_rAcc.load() * keep).to(BFloat16))
                     cute.copy(tiled_r2s, tRS_rC, tRS_sC[(None, None, None, buf)])
                     cute.arch.fence_view_async_shared()
                     epi_bar.arrive_and_wait()
-                    if warp == 0:
+                    if warp % 4 == 0:
                         cute.copy(tma_c, tCsC[(None, buf)], tCgC_grouped[(None, sub)])
                         epi_pipe.producer_commit()
                         epi_pipe.producer_acquire()
@@ -282,21 +286,24 @@ class AwmOutGemm:
                 t += 1
             epi_pipe.producer_tail()
             tmem.relinquish_alloc_permit()
+            cute.arch.barrier(barrier_id=5, number_of_threads=32 * self.num_epi_warps)
             tmem.free(tmem_ptr)
 
     @cute.jit
     def _decode(self, t: Int32, B: Int32, nc: Int32):
-        """Tile index -> (row block in chunk, head in group, chunk, kv head, batch, v tile)."""
+        """Tile index -> (row block in chunk, head in group, chunk, kv head, batch, v tile). Groups (one memory
+        tile) are ordered (b, k, c, vt) with the v tile fastest: the CTAs of the v tiles of the same rows run
+        side by side and read each q tile from L2."""
         rt = t % self.row_tiles
         t1 = t // self.row_tiles
         hr = t1 % self.n_rep
         t2 = t1 // self.n_rep
-        c = t2 % nc
-        t3 = t2 // nc
-        k = t3 % self.K
-        t4 = t3 // self.K
-        b = t4 % B
-        vt = t4 // B
+        vt = t2 % self.n_vt
+        t3 = t2 // self.n_vt
+        c = t3 % nc
+        t4 = t3 // nc
+        k = t4 % self.K
+        b = t4 // self.K
         return rt, hr, c, k, b, vt
 
 
@@ -1146,6 +1153,14 @@ def _blhs(t: torch.Tensor) -> torch.Tensor:
 _DUMMY = {}
 
 
+def _out_tiling(S, V):
+    """(v tile, A stages) of the output GEMM: the resident memory tile (VT x S bf16) and the q ring share the
+    shared memory; with a single 256-wide v tile the ring holds just one tile of K."""
+    vt = min(V, 256)
+    stages = max(2, min(16, (192 * 1024 - vt * S * 2) // (128 * 64 * 2)))
+    return vt, stages
+
+
 def _dummy(dtype, device):
     """A 1-element tensor standing in for an absent optional input (never read)."""
     key = (dtype, device)
@@ -1233,12 +1248,17 @@ def adaptive_working_memory_fwd(
     # phase 3: outputs and the output mask
     out = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
     out_mask = torch.empty(B, L, dtype=torch.bool, device=dev)
-    out_key = ("out", H, K, S, V, C, has_prev, has_seg)
-    f_out = _compiled(out_key, lambda: AwmOutGemm(H, K, S, V, C, has_prev, has_seg), lambda: (
+    out_vt, out_stages = _out_tiling(S, V)
+    out_key = ("out", H, K, S, V, C, has_prev, has_seg, out_vt, out_stages)
+    f_out = _compiled(out_key, lambda: AwmOutGemm(H, K, S, V, C, has_prev, has_seg, out_vt, out_stages), lambda: (
         _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int64, 8), _fake(Int64, 8), _fake(_U8, 1),
         _fake(_U8, 1), *([Int32(0)] * 5)))
-    vt = min(V, 256)
-    num_tiles = (V // vt) * B * K * nc * (H // K) * (C // 128)
+    groups = (V // out_vt) * B * K * nc  # tiles sharing one resident memory tile
+    group_tiles = (H // K) * (C // 128)
+    num_tiles = groups * group_tiles
+    # whole groups per CTA range (a memory tile reload stalls the MMAs): CTAs = groups x splits of a group
+    splits = max(1, min(group_tiles, _sm_count(dev) // groups)) if groups <= _sm_count(dev) else 0
+    out_ctas = groups * splits if splits else _sm_count(dev)
     f_out(q.reshape(-1), MT.reshape(-1), out.reshape(-1), seg.reshape(-1), prev_cnt.reshape(-1), dead.reshape(-1),
-          out_mask.view(torch.uint8).reshape(-1), B, L, seg_off, seg_stride, min(_sm_count(dev), num_tiles))
+          out_mask.view(torch.uint8).reshape(-1), B, L, seg_off, seg_stride, min(out_ctas, num_tiles))
     return out.transpose(1, 2), out_mask, mem_out, lnt_out
