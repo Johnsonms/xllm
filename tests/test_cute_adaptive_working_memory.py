@@ -130,3 +130,35 @@ def test_forward_matches_reference(B, H, K, S, V, L, C, with_memory, seg_rate):
     assert rel_err(memory, rmemory) < 1.5e-2
     assert rel_err(lnt, rlnt) < 1e-5
     assert out.shape == (B, H, L, V) and out.transpose(1, 2).is_contiguous()
+
+
+_REF_PATH = Path(__file__).resolve().parents[1] / "xllm/modules/fused_ops/cute/adaptive_working_memory_reference.py"
+_ref_spec = importlib.util.spec_from_file_location("cute_awm_reference", _REF_PATH)
+awm_ref = importlib.util.module_from_spec(_ref_spec)
+_ref_spec.loader.exec_module(awm_ref)
+
+
+@pytest.mark.parametrize("B,H,K,S,V,L,C,seg_rate", [
+    (2, 4, 2, 16, 24, 256, 64, 0.0),
+    (2, 4, 2, 16, 24, 384, 64, 0.6),
+    (1, 2, 1, 32, 48, 512, 128, 1.0),
+])
+def test_phased_backward_matches_autograd(B, H, K, S, V, L, C, seg_rate):
+    """The phase-decomposed backward (the plan of the backward kernels) against autograd, in FP64."""
+    torch.manual_seed(0)
+    f64 = dict(device="cuda", dtype=torch.float64)
+    q = torch.softmax(torch.randn(B, H, L, S, **f64), -1).requires_grad_()
+    k_raw = torch.randn(B, K, L, S, **f64) * 2
+    k = k_raw.clone().requires_grad_()
+    qk = torch.softmax(k_raw, -1).requires_grad_()
+    v = torch.randn(B, K, L, V, **f64).requires_grad_()
+    seg = (torch.cumsum((torch.rand(B, L, device="cuda") < seg_rate / C).long(), 1) + 3) if seg_rate > 0 else None
+    out, _, memory, lnt = reference_fwd(q, qk, k, v, C, None, None, None, None, None, seg, None)
+    dout, dmem, dlnt = torch.randn_like(out), torch.randn_like(memory), torch.randn_like(lnt)
+    ((out * dout).sum() + (memory * dmem).sum() + (lnt * dlnt).sum()).backward()
+    with torch.no_grad():
+        out2, memory2, _, saved = awm_ref.awm_fwd_saved(q, qk, k, v, C, None, None, None, None, None, seg, None)
+        grads = awm_ref.awm_bwd_phased(dout, dmem, dlnt, q, qk, k, v, C, saved)
+    assert rel_err(out2, out.detach()) < 1e-12 and rel_err(memory2, memory.detach()) < 1e-12
+    for got, leaf in zip(grads, (q, qk, k, v)):
+        assert rel_err(got, leaf.grad) < 1e-12
