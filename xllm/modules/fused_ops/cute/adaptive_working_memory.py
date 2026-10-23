@@ -12,6 +12,21 @@ with kk = exp(k - lse)^T the softmax of the chunk's keys over time. So the forwa
 
 Phases 1 and 3 read every input once and write the output once; the large reductions over the chunk do not
 depend on the recurrence. This file holds the kernels; see adaptive_working_memory_fwd for the host side.
+
+Kernels (one launch each, in stream order):
+  AwmKeyLsePart      partial log-sum-exp of the keys over time (R row splits per chunk)
+  AwmChunkGemm       [A | B] by tcgen05; transform warps turn the raw key tile into P = exp(k - lse), split-K
+                     partials added with TMA reduce-add
+  AwmAToBf16 +       recurrence on warp MMAs over a bf16 copy of A (V < 1024), or
+  AwmRecurrence /    on tcgen05 tf32 with the state as M^T in shared memory (V >= 1024)
+  AwmRecurrenceUmma
+  AwmOutGemm         persistent warp-specialized tcgen05 GEMM, memory tile resident in shared memory
+Masks (key rows, memory resets, output rows) are derived from segment_idx inside the kernels.
+
+bf16, L = 16384, chunk 4096, with segment_idx, B200 (GPU time per call vs the PyTorch reference):
+  gekko-0.9B (B2 H8 K4 S256 V256)    ~125us  (1376us)
+  gekko-4B   (B1 H32 K8 S128 V128)    ~91us   (729us)
+  gekko-7.1B (B1 H4 K4 S256 V2048)   ~207us  (1259us)
 """
 
 import math
