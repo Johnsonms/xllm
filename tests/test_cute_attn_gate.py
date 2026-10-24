@@ -30,8 +30,10 @@ def test_attn_gate(B, L, H, V, gate):
     rmx = (torch.randn_like(sca) * 8)  # exercises the softplus threshold
     g = torch.randn_like(sca)
     out = ag.attn_gate_fwd(sca, awk, rmx, H, gate, EPS)
-    ds, dr, attn = ag.attn_gate_bwd(g, sca, awk, rmx, H, gate, EPS, want_attn=True)
+    ds, dr, attn, delta = ag.attn_gate_bwd(g, sca, awk, rmx, H, gate, EPS, want_attn=True, want_delta=True)
     assert torch.equal(attn, out)
+    delta_ref = (ds.float().view(B, L, H, V) * sca.float().view(B, L, H, V)).sum(-1).permute(0, 2, 1)
+    assert torch.allclose(delta, delta_ref, atol=1e-2 * delta_ref.abs().max().item(), rtol=1e-3)
     sf, af, rf = [t.float().requires_grad_(True) for t in (sca, awk, rmx)]
     s = (sf + af).view(B, L, H, V)
     n = s * torch.rsqrt((s * s).mean(-1, keepdim=True) + EPS)

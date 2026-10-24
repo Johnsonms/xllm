@@ -838,11 +838,13 @@ class GekkoBlockFunction(torch.autograd.Function):
         if cute_gate:
             # the recompute of the gate, its backward and the memory-efficient rmsnorm backward in one pass
             from xllm.modules.fused_ops.cute.attn_gate import attn_gate_bwd
-            sca_out_grad, rmx_grad, attn = attn_gate_bwd(attn_grad, sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps, want_attn=True)
+            sca_out_grad, rmx_grad, attn, sca_delta = attn_gate_bwd(attn_grad, sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps,
+                                                                   want_attn=True, want_delta=(sca_backend == 'cute' and prev_v is None))
         else:
             attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
             attn_norm_grad = torch.mul(attn_grad, r, out=r)
             sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
+            sca_delta = None
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
         # B x L x H x E -> B x H x L x E
@@ -880,7 +882,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
                 sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
-                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
+                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend, delta=sca_delta
             )
             assert prev_aqk_grad is not None and prev_akk_grad is not None and prev_av_grad is not None
             assert prev_sk_grad is not None and prev_sv_grad is not None
@@ -892,7 +894,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             sq_grad, sk_grad, xv_grad, prev_sk_grad, prev_sv_grad = sliding_chunk_attention_bwd(
                 sca_out_grad, sq, sk, xv_, sca_for_save, sca_aux, attention_chunk_size, sca_scale,
-                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend
+                prev_sk, prev_sv, bos_mask, segment_idx, attn_stability_control, deterministic, sca_backend, delta=sca_delta
             )
 
             if handle_memory is not None:
