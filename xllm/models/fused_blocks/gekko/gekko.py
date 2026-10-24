@@ -319,9 +319,9 @@ class GekkoBlockFunction(torch.autograd.Function):
             # apply softmax to aq
             aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
 
-        # opt-in (XLLM_GEKKO_SAVE_QK_PREP=1): keep the conv / q-k prep outputs for the backward instead of recomputing
-        # the three convs and both q / k preps there (~0.7 GB per layer at gekko-0.9B B2 L16384); cute q / k path,
-        # no conv state or pipeline neighbours
+        # opt-in (XLLM_GEKKO_SAVE_QK_PREP=1): keep the conv / q-k prep outputs (and the gate projection rmx) for the
+        # backward instead of recomputing the three convs, both q / k preps and rmx there (~0.7 GB per layer at
+        # gekko-0.9B B2 L16384); cute q / k path, no conv state or pipeline neighbours
         qk_prep_cache = (None,) * 7
         if (_SAVE_QK_PREP and not send_to_next and not recv_from_prev and conv_state_q is None and conv_state_k is None
                 and conv_state_v is None and _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis)
@@ -514,6 +514,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
             *qk_prep_cache,  # xv_, xk_, xq_, sk, aqk, sq, aq (XLLM_GEKKO_SAVE_QK_PREP), else None
+            rmx if qk_prep_cache[0] is not None else None,  # the gate projection, kept with them
             *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
@@ -607,6 +608,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             h1,  # (bsz*slen, v/MP)
             h3,  # (bsz*slen, v/MP)
             c_xv_, c_xk_, c_xq_, c_sk, c_aqk, c_sq, c_aq,  # forward's conv / q-k prep outputs, or None
+            c_rmx,  # forward's gate projection, or None
             *awm_workspace,
         ) = ctx.saved_tensors
 
@@ -848,7 +850,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # recompute attn out
         # B x L x E
-        rmx = F.linear(mx, wr, br)
+        rmx = c_rmx if c_rmx is not None else F.linear(mx, wr, br)
         cute_gate = _cute_gate(sca_out, local_heads, attn_gate_func, hidden_dropout)
         if not cute_gate:
             r = attn_gate_fn(rmx)
