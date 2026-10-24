@@ -1,5 +1,6 @@
 from typing import Tuple, Optional
 import os
+import weakref
 
 import torch
 from torch import Tensor
@@ -14,12 +15,18 @@ import xllm_extension.ops as _xllm_ops
 _MULTISEG_FWD_OUT = getattr(_xllm_ops, "multiseg_attention_fwd_out", None)  # older builds: copy instead
 _ATTN_BWD_OUT = None if os.environ.get("XLLM_SWIFT_BWD_COPY") == "1" else getattr(_xllm_ops, "attention_bwd_out", None)
 _SWIFT_QSPLIT = int(os.environ.get("XLLM_SWIFT_QSPLIT", "2"))
+# with segment ids the split is chosen per step among these (an explicit XLLM_SWIFT_QSPLIT fixes it)
+_SWIFT_QSPLITS = (_SWIFT_QSPLIT,) if "XLLM_SWIFT_QSPLIT" in os.environ else (2, 4)
+# cost of one more attention call in attention-matrix elements per (batch, head), fitted on gekko-7.1B shapes
+# (S 256, V 2048: ~8.3 us per MiB of bf16 matrix over 4 heads, ~84 us per call)
+_SWIFT_CALL_COST = 1.3e6
 
 
 def _swift_blocks(seq_len: int, chunk_size: int, split: int):
     """(query start, query end, key start) of the swift attention calls: every chunk's queries in `split` sub-chunks
     attending to the keys from the previous chunk's start up to the sub-chunk's end, so most of the causal triangle's
-    masked half is never computed (split 2: 17% less GEMM / softmax work at 2 chunks). split 1 = one call per chunk."""
+    masked half is never computed (split 2: 17% less GEMM / softmax work at 2 chunks). split 1 = one call per chunk.
+    With segment ids, _swift_seg_blocks also moves the key starts past earlier segments."""
     cq = chunk_size // split
     return [(c * chunk_size + s * cq, c * chunk_size + (s + 1) * cq, max(c - 1, 0) * chunk_size)
             for c in range(seq_len // chunk_size) for s in range(split)]
@@ -27,6 +34,40 @@ def _swift_blocks(seq_len: int, chunk_size: int, split: int):
 
 def _swift_w_numel(blocks, bsz: int, n_heads: int) -> int:
     return sum(bsz * n_heads * (qe - qb) * (qe - kb) for qb, qe, kb in blocks)
+
+
+_SWIFT_SEG_SKIP = os.environ.get("XLLM_SWIFT_SEG_SKIP", "1") != "0"
+_swift_seg_cache = []  # [(weakref to segment_idx, version, chunk_size, split, blocks)], newest last
+
+
+def _swift_seg_blocks(segment_idx: Tensor, chunk_size: int):
+    """_swift_blocks with each call's key start moved up to the segment start of its first query (over the batch,
+    rounded down to 64): keys before it are masked for every query of the call. The split among _SWIFT_QSPLITS with
+    the least matrix area + per-call cost is used (deterministic in the segment ids, so the backward finds the same
+    calls). The segment ids are the same for all layers of a step: the host copy (one sync) and the choice are cached
+    on the tensor object for the other layers and the backward."""
+    for ref, ver, cs, blocks in reversed(_swift_seg_cache):
+        if ref() is segment_idx and ver == segment_idx._version and cs == chunk_size:
+            return blocks
+    seg = segment_idx.detach().cpu()
+    bsz, seq_len = seg.shape
+    # first position of every position's segment (segment ids are non-decreasing along the sequence)
+    pos = torch.arange(seq_len).expand(bsz, seq_len)
+    is_start = torch.ones(bsz, seq_len, dtype=torch.bool)
+    is_start[:, 1:] = seg[:, 1:] != seg[:, :-1]
+    start = torch.where(is_start, pos, torch.zeros_like(pos)).cummax(dim=1).values.min(dim=0).values.tolist()
+    best = None
+    for split in _SWIFT_QSPLITS:
+        if chunk_size % (8 * split):
+            continue
+        blocks = [(qb, qe, max(kb, start[qb] // 64 * 64)) for qb, qe, kb in _swift_blocks(seq_len, chunk_size, split)]
+        cost = _swift_w_numel(blocks, 1, 1) + _SWIFT_CALL_COST * len(blocks)
+        if best is None or cost < best[0]:
+            best = (cost, blocks)
+    blocks = best[1]
+    _swift_seg_cache.append((weakref.ref(segment_idx), segment_idx._version, chunk_size, blocks))
+    del _swift_seg_cache[:-4]
+    return blocks
 try:
     from xattn.ops import (
         flash_sca_fwd,
@@ -174,7 +215,8 @@ def _sequential_sliding_chunk_attention_fwd(
     if (save_attention_matrix and segment_idx is not None and _MULTISEG_FWD_OUT is not None and
             _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1 and split > 1 and
             chunk_size % (8 * split) == 0):
-        blocks = _swift_blocks(seq_len, chunk_size, split)
+        blocks = (_swift_seg_blocks(segment_idx, chunk_size) if _SWIFT_SEG_SKIP else
+                  _swift_blocks(seq_len, chunk_size, split))
         attn_w = torch.empty(_swift_w_numel(blocks, bsz, n_heads), dtype=value.dtype, device=value.device)
         w_off = 0
         for qb, qe, kb in blocks:
@@ -237,6 +279,7 @@ def _sequential_sliding_chunk_attention_bwd(
     scale: float,
     prev_key_chunk: Optional[Tensor] = None,
     prev_value_chunk: Optional[Tensor] = None,
+    segment_idx: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     bsz, seq_len, n_heads, v_head_dim = grad.shape
     _, _, n_kv_heads, qk_head_dim = key.shape
@@ -261,9 +304,16 @@ def _sequential_sliding_chunk_attention_bwd(
     if _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1 and w.dim() == 1:
         # gradients written in place; key rows already written by earlier calls are accumulated in the GEMMs (beta = 1).
         # The forward's call layout (sub-chunks or one call per chunk) follows from the attention buffer's size.
-        blocks = _swift_blocks(seq_len, chunk_size, _SWIFT_QSPLIT) if _SWIFT_QSPLIT > 1 else []
-        if _swift_w_numel(blocks, bsz, n_heads) != w.numel():
-            blocks = _swift_blocks(seq_len, chunk_size, 1)
+        candidates = []
+        if _SWIFT_QSPLIT > 1 and _SWIFT_SEG_SKIP and segment_idx is not None:
+            candidates.append(lambda: _swift_seg_blocks(segment_idx, chunk_size))
+        if _SWIFT_QSPLIT > 1:
+            candidates.append(lambda: _swift_blocks(seq_len, chunk_size, _SWIFT_QSPLIT))
+        candidates.append(lambda: _swift_blocks(seq_len, chunk_size, 1))
+        for make in candidates:
+            blocks = make()
+            if _swift_w_numel(blocks, bsz, n_heads) == w.numel():
+                break
         w_off = 0
         for qb, qe, kb in blocks:
             w_shape = (bsz, n_heads, qe - qb, qe - kb)
@@ -415,7 +465,8 @@ def sliding_chunk_attention_bwd(
         return dq, dk, dv, None, None
     elif backend == 'swift':
         return _sequential_sliding_chunk_attention_bwd(
-            y_grad, q, k, v, aux, chunk_size, scale, prev_k, prev_v
+            y_grad, q, k, v, aux, chunk_size, scale, prev_k, prev_v,
+            segment_idx if prev_k is None else None
         )
     else:
         raise ValueError(f"Unknown backend: {backend}.")
