@@ -330,6 +330,19 @@ both operands in shared memory run at ~55% of the tensor-core rate (operand band
   for the per-line exec counts / stalls from `ncu --set full --import-source yes --page source --print-source
   cuda,sass --csv` with `CUTE_DSL_LINEINFO=1` (it shows `@P` predication), `sca/layout_check{2,3}.py`.
 
+### Forward with the q tile in tensor memory (2026-10-24, commit 8a8e57a)
+
+`ScaFwdT` applies the same move to the forward: q in TMEM as the A operand of S = Q K^T, P over the S columns,
+raw mbarriers (an S/P stage is freed by the completion of its PV MMA). gekko-4B needs 256 TMEM columns with
+32-key blocks, so two CTAs share an SM; this only works when the TMEM allocation permit is relinquished right
+after the allocation (`tmem.relinquish_alloc_permit()` before the main loop), otherwise the second CTA waits
+for the first to exit and the kernel is slower than before (878 us). S = 256 shapes use 64-key blocks (the
+N = 32 variant costs 2x the MMA instructions: 674 vs 540 us on 0.9B). Per call: 4B 668 -> 550 us
+(segmented 402 -> 340 / 583 -> 473), 0.9B 558 -> 540, 7.1B unchanged (2.07 ms: the 8 v-slab CTAs each
+recompute S, which is as many flops as their PV; a materialized bf16 P^T + cuBLAS PV would be ~1.8 ms).
+Floors (4B): MMA-only 358 us, no-math 393 us; the full kernel is exp2 bound (1.07 G exp2 per layer = 238 us
+of MUFU). Step times move by <= 1% (the forward is ~5% of the step). `SCA_FWD_TMEM=0` selects the old kernel.
+
 ### Open items
 
 - The S = 128 shape (4B) is MUFU bound (exp2); FA4-style exp2 emulation on the FMA units for part of the
