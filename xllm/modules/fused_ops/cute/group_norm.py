@@ -17,24 +17,25 @@ TORCH2CUTE = {torch.bfloat16: BFloat16, torch.float16: Float16}
 
 
 class GroupNormFwd:
-    def __init__(self, dtype, CPG: int, G: int, layer: bool, affine: bool, warps: int = 8):
+    def __init__(self, dtype, CPG: int, G: int, layer: bool, affine: bool, has_add: bool = False, warps: int = 8):
         assert CPG % 128 == 0 and CPG <= 2048 and (affine or not layer)
         self.dtype, self.CPG, self.G, self.layer, self.affine, self.warps = dtype, CPG, G, layer, affine, warps
+        self.has_add = has_add  # normalize x + x2 (the sum is not written)
         self.E = CPG // 32  # elements per lane
         self.VW = min(8, self.E)  # vector width
         self.NV = self.E // self.VW  # vectors per lane
 
     @cute.jit
-    def __call__(self, tX: cute.Tensor, tW: cute.Tensor, tB: cute.Tensor, tY: cute.Tensor, tMean: cute.Tensor,
-                 tRstd: cute.Tensor, rows: Int32, eps: Float32, stream: cuda.CUstream):
+    def __call__(self, tX: cute.Tensor, tX2: cute.Tensor, tW: cute.Tensor, tB: cute.Tensor, tY: cute.Tensor,
+                 tMean: cute.Tensor, tRstd: cute.Tensor, rows: Int32, eps: Float32, stream: cuda.CUstream):
         n = rows * self.G
         grid = (n + self.warps - 1) // self.warps
-        self.kernel(tX.iterator, tW.iterator, tB.iterator, tY.iterator, tMean.iterator, tRstd.iterator, n, eps).launch(
-            grid=[grid, 1, 1], block=[32 * self.warps, 1, 1], stream=stream)
+        self.kernel(tX.iterator, tX2.iterator, tW.iterator, tB.iterator, tY.iterator, tMean.iterator, tRstd.iterator,
+                    n, eps).launch(grid=[grid, 1, 1], block=[32 * self.warps, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, pX: cute.Pointer, pW: cute.Pointer, pB: cute.Pointer, pY: cute.Pointer, pMean: cute.Pointer,
-               pRstd: cute.Pointer, n: Int32, eps: Float32):
+    def kernel(self, pX: cute.Pointer, pX2: cute.Pointer, pW: cute.Pointer, pB: cute.Pointer, pY: cute.Pointer,
+               pMean: cute.Pointer, pRstd: cute.Pointer, n: Int32, eps: Float32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
@@ -45,8 +46,10 @@ class GroupNormFwd:
             al = 2 * self.VW
             x = cute.make_rmem_tensor(cute.make_layout(self.E), Float32)
             for j in cutlass.range_constexpr(self.NV):
-                v = cute.make_tensor((pX + (base + j * 32 * self.VW + lane * self.VW)).align(al),
-                                     cute.make_layout(self.VW)).load().to(Float32)
+                off = base + j * 32 * self.VW + lane * self.VW
+                v = cute.make_tensor((pX + off).align(al), cute.make_layout(self.VW)).load().to(Float32)
+                if cutlass.const_expr(self.has_add):
+                    v = v + cute.make_tensor((pX2 + off).align(al), cute.make_layout(self.VW)).load().to(Float32)
                 for e in cutlass.range_constexpr(self.VW):
                     x[j * self.VW + e] = v[e]
             mean = Float32(0.0)
@@ -97,8 +100,9 @@ def supported(x: torch.Tensor, num_groups: int) -> bool:
             and (D // num_groups) % 128 == 0 and D // num_groups <= 2048 and x.data_ptr() % 16 == 0)
 
 
-def group_norm_fwd(x: torch.Tensor, num_groups: int, eps: float, weight=None, bias=None, layer: bool = False):
-    """Returns (y, rstd) for rms, (y, mean, rstd) for layer norm; mean / rstd [rows, G] fp32."""
+def group_norm_fwd(x: torch.Tensor, num_groups: int, eps: float, weight=None, bias=None, layer: bool = False, x2=None):
+    """Returns (y, rstd) for rms, (y, mean, rstd) for layer norm; mean / rstd [rows, G] fp32. With x2 (same shape),
+    normalizes x + x2 (fp32 sum, not written out)."""
     D = x.shape[-1]
     G = num_groups
     CPG = D // G
@@ -108,17 +112,20 @@ def group_norm_fwd(x: torch.Tensor, num_groups: int, eps: float, weight=None, bi
     stat_shape = (rows, G)  # as the xllm_extension ops return them
     rstd = torch.empty(stat_shape, dtype=torch.float32, device=x.device)
     mean = torch.empty(stat_shape, dtype=torch.float32, device=x.device) if layer else rstd
-    key = (x.dtype, CPG, G, layer, affine)
+    has_add = x2 is not None
+    key = (x.dtype, CPG, G, layer, affine, has_add)
     if key not in _COMPILED:
         dt = TORCH2CUTE[x.dtype]
         al = 2 * min(8, CPG // 32)
         _COMPILED[key] = cute.compile(
-            GroupNormFwd(dt, CPG, G, layer, affine), _fake(dt, al), _fake(dt, al), _fake(dt, al), _fake(dt, al),
-            _fake(Float32, 4), _fake(Float32, 4), Int32(0), Float32(0.0),
+            GroupNormFwd(dt, CPG, G, layer, affine, has_add), _fake(dt, al), _fake(dt, al), _fake(dt, al), _fake(dt, al),
+            _fake(dt, al), _fake(Float32, 4), _fake(Float32, 4), Int32(0), Float32(0.0),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
     w = weight.contiguous() if affine else x
     b = bias.contiguous() if (layer and bias is not None) else x
-    _COMPILED[key](x.reshape(-1), w.reshape(-1), b.reshape(-1), y.reshape(-1), mean.reshape(-1), rstd.reshape(-1), rows, eps)
+    x2v = x2.contiguous() if has_add else x
+    _COMPILED[key](x.reshape(-1), x2v.reshape(-1), w.reshape(-1), b.reshape(-1), y.reshape(-1), mean.reshape(-1),
+                   rstd.reshape(-1), rows, eps)
     return (y, mean, rstd) if layer else (y, rstd)
 
 

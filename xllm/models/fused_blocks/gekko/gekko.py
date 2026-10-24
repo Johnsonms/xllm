@@ -22,6 +22,7 @@ from xllm.modules.fused_ops import (
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     rmsnorm_fwd,
+    rmsnorm_add_fwd,
     rmsnorm_bwd,
     mem_effn_rmsnorm_bwd,
     timenorm_fwd,
@@ -401,7 +402,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
-        attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
+        attn, _ = rmsnorm_add_fwd(sca_out, awk_out, None, local_heads, rmsnorm_eps)
         attn = fused_gate_mul(r, attn, attn_gate_func) if fused_gate else torch.mul(attn, r, out=attn)
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
@@ -807,7 +808,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         rmx = F.linear(mx, wr, br)
         fused_gate = gate_fusable(rmx)
-        attn_norm, attn_rstd = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
+        attn_norm, attn_rstd = rmsnorm_add_fwd(sca_out, awk_out, None, local_heads, rmsnorm_eps)
         if fused_gate:
             attn = fused_gate_mul(rmx, attn_norm, attn_gate_func)
         else:

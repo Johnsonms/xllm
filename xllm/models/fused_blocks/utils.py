@@ -330,6 +330,20 @@ def rmsnorm_fwd(
         return xllm_ops.group_rms_norm_fwd(x, xdim, num_groups, eps)
 
 
+def rmsnorm_add_fwd(
+    x: Tensor,
+    x2: Tensor,
+    weight: Optional[Tensor],
+    num_groups: int,
+    eps: float,
+) -> Tuple[Tensor, Tensor]:
+    """rmsnorm_fwd(x + x2, ...) without writing the sum (fused into the CuTe norm kernel when supported)."""
+    if _fused_norm_ok(x, num_groups) and x2.shape == x.shape and x2.dtype == x.dtype and x2.is_contiguous():
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
+        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None, x2=x2)
+    return rmsnorm_fwd(x + x2, weight, num_groups, eps)
+
+
 def rmsnorm_bwd(
     y_grad: Tensor,
     x: Tensor,
