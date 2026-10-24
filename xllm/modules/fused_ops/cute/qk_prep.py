@@ -28,6 +28,7 @@ except ImportError:  # loaded from its file (tests)
     _compiled, _fake = _awm._compiled, _awm._fake
 
 WARPS = 8
+LOG2E = 1.4426950408889634
 
 
 @cute.jit
@@ -102,8 +103,8 @@ class QkPrepFwd:
                     ov = cute.make_rmem_tensor(cute.make_layout(E), Float32)
                     for i in cutlass.range_constexpr(E // 2):
                         x0, x1, c, s = yv[2 * i], yv[2 * i + 1], fv[2 * i], fv[2 * i + 1]
-                        ov[2 * i] = x0 * c - x1 * s
-                        ov[2 * i + 1] = x0 * s + x1 * c
+                        p0, p1 = cute.arch.mul_packed_f32x2((x1, x1), (-s, c))
+                        ov[2 * i], ov[2 * i + 1] = cute.arch.fma_packed_f32x2((x0, x0), (c, s), (p0, p1))
                     cute.make_tensor((pY + off).align(2 * E), cute.make_layout(E)).store(ov.load().to(BFloat16))
                 else:
                     cute.make_tensor((pY + off).align(2 * E), cute.make_layout(E)).store(yb)
@@ -117,13 +118,16 @@ class QkPrepFwd:
                 m = _warp_max(m)
                 ev = cute.make_rmem_tensor(cute.make_layout(E), Float32)
                 t = Float32(0.0)
-                for k in cutlass.range_constexpr(E):
-                    ev[k] = cute.math.exp(xv[k] - m, fastmath=True)
-                    t = t + ev[k]
+                neg = -m * LOG2E
+                for k2 in cutlass.range_constexpr(E // 2):
+                    a0, a1 = cute.arch.fma_packed_f32x2((xv[2 * k2], xv[2 * k2 + 1]), (LOG2E, LOG2E), (neg, neg))
+                    ev[2 * k2] = cute.math.exp2(a0, fastmath=True)
+                    ev[2 * k2 + 1] = cute.math.exp2(a1, fastmath=True)
+                    t = t + ev[2 * k2] + ev[2 * k2 + 1]
                 t = _warp_sum(t)
-                inv = 1.0 / t
-                for k in cutlass.range_constexpr(E):
-                    ev[k] = ev[k] * inv
+                inv = cute.arch.rcp_approx(t)
+                for k2 in cutlass.range_constexpr(E // 2):
+                    ev[2 * k2], ev[2 * k2 + 1] = cute.arch.mul_packed_f32x2((ev[2 * k2], ev[2 * k2 + 1]), (inv, inv))
                 cute.make_tensor((pSm + off).align(2 * E), cute.make_layout(E)).store(ev.load().to(BFloat16))
 
 
@@ -176,8 +180,8 @@ class QkPrepBwd:
                     fv.store(cute.make_tensor((pF + (Int64(l) * R + lane * E)).align(4 * E), cute.make_layout(E)).load())
                     for i in cutlass.range_constexpr(E // 2):
                         x0, x1, c, s = gy[2 * i], gy[2 * i + 1], fv[2 * i], fv[2 * i + 1]
-                        gy[2 * i] = x0 * c + x1 * s
-                        gy[2 * i + 1] = x1 * c - x0 * s
+                        p0, p1 = cute.arch.mul_packed_f32x2((x1, x0), (s, -s))
+                        gy[2 * i], gy[2 * i + 1] = cute.arch.fma_packed_f32x2((x0, x1), (c, c), (p0, p1))
             # rmsnorm backward: xhat = x rstd, y = xhat w; dxhat = gy w; dx = rstd (dxhat - xhat mean(dxhat xhat))
             ss = Float32(0.0)
             for k in cutlass.range_constexpr(E):
@@ -203,11 +207,14 @@ class QkPrepBwd:
                     m = cute.arch.fmax(m, xv[k])
                 m = _warp_max(m)
                 t = Float32(0.0)
-                for k in cutlass.range_constexpr(E):
-                    xv[k] = cute.math.exp(xv[k] - m, fastmath=True)
-                    t = t + xv[k]
+                neg = -m * LOG2E
+                for k2 in cutlass.range_constexpr(E // 2):
+                    a0, a1 = cute.arch.fma_packed_f32x2((xv[2 * k2], xv[2 * k2 + 1]), (LOG2E, LOG2E), (neg, neg))
+                    xv[2 * k2] = cute.math.exp2(a0, fastmath=True)
+                    xv[2 * k2 + 1] = cute.math.exp2(a1, fastmath=True)
+                    t = t + xv[2 * k2] + xv[2 * k2 + 1]
                 t = _warp_sum(t)
-                inv = 1.0 / t
+                inv = cute.arch.rcp_approx(t)
                 sdot = Float32(0.0)
                 for k in cutlass.range_constexpr(E):
                     xv[k] = xv[k] * inv
