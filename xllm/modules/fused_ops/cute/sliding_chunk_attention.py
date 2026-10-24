@@ -3120,7 +3120,10 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         # dP for the dK / dQ kernels (fp32 GEMMs): dPcur[(c, b, h)] = V_c dO_c^T, dPprev[(c - 1, b, h)] = V_{c-1} dO_c^T
         vc = _chunk_major(v, H, K, V, C, B, L, nc, dev)  # heads repeated
         doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
-        dp_cur = torch.bmm(vc.view(-1, C, V), doc.view(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
+        # dPcur is only read where the query attends the key (query >= key): the sub-blocks below the diagonal are
+        # zeroed instead of computed (the kernels multiply them by P^T = 0)
+        dp_cur = torch.empty(nc, B, H, C, C, dtype=torch.float32, device=dev)
+        _bmm_triu_nt(vc, doc, dp_cur, C, _tril_sub(C))
         if nc > 1:
             dp_prev = torch.bmm(vc[:-1].reshape(-1, C, V), doc[1:].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
         else:
@@ -3186,6 +3189,18 @@ def _bmm_tril_nt(x, y, out, C, n):
         a = x[:, :, :, i * c:(i + 1) * c].reshape(-1, c, x.shape[-1])
         b = y[:, :, :, :(i + 1) * c].reshape(-1, (i + 1) * c, y.shape[-1]).transpose(1, 2)
         torch.bmm(a, b, out_dtype=torch.float32, out=out[:, :, :, i * c:(i + 1) * c, :(i + 1) * c].reshape(-1, c, (i + 1) * c))
+
+
+def _bmm_triu_nt(x, y, out, C, n):
+    """out[(c, b, h)][i-th row block, i c:] = x[i-th row block] y[i c:]^T (fp32 out [nc, B, H, C, C]), the sub-blocks
+    below the diagonal set to zero."""
+    c = C // n
+    for i in range(n):
+        a = x[:, :, :, i * c:(i + 1) * c].reshape(-1, c, x.shape[-1])
+        b = y[:, :, :, i * c:].reshape(-1, C - i * c, y.shape[-1]).transpose(1, 2)
+        torch.bmm(a, b, out_dtype=torch.float32, out=out[:, :, :, i * c:(i + 1) * c, i * c:].reshape(-1, c, C - i * c))
+        if i > 0:
+            out[:, :, :, i * c:(i + 1) * c, :i * c].zero_()
 
 
 def _use_pmat_dv(qmax, B, L, C):
@@ -4201,7 +4216,7 @@ def sca_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, chunk_size: int, 
     dev = q.device
     y = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
     lse2 = torch.empty(B, H, L, dtype=torch.float32, device=dev)
-    if os.environ.get("SCA_FWD_TMEM", "1") == "1":
+    if os.environ.get("SCA_FWD_TMEM", "1") == "1" and S in (64, 128, 256):  # the q tile -> TMEM store needs a power of two
         # 32-key blocks when the TMEM budget then allows two CTAs per SM, else 64-key blocks (fewer MMA instructions)
         KB = 32 if S // 2 + 64 + min(V, 256) <= 256 else 64
         KB = int(os.environ.get("SCA_FWD_KB", KB))
