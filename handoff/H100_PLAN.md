@@ -1,0 +1,180 @@
+# Porting the B200 optimizations to H100: plan for a Claude Code session on a Hopper node
+
+This is the list of everything that was done for Gekko training on B200 (branches `cute-timestep-decay-norm`,
+`cute-adaptive-working-memory`, hand-off `cute-kernels-handoff` of github.com/Johnsonms/xllm; details in
+`HANDOFF.md` sections 4 to 6c), with what each item bought, which parts carry over to H100 unchanged, and what
+has to be redone for sm_90a. Work through it in order: **baseline first, then one item at a time, each with
+its own measurement, parity check and commit.** Push finished commits to `origin` on a new branch
+(suggested name `hopper-kernels`, based on `cute-adaptive-working-memory`). Commit convention:
+`git -c user.name="Johnson" -c user.email="johnson@together.ai" commit ...` with
+`Co-Authored-By: Claude <noreply@anthropic.com>` as the last line. Keep a `handoff/HANDOFF_H100.md` the same
+way `HANDOFF.md` was kept here.
+
+## 0. What H100 changes, in one paragraph
+
+B200 (sm_100a) has 5th-gen tensor cores driven by `tcgen05` with accumulators in **tensor memory (TMEM)**, ~2.25
+PFLOPS dense bf16, 8 TB/s HBM3e, 148 SMs x 228 KB smem, and 180 GB per GPU. H100 SXM (sm_90a) has `wgmma`
+(accumulators in **registers**, operands from smem / registers), ~1 PFLOPS dense bf16, 3.35 TB/s HBM3, 132 SMs
+x 228 KB smem, 80 GB. Everything that was TMEM / tcgen05 specific (the AWM GEMM kernels, the SCA kernels, the
+"A operand in TMEM" trick of §6b) must be re-expressed FA3-style: TMA producer warp + 2 consumer warpgroups,
+`wgmma` with register accumulators, P kept in registers (or smem) between the two GEMMs, `setmaxnreg` to give
+the consumer warpgroups ~240 registers. Everything that was memory-bound or host-side carries over.
+Reference code on Hopper: FlashAttention-3 (`flash_attn/hopper`, CUTLASS C++) and the CuTe DSL Hopper examples
+(`cutlass/examples/python/CuTeDSL/cute/hopper/`: dense GEMM with TMA + wgmma warp specialization). The CuTe
+Python DSL (nvidia-cutlass-dsl) supports sm_90a; check the installed version's Hopper coverage first
+(`cute.nvgpu.warpgroup`, `cpasync`, `pipeline.PipelineTmaAsync`).
+
+## 1. Environment and baseline (do this first, do not skip)
+
+1. Node check: `nvidia-smi` (H100 SXM vs PCIe, HBM size), NVLink topology (`nvidia-smi topo -m`), CUDA /
+   driver, whether `ncu` is available (on B200 it was not installed system-wide: `apt-get download
+   nsight-compute-* && dpkg -x` into scratch worked without sudo). Build the `xllm_extension` (`setup.py
+   build_ext`) against the node's CUDA; HANDOFF.md §2 has the pip-toolchain pitfalls.
+2. venv: torch (cu12x for Hopper), `nvidia-cutlass-dsl`, `apache-tvm-ffi`, the harness deps
+   (`handoff/venv-freeze.txt` lists what the B200 venv had). Check whether **xattn** (`xattn.ops`, the flash
+   SCA used on H200) installs on this node: it is the production SCA backend on Hopper (`sca_backend='xattn'`)
+   and did not support SM100, which is why the CuTe SCA was written at all.
+3. Copy `handoff/scripts/profile/` and run the same harness as on B200 (all numbers below come from it):
+   - `run1.sh <gpus> <nproc> <port> <trace> <preset> <B> <L> [steps]` -> `fsdp_trace.py` (torchrun, FSDP2,
+     clip + optimizer, chrome trace of one step with the `FWDBWD` window; env `CFG_<field>=value` overrides
+     any ModelConf field, `AWM_BACKEND`, `TN_BACKEND`, `SAME_SEED`, `SEED_OFFSET`, `PROF_STEP`, `WITH_STACK`,
+     `FSDP_FP32_RS`, `FSDP_RESHARD`).
+   - `gaps.py <trace>` (compute-stream idle time, NCCL overlap), `gapattr.py` / `cpuself.py` (GPU-idle time and
+     CPU self time by python frame, needs `WITH_STACK=1`), `kcmp.py <a> <b>` (kernel diff of two steps),
+     `prof_step.py` (kernel time by category), `prof_stack2.py` + `attrib.py` (kernel time by xllm call site).
+   - Presets: gekko-0.9B (B2 L16384), gekko-4B (B1 L8192), gekko-7.1B (B1 L16384). On 80 GB the 7.1B / 0.9B
+     shapes may not fit with the swift SCA (it materializes the attention matrix: ~105 GB at 0.9B B2 L16384);
+     record OOMs as results and use the largest shape that fits for the baseline of each backend.
+4. Baseline table to produce before touching any kernel (1 GPU and 8 GPUs, fwd+bwd ms, peak memory):
+   - `timenorm_backend` cub (default) ; `awm_backend` torch (default) ; `sca_backend` xattn and swift.
+   - Per-op microbenchmarks with the scripts in `handoff/scripts/{tsdn,awm,sca}` (they measure GPU time per
+     call at the real shapes; the cute variants will not run on sm_90 yet, use them for the torch / cub sides).
+   - The step profile breakdown (prof_step.py + attribution) so that the H100 priority order is based on H100
+     numbers, not on the B200 ones below. Expect the balance to differ: H100 has 2.2x less tensor throughput
+     and 2.4x less HBM bandwidth than B200, so GEMM-bound parts grow relative to host-bound ones.
+5. Straggler check (§6c finding, arch independent): run 8 GPUs with `SAME_SEED=1` and without; the difference is
+   data-dependent compute (SCA cost depends on the segment structure of each rank's batch), not communication.
+
+## 2. Items that carry over unchanged (verify, measure, no port needed)
+
+These are already on `cute-adaptive-working-memory`; they are not Blackwell specific. Keep them in the H100
+baseline and just confirm their effect.
+
+| Item | Where | B200 effect | What to check on H100 |
+|---|---|---|---|
+| `create_on_gpu()` restored the default device with `set_default_device("cpu")`, leaving a `DeviceContext` TorchFunctionMode active for the whole run (python hook on every torch op) | `xllm/utils.py`, commit 671884b | 4B 1-GPU 554 -> 444 ms, 0.9B 590 -> 530; 8 GPUs 4B 614 -> 504 | Measure with/without (`git stash` the 5-line change): H100 is slower per kernel, so the launch-bound share shrinks, but the mode cost is pure CPU and stays |
+| `ModelConf.fsdp_layers_per_group` (several GekkoBlocks per `fully_shard` group, layer 0 alone) | `xllm/config.py`, `xllm/models/gekko.py`, commit 1f9d3c0 | 4B 8 GPUs 504 -> 485 (same batches 449 -> 430); 0.9B / 7.1B no gain | Only helps launch-bound models; on H100 with 900 GB/s NVLink the exposed first all-gather / last reduce-scatter are larger, so also re-test `reshard_after_forward=False` and `fp32_reduce_scatter=False` (no effect on B200) |
+| SCA `segment_starts` / `query_limits` cached per segment_idx tensor | `cute/sliding_chunk_attention.py` | ~0.3 ms host per call saved | Only used by the cute SCA path |
+| TF32 for the fp32 cross-entropy gradient GEMM | `train.py` already sets `allow_tf32` | 64 -> ~5 ms per step (harness only) | nothing |
+| Profiling methodology (chrome-trace call-site attribution via `correlation` of cuda_runtime and cuda_driver events; `FWDBWD` window needs `torch.cuda.synchronize()` inside the `record_function`) | `handoff/scripts/profile/` | - | same scripts |
+
+## 3. Items to port, in the order they paid off on B200
+
+Each entry: what was built, what it bought, the H100-specific plan, how to validate. Re-order by the H100
+baseline profile if it disagrees.
+
+### 3.1 Sliding chunk attention (SCA): the biggest item on B200 (58% of the 0.9B step)
+
+- **B200:** `xllm/modules/fused_ops/cute/sliding_chunk_attention.py`, `sca_backend='cute'`. Flash-style
+  forward (q tile resident, 64-key K/V TMA ring, online softmax in 4 warps, P in TMEM as the A operand of PV,
+  lse2 saved); backward = fused dK+dV kernel + dQ kernel (S + V <= 256) or three kernels (larger heads), delta
+  via a row-dot kernel, V > 256 handled with 256-wide v slabs and cuBLAS fp32 dP GEMMs. Segment mask = per-row
+  key range [kmin(row), row]; blocks fully outside are skipped. Numbers: 0.9B per layer fwd 0.83 / bwd 3.0 ms
+  (swift ~12 / ~11), step 1151 -> 590 ms, peak memory 139 -> 40 GB; 4B bwd worst case 3.6 -> 1.8 ms/layer.
+- **H100 plan:** first measure `sca_backend='xattn'` (forward and backward per layer, with `multi_segments=True`
+  and the real segment structure) against the FA3 roofline: for 4B (hdim 128) FA3 does ~600-700 TFLOPS forward
+  and ~450-550 backward on H100; for S = 256 heads (0.9B, 7.1B's qk dim) check whether xattn supports hdim 256
+  at all and its speed. Only if xattn is missing, slow for these shapes, or wrong with segments, write an
+  FA3-style CuTe DSL kernel: TMA producer warp, 2 consumer warpgroups (128 x 128 tiles for hdim 128), wgmma
+  with S and O accumulators in registers, P converted to bf16 in registers as the A operand of PV, softmax
+  ping-pong between the warpgroups, `setmaxnreg`. The backward on Hopper is the FA3 structure (per K/V tile:
+  S^T, dP^T, dS in registers, dK/dV accumulators in registers, dQ via atomic adds to an fp32 buffer or a
+  separate dQ kernel as done here). The design decisions that carry over: 128-row key tiles looping over the
+  attending query blocks bounded by `query_limits`; the fused dK+dV pass (one S^T GEMM and one exp2 pass less
+  than separate kernels); the dS scale applied in the epilogue; the masked / unmasked block bodies as separate
+  code paths (ptxas if-converts an `if` around 160 selects, it then runs in every block - 10%); column data
+  (lse, delta, kmin of a query block) prefetched one block ahead and staged through per-warp smem slots.
+- **Validate:** `tests/test_cute_sliding_chunk_attention.py` (dense fp32 reference incl. segments; adapt the
+  backend name), `handoff/scripts/sca/test_bwd.py <B,H,K,S,V,L,C,seg_p>`, then `profile/parity_sca.py` (swift
+  vs new backend: losses, grad norms, step time, peak memory) on the full model.
+
+### 3.2 TimestepDecayNorm (TSDN): CUB -> single-pass decoupled look-back scan
+
+- **B200:** `xllm/modules/fused_ops/cute/timestep_decay_norm.py`, `timenorm_backend='cute'`. fwd 102 us / bwd
+  156 us vs CUB 1488 / 3104 (B8 L8192 H2048 G32), 82-85% of HBM SOL; step 0.9B -8%, 7.1B -8.5%. Memory-bound.
+- **H100 plan:** this kernel uses TMA, mbarriers, named barriers and the look-back protocol but no tensor
+  cores and no TMEM, so it should port with small changes: (a) compile target sm_90a; (b) replace the
+  Blackwell-only packed `fma_packed_f32x2` / `cute.arch.*_packed_f32x2` math with scalar ops (PTX `f32x2` ops
+  are sm_100+); (c) re-tune T (tile length), the number of resolve warps and CTAs/SM for 132 SMs and 3.35 TB/s
+  (the B200 study in HANDOFF.md §8 says what was tried); (d) the look-back latency matters more when there
+  are few chains (B=1 L=65536). Target: >= 80% of the H100 HBM roofline (the CUB path moves ~10x the bytes).
+- **Validate:** `tests/normalization/test_cute_timestep_decay_norm.py`, `profile/parity.py` (cub vs cute
+  losses / grad norms).
+
+### 3.3 AdaptiveWorkingMemory (AWM): torch reference -> phase-decomposed kernels
+
+- **B200:** `cute/adaptive_working_memory.py` (+ `_bwd.py`, `_reference.py` = the phase decomposition as an
+  executable spec), `awm_backend='cute'`. Identity kk (v - qk M) = kk v - (kk qk) M lets the A|B chunk GEMMs
+  run in parallel over chunks, leaving a cheap S x V recurrence. fwd per call 0.9B 1376 -> 125 us, 4B 729 ->
+  91, 7.1B 1259 -> 207; bwd 0.9B 99 -> 6 ms per step. ~10% of the step before, ~1-2% after.
+- **H100 plan:** the algorithm (phases, workspaces saved for the backward, masks derived from segment_idx in
+  kernel) carries over; the GEMM kernels (`AwmChunkGemm`, `AwmOutGemm`, `AwmDmoGemm`, `AwmChunkBwd`,
+  `AwmRecurrenceUmma`) are tcgen05 and need wgmma versions: TMA + warp-specialized wgmma GEMM (the CuTe DSL
+  Hopper GEMM example is the template), with the transform warps' work (P^T from k via lse, bf16 conversion,
+  masks) done by the consumer warpgroups in registers. The recurrence (`AwmRecurrence`, warp-level bf16 mma
+  with a cp.async ring) is Hopper-compatible as written except for packed f32x2 math. Keep the 7.1B
+  (V = 2048) path on tf32 wgmma as it was on tcgen05. Before writing kernels, measure the torch backend on
+  H100: on B200 AWM was ~10% of the step; if it is < 5% on H100 do it last.
+- **Validate:** `tests/test_cute_adaptive_working_memory.py` (FP64 autograd reference, 19 tests), the harness
+  with `AWM_BACKEND=cute` vs `torch` (losses equal).
+
+### 3.4 SCA backward worst case (the §6b rewrite): what transfers
+
+- **B200:** TMEM-resident A operands (K, V / Q, dO), 32-query blocks, two compute groups alternating blocks,
+  raw mbarriers; 4B dK+dV 2546 -> 1071 us, dQ 1042 -> 710 us. The root causes (one CTA per SM, GEMMs with both
+  operands in smem at ~55% of peak) are Blackwell-specific.
+- **H100 plan:** nothing to port literally; on Hopper the equivalent is FA3's backward (register accumulators,
+  2 consumer warpgroups, 128 x 128 tiles with hdim 128). The transferable lessons are the pipeline shape
+  (dV_j, dK_{j-1}, dP_{j+1}, S_{j+2} issue order so the compute of block j has a full block of tensor work to
+  hide behind), the measurement method (`SCA_DBG=1` no-math and `SCA_DBG=3` MMA-only variants of the kernel
+  bound the compute side and the tensor side separately: do the same on H100 before optimizing anything), and
+  the ptxas predication pitfall.
+
+### 3.5 Host overhead of the forward (launch-bound models)
+
+- **B200:** after the `create_on_gpu` fix the 4B forward was still launch-bound (1 GPU ~50 ms GPU idle per
+  step): triton causal conv (108 launcher calls, ~17 ms), `F.linear` ~55 us per call, FSDP2 per-parameter python
+  (~16 parameters per layer), the TSDN / AWM / SCA wrappers (0.2-0.3 ms per call). Not fixed.
+- **H100 plan:** check first whether any H100 shape is launch-bound (`gaps.py`: compute-stream gaps in the first
+  half of the step). H100 kernels run ~2x longer, so probably only gekko-4B at short L. If so: the conv
+  launcher (3 triton launches per call: fuse the three conv calls per layer or cache the launcher), the
+  kernel wrappers' `reshape` / dtype casts, and `fsdp_layers_per_group`.
+
+### 3.6 gekko-7.1B specifics (V = 2048)
+
+- **B200:** the SCA dV kernel recomputes S^T per 256-wide v slab (8x), 2.8 ms/layer; dP via cuBLAS fp32 GEMM
+  1.2 ms; dense GEMMs are ~55% of the step at ~1.3 PFLOPS achieved (cuBLAS standalone 1.6).
+- **H100 plan:** same structure applies if a CuTe SCA is written; a materialized bf16 P^T + cuBLAS dV would
+  save ~1.5 ms/layer on B200 and the same idea holds on H100. Check cuBLAS GEMM efficiency on H100 for the
+  7.1B shapes (dim 4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak; nothing kernel-side to do if
+  >= 75%.
+
+## 4. How to work (what worked on B200)
+
+- One item per commit, each with: microbenchmark before/after at the real shapes (per-call GPU time via
+  torch.profiler, like `prof_bwd.py`), the test file, the harness step time and loss / grad-norm parity, and
+  the numbers in the commit message. Push after each.
+- ncu is the tool for kernels: `--set full --import-source yes --page source --print-source cuda,sass --csv`
+  with `CUTE_DSL_LINEINFO=1`, aggregated by `common/src_an.py` (per-line instruction counts, stall reasons,
+  and whether code runs predicated). Check `sm__pipe_tensor_cycles_active` (tensor pipe busy) and
+  `sm__inst_executed_pipe_xu` (MUFU: exp2 bound shapes) first.
+- Build measurement variants into the kernel behind an env var (`SCA_DBG` style): no-math, MMA-only,
+  no-TMA. They turn "it is slow" into "the tensor side alone takes X, the compute side adds Y".
+- CuTe DSL pitfalls that are not Blackwell-specific (HANDOFF.md §8, `handoff/memory/*.md`): no closures
+  called inside staged for/if (pass arguments to a `@cute.jit` helper instead); `cutlass.range_constexpr`
+  only inside jit/kernel functions; `tm.set(ACCUMULATE, dynamic)` leaks staged state out of helpers; TMA
+  `cute.copy` must be issued by a full warp; a producer stage that nobody consumes hangs; "empty" barriers
+  with no first producer start at parity 1; TVM-FFI fake tensors are int32-sized (2-D fakes for > 2^31
+  elements); results of look-back scans and `red.add` reductions are not bitwise deterministic.
+- Memory in this directory (`handoff/memory/`) is the B200 session's auto-memory; copy what is still true
+  into the H100 session's memory directory and correct the arch-specific parts.

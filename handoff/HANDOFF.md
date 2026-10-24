@@ -14,6 +14,8 @@ Both are written in the CuTe Python DSL (nvidia-cutlass-dsl 4.8.1) and target B2
 
 The original request came from Max: replace the CUB/torch implementations with FA-level-performance CuTe kernels. Use ncu to find bottlenecks. Push finished commits to `origin` (github.com/Johnsonms/xllm).
 
+`H100_PLAN.md` next to this file lists every optimization with its effect and how to redo it on H100 (Hopper).
+
 ## 1. Branches (all pushed to origin)
 
 | Branch | Content |
