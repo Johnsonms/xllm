@@ -296,6 +296,38 @@ are no longer hidden on those two (nccl 481 ms on 7.1B; busy(non-nccl) 991 of a 
 longer than on 1 GPU). That is the next thing to look at for multi-GPU training (reshard_after_forward=False,
 prefetching, or bucketing).
 
+### Backward rewrite for S + V <= 256 (2026-10-24, after §6c; commit 459db31)
+
+Asked for: the worst case of the backward (batches without segment boundaries, the straggler of §6c). On the
+4B shape (H32 K8 S128 V128, B1 L8192) it took 3.6 ms per layer with the tensor pipe 30-40% busy. ncu plus an
+MMA-only variant of the kernel (`SCA_DBG=3`) showed two causes: 512 TMEM columns per CTA leave one CTA per SM,
+so every handshake latency between the MMA warp and the compute warps is exposed; and the N = 64 GEMMs with
+both operands in shared memory run at ~55% of the tensor-core rate (operand bandwidth, ~192 B/clk needed).
+
+- `ScaBwdDkDv`: dK and dV of a key tile in one pass (one S^T GEMM and one exp2 pass less). K and V are stored
+  in tensor memory (bf16, by the compute warps) as the A operands of S^T = K Q^T and dP^T = V dO^T; P^T is
+  written over the S^T columns as the A operand of dV; S^T / dP^T are double-buffered 32-query blocks
+  (TMEM: K 64 | V 64 | S^T x2 | dP^T x2 | dV 128 | dK 128 = 512). Two groups of 4 compute warps alternate
+  blocks; the MMA warp issues dV_j, dK_{j-1}, dP^T_{j+1}, S^T_{j+2} per block over raw mbarriers (an S^T / P^T
+  stage is freed by the completion of its dV MMA through a tcgen05 commit on the stage's empty barrier, a dP^T
+  stage by the compute warps, a dS^T buffer by its dK MMA). Q ring 4 stages, dO ring 3.
+- `ScaBwdDqT`: same idea for dQ (Q and dO in TMEM, 64-key blocks, S / dP double-buffered, 2 dS buffers).
+- The per-block body is a `@cute.jit` helper with explicit arguments, instantiated for masked and unmasked
+  blocks: an `if` around the mask selects alone is if-converted by ptxas (every block paid ~160 predicated
+  instructions, 10%). Column data (lse2, delta, kmin of the block) is prefetched one block ahead and staged
+  through per-warp shared-memory slots (no group barrier); the dS scale moves to the epilogue; dP is loaded
+  after the P store (96 registers, no spills; 320 threads cap registers at 168).
+- Numbers (4B, per layer, worst case): dK + dV 2546 -> 1071 us, dQ 1042 -> 710 us, backward 3627 -> 1824 us
+  (MMA-only floors 753 / 562 us: the remaining gap is compute-warp latency and the grid tail, 3.5 waves).
+  Model step, 1 GPU, batches without eos: 474 -> 424 ms mean, worst step 520 -> 458; 8 GPUs 494 -> 480
+  (`fsdp_layers_per_group=1`), 485 -> 428 (4). Losses / grad norms unchanged; 19 SCA tests pass.
+- Scope: S + V <= 256 only (TMEM budget 1.5 (S + V) + 4 QB <= 512); 0.9B / 7.1B (S = V = 256) keep the
+  previous kernels. The same A-in-TMEM structure would apply to the forward (Q tile in TMEM) and, with a
+  materialized bf16 P^T + cuBLAS dV, to the 7.1B dV (2.8 ms/layer today).
+- Scripts: `sca/ncu_sca.py <shape>` (one profiled backward for ncu), `common/src_an.py <csv> <top> <source>`
+  for the per-line exec counts / stalls from `ncu --set full --import-source yes --page source --print-source
+  cuda,sass --csv` with `CUTE_DSL_LINEINFO=1` (it shows `@P` predication), `sca/layout_check{2,3}.py`.
+
 ### Open items
 
 - The S = 128 shape (4B) is MUFU bound (exp2); FA4-style exp2 emulation on the FMA units for part of the
