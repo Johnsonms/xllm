@@ -526,6 +526,18 @@ SCA (`sliding_chunk_attention.py`):
   0.9B / 7.1B / 4B. A different decomposition (threads along time, channels in a warp-wide shuffle) is the next
   thing to try.
 
+### Repository test suites (script-style, run with `PYTHONPATH=<repo>:<xext dir>:<stub dir> python tests/...`)
+
+- `tests/normalization/test_group_norm_small_groups.py`: 5040 / 5040 pass with the rebuilt extension (the first
+  vectorized version failed fp32 inputs and channel counts not divisible by 8: fixed with element-size-aware
+  loads and the original kernels as the fallback).
+- `tests/normalization/test_rms_group_norm.py 0` / `test_layer_group_norm.py 0`: one and two mismatched elements
+  out of 18 in a tiny case - identical with the original extension (pre-existing tolerance issue).
+- `tests/conv/test_causal_conv1d.py 0 bf16`: 614 passes, one backward case with 1 / 7168 elements at 0.0127 vs
+  0.01 tolerance - identical with `XLLM_CUTE_CONV=0` (Triton only; pre-existing).
+- `tests/sca/test_sliding_chunk_attention.py` needs xattn (not installed). The CuTe suites: `tests/test_cute_*.py`
+  (68 tests).
+
 ### What applies where
 
 All block-level fusions (q/k prep, attention gate + delta, swiglu, layernorm, the fused-linear cross entropy)
