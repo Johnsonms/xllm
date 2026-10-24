@@ -286,6 +286,9 @@ def layernorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     xdim = x.shape[-1]
+    if weight is not None and _fused_norm_ok(x, num_groups):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
+        return group_norm_fwd(x, num_groups, eps, weight + 1.0, bias, layer=True)
     if weight is not None:
         return xllm_ops.group_layer_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, bias, eps)
     else:
@@ -315,6 +318,9 @@ def rmsnorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor]:
     xdim = x.shape[-1]
+    if _fused_norm_ok(x, num_groups):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
+        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None)
     if weight is not None:
         return xllm_ops.group_rms_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, eps)
     else:
@@ -876,6 +882,16 @@ def grouped_experts_bwd(
 
     x_grad = torch.add(x_grad, x_grad_h3, out=x_grad)
     return x_grad, w1_grad, w2_grad, w3_grad
+
+
+_NORM_EXT = os.environ.get("XLLM_NORM_EXT", "0") == "1"  # xllm_extension group norm forward instead of the CuTe one
+
+
+def _fused_norm_ok(x: Tensor, num_groups: int) -> bool:
+    if _NORM_EXT:
+        return False
+    from xllm.modules.fused_ops.cute import group_norm as cute_group_norm
+    return cute_group_norm.supported(x, num_groups)
 
 
 _SWIGLU_TORCH = os.environ.get("XLLM_SWIGLU_TORCH", "0") == "1"  # torch reference path instead of the fused kernels
