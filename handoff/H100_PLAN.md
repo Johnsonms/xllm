@@ -36,6 +36,7 @@ rewrite; "P" marks code that should port with small changes.
 | `SwigluFwd` / `Bwd` | `swiglu.py` | silu * h3; recompute + silu_backward + 2 muls | 3 / 6 passes | 7.1B 813 -> 798 | P |
 | `CeLogits` | `cross_entropy.py` | ~12 torch ops per logits chunk | CTA per row: loss + fp32 / bf16 scores | 0.9B 352 -> 338 | P |
 | `LnFwd` / `LnBwd` | `layer_norm.py` | extension GroupLayerNorm | C / 256 warps per row | 0.9B 348 -> 335, 7.1B 850 -> 826 | P |
+| `ConvFwd` (`cute/causal_conv.py`, forward only) | `causal_conv1d.py` dispatch (backend 'triton') | Triton causal conv1d forward | thread = 8 channels x 4-row steps, 3-row register window, packed f32x2, mask-free path | 0.9B q 128 -> 75 us, v 126 -> 59; 7.1B v 207 -> 164 | P (plain memory kernel; on H100 compare with the Triton kernel first - it may already be at bandwidth there) |
 | csrc `GammaBwdLargeKernel` / `GammaBetaBwdLargeKernel` | `xllm/csrc/ops/group_*_norm_kernel.cu` | the same kernels (32-64 blocks) | row-split, 16-byte loads, fp32 partials + finalize | 0.9B 469 -> 433, 7.1B 924 -> 910 | P (identical CUDA; rebuild the extension) |
 
 Not kernels, but part of the B200 result (section 2): the `create_on_gpu` default-device fix, `fsdp_layers_per_group`,

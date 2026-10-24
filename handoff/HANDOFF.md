@@ -498,6 +498,8 @@ SCA (`sliding_chunk_attention.py`):
   159 us. The kernel-path dP GEMMs run per head on strided views of v / dout into dPcur [B, nc, H, C, C] and
   dPprev [B, nc - 1, H, C, C] (the kernels index that layout), so the two ChunkMajorCopy passes are gone:
   7.1B kernel-path backward 3394 (morning) -> 2766 us/layer; 1-GPU step 805 ms.
+- The attention gate backward also emits the SCA backward's delta (rowsum of dS * y), one RowDot pass less
+  per layer. Final 1-GPU steps: 0.9B 318, 4B 314, 7.1B 798 ms.
 - The gate kernels were instruction bound (ncu: 51 instructions per element, math-pipe throttle): with
   beta = ln 2, softplus(x) = log2(1 + 2^x) and its derivative 1 / (1 + 2^-x) (ex2 + lg2 / rcp): forward
   116 -> 79 us (0.9B), 247 -> 167 (7.1B), same numerics. The q/k prep backward with exp2 + rcp and packed
@@ -511,11 +513,15 @@ SCA (`sliding_chunk_attention.py`):
 
 ### Tried, not kept
 
-- CuTe causal conv1d (width 4, bos resets, silu): a register-walk kernel (`conv/causal_conv_draft.py`) and a
-  cp.async shared-memory staged kernel (`conv/causal_conv_smem.py`) are both correct (weight gradient more
-  accurate than Triton's) but not faster: the Triton kernels run at ~2.3 TB/s; the drafts are latency bound
-  (ncu: 17% DRAM, 24-37% warps active, `wait` / `long_scoreboard` stalls, 32 instructions per element). Worth
-  ~12 / 22 / 7 ms per step on 0.9B / 7.1B / 4B with a better design (TMA tile loads, time-parallel threads).
+- CuTe causal conv1d (width 4, bos resets, silu): the register-walk kernel became fast enough in the forward
+  once the inner loop used packed f32x2 math and a mask-free path (ncu per-line view, `common/src_an.py`:
+  the scalar version spent 46% of its instructions in the tap FMAs and multiplied the masks on every
+  element): `cute/causal_conv.py` (commit "cute causal conv1d forward"), 0.9B q 128 -> 75 us, v (silu) 126 ->
+  59, 7.1B v 207 -> 164 vs Triton; six calls per layer (the block recomputes the convs in its backward). The
+  backward kernel in the module and the cp.async shared-memory staged variant (`conv/causal_conv_smem.py`) are
+  correct but slower than Triton's backward (latency bound; the bwd needs 7-row x and g windows -> 69-122
+  registers, 24-37% warps active): opt-in via `XLLM_CUTE_CONV_BWD=1`. Remaining: ~10 / 17 / 11 ms per step of
+  Triton conv backward on 0.9B / 7.1B / 4B.
 - Fusing dS into ScaPmat (three variants, §6b) stays slower.
 
 ### Remaining (1-GPU shares)
