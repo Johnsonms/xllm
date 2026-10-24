@@ -56,6 +56,8 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | fused linear cross entropy through quack's scaled-exp path on sm_90 (scores never written, dw in fp32; `XLLM_QUACK_CE=0` off) | c59b2cc | unchanged at the harness vocab (32000); with the llama3 vocab (128256) step 606 -> 585 ms |
 | TSDN backward: residual gradient accumulated by TMA reduce-add stores (`residual=`) | 0bba4da | TSDN bwd + add 211 -> 161 us/layer (0.9B), 146 -> 121 (7.1B) |
 | AWM backward: dv reduce-added (TMA) into the SCA's v gradient (`awm_bwd_finish(dv_acc=)`) | 2f4cc66 | step 540.7 -> 538.9 ms |
+| AWM: lse2 combine in one kernel (was 7 torch ops per use), chunk row bounds cached per step | 9c3ff5b | AWM per call 0.9B fwd 272 -> 244 us, bwd 372 -> 344; step 538.9 -> 537.1 ms |
+| packed FFN recompute on the quack path (`swiglu_recompute`, for `recompute_fc1_out` / `fc3_out`) | 8a4842a | 7.1B L16384 unchanged |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
 
@@ -120,6 +122,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 | gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~837 ms | ~822 ms |
 | gekko-7.1B (swift) | B1 L16384 (the plan's shape) | OOM | ~1.70 s (65 GB) with `recompute_fc1_out` / `recompute_fc3_out` and `expandable_segments` (still OOM without the recompute: 76.6 GB) | - |
 
+With the llama3 vocab (`VOCAB=128256`, per-rank batches, current head): 0.9B ~658 ms, 4B ~571, 7.1B ~872; the
+quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674 / 584 / 893).
+
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
 - Communication is overlapped (4B: 15 ms of compute-stream gaps per step, 12 under NCCL). The collectives slow the
@@ -158,7 +163,8 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
-- Also tried, no gain: quack's plain GEMM vs cuBLAS on the projection shapes (wins on some, e.g. K=1024 accumulates
+- Also tried, no gain: swift dK / dV as one beta = 1 GEMM after zeroing the new rows (2159 -> 2233 us, slower than
+  the beta = 1 / beta = 0 pair); the B200 CuTe conv backward rework on H100 (232-268 vs Triton 154-166 us); quack's plain GEMM vs cuBLAS on the projection shapes (wins on some, e.g. K=1024 accumulates
   217 -> 170 us, loses on others); merging the q / k / v / r projections into one GEMM (forward equal, only the
   accumulated input gradient gains ~15%, eaten by the extra copies); Triton conv backward block / warp configs (the
   default is the best of 10); xattn varlen hdim-256 backward with BN 64 / 96 (4490 / 8162 vs 3875 us at BN 80).
