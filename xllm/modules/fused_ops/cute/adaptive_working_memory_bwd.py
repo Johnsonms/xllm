@@ -1163,6 +1163,33 @@ def _recurrence_bwd_torch(w, dMo, dmem, K, S, V, C, has_seg):
     return dB16, drp, G
 
 
+def _recurrence_bwd_warp(w, dMo, dmem, K, S, V, C, has_seg):
+    """AwmRecurrenceBwdWarp (warp MMAs; training case): dB16, the dr partials per 64-column v tile, the final G."""
+    B, nc = dMo.shape[0], dMo.shape[2]
+    nu = max(w["nu"], 1)
+    dev = dMo.device
+    # v tile as in the forward recurrence: the widest that still gives >= 128 CTAs (the updates are sequential)
+    VT = next((vt for vt in (64, 32, 16) if V % vt == 0 and B * K * (V // vt) >= 128), 16)
+    n_vt = V // VT
+    dB16 = torch.empty(B, K, nu, S, V, dtype=torch.bfloat16, device=dev)
+    drp = torch.empty(B, K, nu, n_vt, S, dtype=torch.float32, device=dev)
+    gmem = torch.empty(B, K, S, V, dtype=torch.float32, device=dev)
+    if w["nu"] == 0:
+        drp.zero_()
+        gmem.copy_(dmem.float() if dmem is not None else dMo[:, :, 0] * 0)
+        return dB16, drp, gmem
+    a16t = w["A16"].transpose(-1, -2).contiguous()
+    has_dmem = dmem is not None
+    sm90 = _fwd_mod()._sm90()
+    f = _compiled(("recbw", K, S, V, C, has_seg, has_dmem, VT), lambda: sm90.AwmRecurrenceBwdWarp(K, S, V, C, has_seg, has_dmem, VT),
+                  lambda: (_fake(BFloat16), _fake(Float32), _fake(Float32), _fake(Float32), _fake(Int64, 8),
+                           _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(Float32), *([Int32(0)] * 4)))
+    f(a16t.reshape(-1), dMo.reshape(-1), w["R"].reshape(-1), w["D"].reshape(-1), w["seg"].reshape(-1),
+      (dmem.float().contiguous() if has_dmem else gmem).reshape(-1), dB16.reshape(-1), drp.reshape(-1),
+      gmem.reshape(-1), B, nc, w["nu"], w["seg_stride"])
+    return dB16, drp, gmem
+
+
 def _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg):
     """AwmChunkBwd: with P[s, t] = exp2(k[t, s] log2e - lse2[s]) (rows outside the segment of the chunk's last
     row 0), dP = dA qk^T + dB v^T, dk = P (dP - delta + dlse), dqk = P^T dA, dv = P^T dB for the update chunks."""
@@ -1245,9 +1272,12 @@ def _phase2_bwd(w, dMo, dmem, dlnt, K, S, V, C, has_prev, has_seg):
     VT = 64
     n_vt = V // VT
     has_dmem, has_dlnt = dmem is not None, dlnt is not None
-    if _is_hopper(dev):
+    if _is_hopper(dev) and (_fwd_mod()._AWM_SM90_CUBLAS or has_prev):
         n_vt = 1  # dr written as full sums over V
         dB16, drp, gmem = _recurrence_bwd_torch(w, dMo, dmem, K, S, V, C, has_seg)
+    elif _is_hopper(dev):
+        dB16, drp, gmem = _recurrence_bwd_warp(w, dMo, dmem, K, S, V, C, has_seg)
+        n_vt = drp.shape[3]
     else:
         dB16, drp, gmem = _recurrence_bwd_sm100(w, dMo, dmem, K, S, V, C, has_prev, has_seg, n_vt)
     # dA_u = -(rG) M^T with M the state update u starts from (Mneg = -M, 0 after a reset): off the sequential chain

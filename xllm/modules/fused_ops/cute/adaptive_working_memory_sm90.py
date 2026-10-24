@@ -810,3 +810,144 @@ class AwmChunkBwdSm90:
                 tsb, tgb = cpasync.tma_partition(tma_dbv, 0, cute.make_layout(1), sb, gb)
                 cute.copy(tma_dbv, tgb, tsb[(None, prod.index)], tma_bar_ptr=bar)
         ring2.producer_commit(prod)
+
+
+class AwmRecurrenceBwdWarp:
+    """Phase 2' (reverse recurrence) on warp MMAs, the training case (no previous chunk; any arch with mma.sync):
+    per (b, kv head), backwards over the updates u (chunk c = u + 1), with G = dL/dM' (starts at dmem or 0):
+
+        drp[.., u, vt, s] = sum_{v in tile vt} G[s, v] D_u[s, v]        (dr partials, summed by AwmLseChain)
+        dB_u = bf16(r G);   G <- (1 - r) G - A_u^T (r G);   G <- 0 on a memory reset;   G <- G + dMo_c
+    and the final G (the input memory's gradient). Same structure as the forward AwmRecurrence: one CTA (8 warps)
+    per (b, k, VT columns of V), G in fp32 registers in the warp-MMA accumulator layout, A_u^T (a transposed bf16
+    copy of A) streamed through a cp.async ring, r G (bf16) as the B operand in shared memory."""
+
+    def __init__(self, K: int, S: int, V: int, C: int, has_seg: bool, has_dmem: bool, VT: int = 64):
+        self.K, self.S, self.V, self.C, self.has_seg, self.has_dmem = K, S, V, C, has_seg, has_dmem
+        self.VT = min(VT, V)
+        self.KB = 64
+        self.STAGES = 4
+        self.threads = 256
+        self.PAD = 8
+        assert V % self.VT == 0 and S % self.KB == 0 and S % 128 == 0 and self.VT % 16 == 0
+        self.n_vt = V // self.VT
+
+    @cute.jit
+    def __call__(self, tA16T: cute.Tensor, tDMo: cute.Tensor, tR: cute.Tensor, tD: cute.Tensor, tSeg: cute.Tensor,
+                 tDMem: cute.Tensor, tDB: cute.Tensor, tDrp: cute.Tensor, tGout: cute.Tensor, B: Int32, nc: Int32,
+                 nu: Int32, seg_stride: Int32, stream: cuda.CUstream):
+        K, S, V = self.K, self.S, self.V
+        # A_u^T [B, K, nu, S(out), S(t)] with t contiguous: the layout the forward's block loader expects
+        mA16 = cute.make_tensor(tA16T.iterator, cute.make_layout((S, S, nu, K, B), stride=(1, S, S * S, nu * S * S, K * nu * S * S)))
+        mDMo = cute.make_tensor(tDMo.iterator, cute.make_layout((V, S, nc, K, B), stride=(1, V, S * V, nc * S * V, K * nc * S * V)))
+        mD = cute.make_tensor(tD.iterator, cute.make_layout((V, S, nu, K, B), stride=(1, V, S * V, nu * S * V, K * nu * S * V)))
+        mR = cute.make_tensor(tR.iterator, cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S)))
+        mDB = cute.make_tensor(tDB.iterator, cute.make_layout((V, S, nu, K, B), stride=(1, V, S * V, nu * S * V, K * nu * S * V)))
+        mDrp = cute.make_tensor(tDrp.iterator, cute.make_layout((S, self.n_vt, nu, K, B), stride=(
+            1, S, self.n_vt * S, nu * self.n_vt * S, K * nu * self.n_vt * S)))
+        mG = cute.make_tensor(tGout.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
+        mDMem = cute.make_tensor(tDMem.iterator, cute.make_layout((V, S, K, B), stride=(1, V, S * V, K * S * V)))
+        op = cute.nvgpu.warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16))
+        tiled_mma = cute.make_tiled_mma(op, cute.make_layout((8, 1, 1)), permutation_mnk=(128, 16, 16))
+        grid = B * K * self.n_vt
+        self.kernel(tiled_mma, mA16, mDMo, mR, mD, tSeg.iterator, mDMem, mDB, mDrp, mG, nc, nu, seg_stride).launch(
+            grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.jit
+    def _load_a_block(self, mA16: cute.Tensor, sA: cute.Tensor, atom, q, n_blocks, nkb, nu, k, b, tidx):
+        """cp.async of A^T block q (update nu - 1 - q // nkb, the updates run backwards) into buffer q % STAGES."""
+        if q < n_blocks:
+            qu = q // nkb
+            u = nu - 1 - qu
+            col0 = (q - qu * nkb) * self.KB
+            rq = tidx // (self.KB // 8)
+            cq = (tidx % (self.KB // 8)) * 8
+            src0 = mA16.iterator + mA16.layout((col0 + cq, rq, u, k, b))
+            dst0 = sA.iterator + sA.layout((rq, cq, q % self.STAGES))
+            rows_per_it = self.threads * 8 // self.KB
+            for it in cutlass.range_constexpr(self.S // rows_per_it):
+                src = cute.make_tensor((src0 + it * rows_per_it * self.S).align(16), cute.make_layout(8))
+                dst = cute.make_tensor((dst0 + it * rows_per_it * (self.KB + self.PAD)).align(16), cute.make_layout(8))
+                cute.copy(atom, src, dst)
+        cute.arch.cp_async_commit_group()
+
+    @cute.kernel
+    def kernel(self, tiled_mma: cute.TiledMma, mA16: cute.Tensor, mDMo: cute.Tensor, mR: cute.Tensor, mD: cute.Tensor,
+               pSeg: cute.Pointer, mDMem: cute.Tensor, mDB: cute.Tensor, mDrp: cute.Tensor, mG: cute.Tensor, nc: Int32,
+               nu: Int32, seg_stride: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        S, VT, KB = self.S, self.VT, self.KB
+        vt = bidx % self.n_vt
+        k = (bidx // self.n_vt) % self.K
+        b = bidx // (self.n_vt * self.K)
+        v0 = vt * VT
+        nkb = S // KB
+        smem = utils.SmemAllocator()
+        sA = smem.allocate_tensor(BFloat16, cute.make_layout((S, KB, self.STAGES), stride=(KB + self.PAD, 1, S * (KB + self.PAD))),
+                                  byte_alignment=16)
+        sRG = smem.allocate_tensor(BFloat16, cute.make_layout((VT, S), stride=(S + self.PAD, 1)), byte_alignment=16)
+        sR = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
+        sDr = smem.allocate_tensor(Float32, cute.make_layout(S), byte_alignment=16)
+        atom = cute.make_copy_atom(cpasync.CopyG2SOp(), BFloat16, num_bits_per_copy=128)
+        n_blocks = nu * nkb
+        for p0 in cutlass.range_constexpr(self.STAGES - 1):
+            self._load_a_block(mA16, sA, atom, Int32(p0), n_blocks, nkb, nu, k, b, tidx)
+
+        thr_mma = tiled_mma.get_slice(tidx)
+        coords = thr_mma.partition_C(cute.make_identity_tensor((S, VT)))
+        g = cute.make_rmem_tensor(coords.shape, Float32)
+        acc = cute.make_rmem_tensor(coords.shape, Float32)
+        n_frag = cute.size(coords)
+        if const_expr(self.has_dmem):
+            for i in cutlass.range_constexpr(n_frag):
+                s1, v1 = coords[i]
+                g[i] = mDMem[v0 + v1, s1, k, b]
+        else:
+            g.fill(0.0)
+
+        q = Int32(0)
+        for qu in cutlass.range(nu):
+            u = nu - 1 - qu
+            c = u + 1
+            if tidx < S:
+                sR[tidx] = mR[tidx, u, k, b]
+                sDr[tidx] = Float32(0.0)
+            cute.arch.barrier()
+            # dr partials of this v tile, and r G (bf16): dB and the B operand
+            for i in cutlass.range_constexpr(n_frag):
+                s2, v2 = coords[i]
+                cute.arch.atomic_add((sDr.iterator + s2).llvm_ptr, g[i] * mD[v0 + v2, s2, u, k, b], sem="relaxed", scope="cta")
+                rg = (sR[s2] * g[i]).to(BFloat16)
+                mDB[v0 + v2, s2, u, k, b] = rg
+                sRG[v2, s2] = rg
+            acc.fill(0.0)
+            for kb in cutlass.range(nkb):
+                buf = q % self.STAGES
+                cute.arch.cp_async_wait_group(self.STAGES - 2)
+                cute.arch.barrier()  # block q landed; block q - 1's buffer is free; sRG / sDr written
+                self._load_a_block(mA16, sA, atom, q + self.STAGES - 1, n_blocks, nkb, nu, k, b, tidx)
+                tCsA = thr_mma.partition_A(sA[None, None, buf])
+                tCsB = thr_mma.partition_B(cute.local_tile(sRG, (VT, KB), (0, kb)))
+                tCrA = tiled_mma.make_fragment_A(tCsA)
+                tCrB = tiled_mma.make_fragment_B(tCsB)
+                cute.autovec_copy(tCsA, tCrA)
+                cute.autovec_copy(tCsB, tCrB)
+                for kk in cutlass.range_constexpr(cute.size(tCrA, mode=[2])):
+                    cute.gemm(tiled_mma, acc, tCrA[None, None, kk], tCrB[None, None, kk], acc)
+                q += 1
+            if tidx < S:
+                mDrp[tidx, vt, u, k, b] = sDr[tidx]
+            reset = cutlass.Boolean(False)
+            if const_expr(self.has_seg):
+                if c >= 2:  # a memory reset before update u: no gradient to the state before it
+                    reset = _seg_anchor(pSeg, pSeg, b, c - 2, 0, seg_stride, self.C) != \
+                        _seg_anchor(pSeg, pSeg, b, c - 1, 0, seg_stride, self.C)
+            keep = cutlass.select_(reset, Float32(0.0), Float32(1.0))
+            for i in cutlass.range_constexpr(n_frag):
+                s4, v4 = coords[i]
+                g[i] = ((1.0 - sR[s4]) * g[i] - acc[i]) * keep + mDMo[v0 + v4, s4, c, k, b]
+            cute.arch.barrier()  # sR / sRG / sDr are rewritten in the next update
+        for i in cutlass.range_constexpr(n_frag):
+            s5, v5 = coords[i]
+            mG[v0 + v5, s5, k, b] = g[i]
