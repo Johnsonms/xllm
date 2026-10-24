@@ -30,6 +30,7 @@ except ImportError:  # loaded from its file (tests)
 
 WARPS = 8  # per CTA
 LN2 = math.log(2.0)
+LOG2E = 1.0 / LN2
 
 
 @cute.jit
@@ -41,15 +42,20 @@ def _warp_sum(v: Float32) -> Float32:
 
 @cute.jit
 def _softplus(x: Float32) -> Float32:
-    # torch: softplus(x, beta, threshold) = log1p(exp(beta x)) / beta, x when beta x > threshold
-    bx = x * LN2
-    y = cute.math.log1p(cute.math.exp(bx, fastmath=True), fastmath=False) * (1.0 / LN2)
-    return x if bx > 20.0 else y
+    # torch: softplus(x, beta = ln 2, threshold = 20) = log1p(exp(beta x)) / beta = log2(1 + 2^x), x when beta x > 20
+    y = cute.math.log2(1.0 + cute.math.exp2(x, fastmath=True), fastmath=True)
+    return x if x > 20.0 / LN2 else y
+
+
+@cute.jit
+def _sigmoid_ln2(x: Float32) -> Float32:
+    # sigmoid(beta x) with beta = ln 2: 1 / (1 + 2^-x)
+    return cute.arch.rcp_approx(1.0 + cute.math.exp2(-x, fastmath=True))
 
 
 @cute.jit
 def _sigmoid(x: Float32) -> Float32:
-    return 1.0 / (1.0 + cute.math.exp(-x, fastmath=True))
+    return cute.arch.rcp_approx(1.0 + cute.math.exp2(-x * LOG2E, fastmath=True))
 
 
 @cute.jit
@@ -182,7 +188,7 @@ class AttnGateBwd:
                 dgate = sg * (1.0 + x * (1.0 - sg))
             else:
                 r = BFloat16(_softplus(x)).to(Float32)
-                dgate = 1.0 if x * LN2 > 20.0 else _sigmoid(x * LN2)
+                dgate = 1.0 if x > 20.0 / LN2 else _sigmoid_ln2(x)
             dn[k] = BFloat16(gv[k] * r).to(Float32)
             av[k] = n * r
             dot = dot + dn[k] * n
