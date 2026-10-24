@@ -642,8 +642,12 @@ def swiglu_forward(
     if swiglu:
         h1 = F.linear(x, w1)
         h3 = F.linear(x, w3)
-        hidden = F.silu(h1)
-        hidden = torch.mul(hidden, h3, out=hidden)
+        if _fused_swiglu_ok(h1, h3):
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd as fused_swiglu_fwd
+            hidden = fused_swiglu_fwd(h1, h3)
+        else:
+            hidden = F.silu(h1)
+            hidden = torch.mul(hidden, h3, out=hidden)
     else:
         h1 = F.linear(x, w1)
         h3 = None
@@ -676,21 +680,28 @@ def swiglu_backward(
     assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
     bsz, seq_len, _ = x.shape
 
-    # B*L x E
-    h1s = F.silu(h1)
-    h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
-    # B*L x D, D x E -> B*L x E
-    h_grad = torch.mm(y_grad, w2)
-    h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
-
-    if h3 is not None:
-        h1s_grad = h_grad * h3
-        h3_grad = h_grad * h1s
+    if h3 is not None and dropout == 0.0 and _fused_swiglu_ok(h1, h3):
+        # fused elementwise around the h_grad GEMM (no dropout): h for the fc2 weight gradient, then both grads
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd as fused_swiglu_fwd, swiglu_bwd as fused_swiglu_bwd
+        h = fused_swiglu_fwd(h1, h3)
+        h_grad = torch.mm(y_grad, w2)
+        h1_grad, h3_grad = fused_swiglu_bwd(h_grad, h1, h3)
     else:
-        h1s_grad = h_grad
-        h3_grad = None
+        # B*L x E
+        h1s = F.silu(h1)
+        h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
+        # B*L x D, D x E -> B*L x E
+        h_grad = torch.mm(y_grad, w2)
+        h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
 
-    h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
+        if h3 is not None:
+            h1s_grad = h_grad * h3
+            h3_grad = h_grad * h1s
+        else:
+            h1s_grad = h_grad
+            h3_grad = None
+
+        h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
     xf_grad = h1_grad.matmul(w1)
     if h3_grad is not None:
         xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
@@ -865,6 +876,16 @@ def grouped_experts_bwd(
 
     x_grad = torch.add(x_grad, x_grad_h3, out=x_grad)
     return x_grad, w1_grad, w2_grad, w3_grad
+
+
+_SWIGLU_TORCH = os.environ.get("XLLM_SWIGLU_TORCH", "0") == "1"  # torch reference path instead of the fused kernels
+
+
+def _fused_swiglu_ok(h1: Tensor, h3: Tensor) -> bool:
+    if _SWIGLU_TORCH:
+        return False
+    from xllm.modules.fused_ops.cute import swiglu as cute_swiglu
+    return cute_swiglu.supported(h1, h3)
 
 
 _ROPE_TORCH = os.environ.get("XLLM_ROPE_TORCH", "0") == "1"  # torch reference path instead of the fused kernel
