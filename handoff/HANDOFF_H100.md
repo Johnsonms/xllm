@@ -167,6 +167,10 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - 30-step 8-GPU gekko-4B B1 L8192, current head vs every reference path (unpatched xattn, torch AWM incl. torch lse2,
   CUB TSDN, foreach Adam, quack / cute fused kernels off, fp32 CE dgrad): loss |diff| <= 0.0004, grad norms within
   0.12%; median step 801 -> 553 ms.
+- 150-step soak, 8 GPUs gekko-7.1B B1 L8192 (`FSDP_RESHARD=0` both): everything-on (`XLLM_GEKKO_SAVE_QK_PREP=1`,
+  swift items, quack) vs the reference paths: loss |diff| <= 0.0028, grad norms drift late (up to 32% at grad norm
+  ~0.08, the random-token harness sits at the ln(32000) plateau); the reference against a rerun of itself drifts
+  more (loss |diff| <= 0.0047, grad norm up to 4.4x late): within run-to-run nondeterminism. Median 861 -> 783 ms.
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
