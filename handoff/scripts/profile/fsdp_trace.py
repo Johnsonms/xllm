@@ -5,7 +5,7 @@ usage: torchrun --nproc_per_node N fsdp_step.py <preset> <batch_per_gpu> <seq_le
 import os, sys, time, re, json
 from collections import defaultdict
 S = "/tmp/claude-243000396/-data-home-johnson-xllm/d3839bfb-7816-4668-9945-7c337f0c3f9e/scratchpad/handoff/scripts/awm"
-sys.path.insert(0, os.path.join(S, "xext")); sys.path.insert(0, "/home/johnson/xllm")
+sys.path.insert(0, os.environ.get("XEXT", os.path.join(S, "xext"))); sys.path.insert(0, "/home/johnson/xllm")
 import torch, torch.distributed as dist, types
 sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
 preset, bsz, seq_len = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
@@ -52,7 +52,7 @@ def step(prof=None):
 res = []
 for s in range(steps):
     if s == int(os.environ.get("PROF_STEP", steps - 1)) and rank == 0:
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU], with_stack=bool(int(os.environ.get("WITH_STACK", "0")))) as prof:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU], with_stack=bool(int(os.environ.get("WITH_STACK", "0"))), record_shapes=bool(int(os.environ.get("RECORD_SHAPES", "0")))) as prof:
             r = step(); torch.cuda.synchronize()
         prof.export_chrome_trace(os.environ.get("TRACE_OUT", f"fsdp_{preset}_w{world}.json"))
     else:

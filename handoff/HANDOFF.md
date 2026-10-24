@@ -377,6 +377,8 @@ the path is dominated by the dense GEMMs over half-empty causal blocks (dP 1.2 m
 - Context-parallel ranks > 0 (previous chunk) fall back to swift, as for AWM.
 - Remaining step time (0.9B, 590 ms): dense GEMMs ~250, fused-block elementwise ~90, cross-entropy ~85 (TF32 in
   train.py makes it ~5), swiglu ~90, rope ~70, norms ~65, SCA ~115, AWM ~10.
+- (Done in §6d: rope, the q/k softmax chain, the norm weight gradients, the attention gate, swiglu, the
+  cross-entropy chunk ops, layernorm, and TMEM-A kernels for the S = V = 256 backward.)
 
 ## 6c. FSDP2 overlap on 8 GPUs: done (2026-10-24, slinky-0)
 
@@ -430,6 +432,77 @@ the fwd+bwd window), `gaps.py` (compute-stream idle time inside that window and 
   worst-case SCA backward.
 - Per-rank step-time telemetry in train.py would make straggling visible in production.
 
+## 6d. Second pass (2026-10-24, autonomous 12-hour run): fusions, norm kernels, SCA backward for S = V = 256
+
+Starting point (1-GPU fwd+bwd, cute TSDN / AWM / SCA): 0.9B B2 L16K 527 ms, 4B B1 L8K 424, 7.1B B1 L16K 939.
+End: 0.9B 319, 4B ~323 (launch-bound; time it alone, CPU load from other jobs moves it by 10%), 7.1B ~820;
+8 GPUs 7.1B 884 (was 1017), 0.9B 388. Every item: commit on `cute-adaptive-working-memory`, unit test under
+`tests/test_cute_*.py`, loss / grad-norm parity on the harness via `profile/parity_env.py` (same batches, env
+var toggles the path in one process), step time via `profile/run1.sh`. All new paths have an env kill switch.
+
+### What the profile said
+
+`profile/opattr.py <trace> <kernel regex>` (needs a trace recorded with `WITH_STACK=1 RECORD_SHAPES=1
+run1.sh ...`) attributes every kernel to the innermost xllm python frame and the innermost aten op with its
+input shapes. On the 0.9B step 55% of the kernel time was elementwise / norm / copy: rope 68 ms (float,
+complex multiply, cast, torch.cat, three times per layer), the q / k softmax fp32 round trips 30, the norm
+weight gradients 30 (extension kernels launching 32-64 blocks), small-group rmsnorm 20, swiglu elementwise 17,
+cross-entropy chunk ops 17, conv 20, layernorm 12. The 7.1B linear GEMMs run at 70-79% of peak (nvjet
+256x256) and were left alone.
+
+### Kernels added (all `xllm/modules/fused_ops/cute/`, bf16 in / out, fp32 math, Blackwell only via a
+`*_supported()` check, torch path kept as the fallback)
+
+| Kernel | File / switch | Replaces | Effect |
+|---|---|---|---|
+| `Rope` | `rope.py`, `XLLM_CUTE_ROPE` | `apply_rope` / `apply_ropes` (4-5 passes) | 0.9B q 547 -> 50 us; step 527 -> 469 |
+| `QkPrepFwd` / `QkPrepBwd` | `qk_prep.py`, `XLLM_CUTE_QK` | rmsnorm_fwd + rope + F.softmax(fp32).to(bf16) and the recompute, rope bwd, rmsnorm_bwd, _softmax_backward_data (fp32 round trips) and two adds in the backward | one pass per direction per tensor; a warp per head row; weight-gradient partials in registers (a warp sees one head). 0.9B q: fwd 525 -> 99 us, bwd 863 -> 245; steps 0.9B 433 -> 379, 4B 381 -> 368, 7.1B 910 -> 893 |
+| `AttnGateFwd` / `Bwd` | `attn_gate.py`, `XLLM_CUTE_GATE` | add + per-head rmsnorm + softplus/silu gate + multiply (10 passes) and the backward (22 passes) | 4 + 6 passes; V / 256 warps per row for V = 2048; intermediate bf16 roundings reproduced (1 ulp vs torch). 0.9B 379 -> 356, 4B 368 -> 334, 7.1B 893 -> 852 |
+| `SwigluFwd` / `Bwd` | `swiglu.py`, `XLLM_CUTE_SWIGLU` | F.silu * h3 (5 passes); recompute + 2 muls + silu_backward (14 passes) | 3 + 6 passes at 6.5 TB/s, bit-identical except 1 ulp in the silu gradient. 0.9B 364 -> 352, 7.1B 813 -> 798 (in-process) |
+| `CeLogits` | `cross_entropy.py`, `XLLM_CUTE_CE` | ~12 torch ops per fp32 [2048, vocab] logits chunk | one CTA per row: loss + fp32 and bf16 score matrices from the bf16 GEMM output; 1059 -> 147 us per chunk; single model-parallel rank only. 0.9B 352 -> 338 |
+| `LnFwd` / `LnBwd` | `layer_norm.py`, `XLLM_CUTE_LN` | extension GroupLayerNorm fwd/bwd (1.7 TB/s) | C / 256 warps per row, 16-byte loads, partials in registers; >= 2048 tokens. [2, 16384, 1536] x 2: fwd 123 -> 54 us, bwd 197 -> 101 |
+| csrc `GammaBwdLargeKernel`, `GammaBetaBwdLargeKernel` | `xllm/csrc/ops/group_{rms,layer}_norm_kernel.cu` (rebuild the extension) | the norm weight-gradient kernels: 32 x 32 blocks, channels / 32 * groups blocks (32 for a 4-head q norm), 64-byte row segments, ~0.3 TB/s | 32 x 8 blocks of 8 channels per thread (16-byte loads), row split over gridDim.z into fp32 partials + finalize; channels per group must be a multiple of 8. group_rms_norm_bwd_affine [32768, 2048] x 8: 710 -> 210 us; steps 0.9B 469 -> 433, 4B 390 -> 381, 7.1B 924 -> 910 |
+
+SCA (`sliding_chunk_attention.py`):
+
+- 4 x 4 sub-blocking of the causal [C x C] GEMMs of the materialized-P / dS path (`_bmm_tril_tn/nn/nt`, `_tril_sub`;
+  `SCA_TRIL_N`): 7.1B no-boundary backward 4.16 -> 3.76 ms/layer. ScaDsMat never reads dP past the row's
+  8-aligned diagonal, so the skipped sub-blocks stay unwritten. The kernel path's dense fp32 dPcur GEMM is
+  sub-blocked the same way (`_bmm_triu_nt`, zeros below the diagonal): 1.12 -> 0.95 ms/layer.
+- `ScaBwdDvT`: the fused dK+dV kernel without dK (K in TMEM as the A operand of S^T, P^T over the S^T columns,
+  32-query blocks, v-slab index) for S + V > 256: S / 2 + 64 + min(V, 256) <= 512 columns. 0.9B dV 768 -> 624
+  us, 7.1B 1106 -> 977. `SCA_DV_TMEM=0` restores ScaBwdDv.
+- `ScaBwdDkT`: dK with the K tile in smem (TMA, A of S^T), V in TMEM (A of dP^T), double-buffered 32-query
+  S^T / dP^T stages released by the compute warps, dS^T in smem: V / 2 + 128 + S <= 512 (exactly 512 for
+  S = V = 256). 0.9B dK 1161 -> 922 us. `SCA_DK_TMEM=0`. First version hung: an empty-stage barrier whose
+  stage is filled in the prologue must be waited with parity 0, not 1 (over-running a barrier by two phases
+  deadlocks).
+- `ScaBwdDqT(q_smem=True, KB=32)`: the dQ TMEM kernel with the q tile in smem and 32-key blocks (64-byte
+  swizzled dS stores): V / 2 + 128 + S <= 512. 0.9B dQ 990 -> 899 us. 0.9B backward per layer 2972 -> 2489 us.
+- The q / K / V -> TMEM stores need a power-of-two S / V (`Repetition`); the dispatch falls back otherwise
+  (S = 192 used to fail in ScaFwdT).
+- V > 256: both backward paths are compiled at the first call (`_compile_bwd_paths`). A rank compiling the GEMM
+  path lazily mid-run stalled every rank of an 8-GPU step for seconds (2.6 s steps between 0.86 s steps). The
+  path threshold on the attended fraction is 0.5 on one GPU and 0.35 under data parallelism, where the
+  fixed-cost GEMM path avoids straggling (8 x B200 7.1B: kernel path 893, forced GEMM 870, auto 884 ms;
+  `SCA_PMAT_FRAC` overrides).
+
+### Tried, not kept
+
+- CuTe causal conv1d (width 4, bos resets, silu): a register-walk kernel (`conv/causal_conv_draft.py`) and a
+  cp.async shared-memory staged kernel (`conv/causal_conv_smem.py`) are both correct (weight gradient more
+  accurate than Triton's) but not faster: the Triton kernels run at ~2.3 TB/s; the drafts are latency bound
+  (ncu: 17% DRAM, 24-37% warps active, `wait` / `long_scoreboard` stalls, 32 instructions per element). Worth
+  ~12 / 22 / 7 ms per step on 0.9B / 7.1B / 4B with a better design (TMA tile loads, time-parallel threads).
+- Fusing dS into ScaPmat (three variants, §6b) stays slower.
+
+### Remaining (1-GPU shares)
+
+0.9B 319 ms: SCA bwd 70 (DkT 26, DqT 25, DvT 17), SCA fwd 18, linear GEMMs ~95, conv 20, AWM 10, TSDN 5,
+CE GEMMs ~8. 7.1B ~820: linear GEMMs 460 (70-79% of peak), SCA ~115 (fwd 37, dP GEMMs 30, DvT 31, Dk 24,
+Dq 14), conv 34, layernorm ~12, residual adds 11, TSDN 7. 4B 323: GEMMs ~100, SCA 44, conv 18, optimizer
+(outside fwd+bwd) 50, FSDP `_chunk_cat` 11 (harness).
+
 ## 7. Dev scripts (`handoff/scripts/`)
 
 These were copied from the session scratchpad and are not polished. Most assume the repo is at `/home/johnson/xllm`.
@@ -461,6 +534,16 @@ These were copied from the session scratchpad and are not polished. Most assume 
   overlap inside the FWDBWD window; `gapattr.py <trace> [depth] [regex] [--ops]` GPU-idle time by python frame
   or cpu op; `cpuself.py <trace> [top] [--fwd]` CPU self time per python function; `kcmp.py <a> <b>` kernel
   time diff of two traces.
+- **`fusions/`** (§6d): `test_rope.py`, `test_qk.py` / `qk_var.py`, `test_gate.py`, `test_swiglu.py`, `test_ce.py`,
+  `test_ln.py` compare each fused kernel with the torch / extension path it replaces (max error, fp32
+  reference, timing at the real shapes); `subblk.py` times the sub-blocked causal GEMMs. `profile/opattr.py
+  <trace> <regex>` kernel time by python frame + aten op + input shapes (trace from `run1.sh` with
+  `WITH_STACK=1 RECORD_SHAPES=1`); `profile/parity_env.py <preset> <B> <L> <ENV> <v1,v2> [xext]` loss /
+  grad-norm / per-param parity between values of an env var; `profile/gamma_check.py <xext dir>` checks and
+  times the extension's norm backward (old vs rebuilt .so). `run1.sh` / `fsdp_trace.py` take `XEXT` (extension
+  dir) and `RECORD_SHAPES`; `prof_step.py` honours `TN_BACKEND` and `CFG_<field>`.
+- **`conv/`**: the two conv1d drafts and their tests (`test_conv.py`, `test_conv_s.py` vs the reference and
+  Triton kernels), `conv_once.py` (ncu driver), `conv_bisect.py` (CPU-only compile bisect of DSL errors).
 - **`tsdn/`**: check, bench, sweep and profile scripts for TSDN. `cubext/` builds the CUB baseline.
 - **`common/ncu_src.sh <tag> [shape] [cfg]`**: source-level ncu stall breakdown. Set `NCU`, `KNAME` (kernel regex) and `SCRIPT` (a driver such as `../awm/ncu_awm.py`), plus `SRC` and `NLINES`. It uses `CUTE_DSL_LINEINFO=1` and `--import-source yes`. `src_an.py` aggregates per source line.
 
@@ -474,6 +557,18 @@ Not copied, because they are large or can be regenerated:
 - the Gecko paper, arXiv 2601.06463
 
 ## 8. Lessons (details in `handoff/memory/`)
+
+### CuTe DSL 4.8.1 pitfalls (additions from §6d)
+
+- `cute.make_rmem_tensor(layout, dtype)` is the register array (no `make_fragment`); index elements for
+  pair-wise math (rope), `.load()` / `.store()` for vector ops.
+- Python `and` / `or` on DSL values inside kernels breaks IR dominance: use `&` on comparisons. A `.load()` SSA
+  vector consumed in a loop under a `const_expr` branch failed the same way: stage it in an rmem tensor.
+- `exp` / `rsqrt` with `fastmath=False` are slow software sequences; `fastmath=True` (MUFU) is what the torch
+  kernels effectively use.
+- Vector loads need `.align(bytes)` that is a power of two (8 elements bf16 = 16 bytes).
+- Every process compiles every kernel it uses (seconds each): in multi-rank runs pre-compile data-dependent
+  paths, or a rank's first use stalls the whole step.
 
 ### CuTe DSL 4.8.1 pitfalls
 

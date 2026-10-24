@@ -19,7 +19,11 @@ from xllm.models.gekko import Gekko
 from xllm.configuration import ConfStore
 class Tok: bos_id, eos_id, pad_id, vocab_size, n_words = 1, 2, 0, 32000, 32000
 cfg = ConfStore[preset]; cfg.vocab_size = Tok.vocab_size; cfg.fused_block = True
-cfg.awm_backend = os.environ.get("AWM_BACKEND", "cute")
+cfg.awm_backend = os.environ.get("AWM_BACKEND", "cute"); cfg.timenorm_backend = os.environ.get("TN_BACKEND", "cub")
+for k, v in os.environ.items():
+    if k.startswith("CFG_"):
+        cur = getattr(cfg, k[4:]); setattr(cfg, k[4:], (v == "1") if isinstance(cur, bool) else type(cur)(v))
+torch.backends.cuda.matmul.allow_tf32 = True
 torch.manual_seed(0)
 model = Gekko(cfg, Tok()).cuda().to(torch.bfloat16); model.train()
 print(f"{preset}: H={cfg.num_heads} K={cfg.num_kv_heads} S={cfg.head_dim} V={cfg.v_head_dim} C={cfg.chunk_size} dim={cfg.model_dim} "

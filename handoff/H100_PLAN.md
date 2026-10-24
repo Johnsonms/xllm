@@ -28,6 +28,15 @@ rewrite; "P" marks code that should port with small changes.
 | `ScaPmat`, `ScaDsMat` + cuBLAS bmm (default for V > 256 when > 50% of the window is attended) | same | `ScaBwdDv` v-slab path, `ScaBwdDk`, `ScaBwdDq` | materialized bf16 P and dS = P (dP - delta) (chunk-major [C x 2C]); dV, dK, dQ as two bmm per chunk each; chosen per call from qmax | 7.1B backward 6.13 -> 4.16 ms/layer (no boundaries) | B for ScaPmat (q in TMEM); ScaDsMat is a plain memory kernel (P); the cuBLAS path is portable as is |
 | `ChunkMajorCopy`, `ChunkMajorUncopy`, `RowDot` | same | torch permute copies / fp32 casts | layout copies (~1.7 TB/s in torch) and delta = rowsum(dO * y) | ~2.4 ms/layer saved on 7.1B | P (plain memory kernels) |
 | host: `segment_starts` / `query_limits` (cached), `_use_pmat_dv` | same | - | per-row key ranges from segment_idx; path choice with one sync | - | P |
+| `ScaBwdDvT`, `ScaBwdDkT`, `ScaBwdDqT(q_smem)` (default for S + V > 256, V <= 256 and the 7.1B dV) | same | `ScaBwdDv`, `ScaBwdDk`, `ScaBwdDq` for S = V = 256 | TMEM-A variants with one operand left in smem to fit 512 columns; 32-query / 32-key stages | 0.9B bwd 2972 -> 2489 us/layer; 7.1B dV 1106 -> 977 | B (nothing to port: on Hopper all operands are in smem anyway; the FA3 backward structure applies) |
+| `_bmm_tril_*`, `_bmm_triu_nt`, `_compile_bwd_paths`, DP threshold | same | dense cuBLAS GEMMs over causal blocks | 4 x 4 sub-blocked bmm; both paths compiled at the first call; GEMM path from fraction 0.35 under data parallelism | 7.1B bwd 4.16 -> 3.76 ms/layer; 8 GPUs 1017 -> 884 ms | P (host code, portable as is) |
+| `Rope` | `rope.py` | `apply_rope` / `apply_ropes` (torch, 4-5 passes) | one bf16 pass, fp32 math from the (cos, sin) table | 0.9B step 527 -> 469 ms | P (plain memory kernel; any CUDA / Triton version works) |
+| `QkPrepFwd` / `QkPrepBwd` | `qk_prep.py` | rmsnorm + rope + fp32 softmax and their backward | warp per head row, partials in registers | 0.9B 433 -> 379, 4B 381 -> 368 | P |
+| `AttnGateFwd` / `Bwd` | `attn_gate.py` | add + rmsnorm + softplus gate + mul and backward | 1-8 warps per row, torch roundings reproduced | 0.9B 379 -> 356, 4B 368 -> 334, 7.1B 893 -> 852 | P |
+| `SwigluFwd` / `Bwd` | `swiglu.py` | silu * h3; recompute + silu_backward + 2 muls | 3 / 6 passes | 7.1B 813 -> 798 | P |
+| `CeLogits` | `cross_entropy.py` | ~12 torch ops per logits chunk | CTA per row: loss + fp32 / bf16 scores | 0.9B 352 -> 338 | P |
+| `LnFwd` / `LnBwd` | `layer_norm.py` | extension GroupLayerNorm | C / 256 warps per row | 0.9B 348 -> 335, 7.1B 850 -> 826 | P |
+| csrc `GammaBwdLargeKernel` / `GammaBetaBwdLargeKernel` | `xllm/csrc/ops/group_*_norm_kernel.cu` | the same kernels (32-64 blocks) | row-split, 16-byte loads, fp32 partials + finalize | 0.9B 469 -> 433, 7.1B 924 -> 910 | P (identical CUDA; rebuild the extension) |
 
 Not kernels, but part of the B200 result (section 2): the `create_on_gpu` default-device fix, `fsdp_layers_per_group`,
 the profiling scripts.
@@ -184,6 +193,21 @@ baseline profile if it disagrees.
   and GEMM costs scale differently). Do not fuse dS into the P kernel (three variants were slower on B200: the
   strided fp32 dP reads are latency bound). Check cuBLAS GEMM efficiency on H100 for the 7.1B shapes (dim
   4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak.
+
+### 3.7 Elementwise and norm fusions (HANDOFF §6d): second-largest item after SCA on 0.9B / 4B
+
+- **B200:** the per-op attribution (`profile/opattr.py` on a `RECORD_SHAPES=1` trace) showed 55% of the 0.9B
+  kernel time in elementwise / norm / copy kernels. Seven fused kernels (rope, q/k prep, attention gate,
+  swiglu, cross-entropy chunk, layernorm) and a fix of the extension's norm weight-gradient kernels took the
+  0.9B step 469 -> 335 ms, 4B 390 -> 325, 7.1B 924 -> 826; all are memory-bound kernels at 4-6.5 TB/s on B200.
+- **H100 plan:** all of them are plain memory kernels and port as they are (lower the per-SM thread counts
+  only if occupancy limits show up); the gains scale with H100's 3.35 TB/s vs 8 TB/s, so the share of the step
+  they save is similar or larger. Do the csrc gamma fix first (it is a rebuild, no port), then rope and q/k
+  prep (largest), then the gate, swiglu, CE, layernorm. Keep each behind its env switch and validate with
+  `profile/parity_env.py` (loss to 1e-4, grad norms to 1e-3) and the unit tests in `tests/test_cute_*.py`.
+- **Not done:** the causal conv1d (Triton, ~2.3 TB/s, 20 / 34 / 18 ms per step on 0.9B / 7.1B / 4B); two CuTe
+  drafts in `handoff/scripts/conv/` are correct but slower (latency bound). On H100 the Triton kernel's share
+  grows; a TMA-tile + time-parallel design is the next attempt.
 
 ## 4. How to work (what worked on B200)
 
