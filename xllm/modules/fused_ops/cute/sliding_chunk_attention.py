@@ -1503,7 +1503,8 @@ class ScaBwdDk:
                 cute.arch.fence_view_async_tmem_store()
                 v_bar.arrive_and_wait()
             # dP^T matrices of this key tile's chunk (load_dp mode): rows = keys of chunk ck, columns = queries
-            m_idx = Int64((ck * B + b) * H) * C * C  # + h * C * C per head
+            m_cur = Int64((b * nc + ck) * H) * C * C  # + h * C * C per head: dPcur [B, nc, H, C, C]
+            m_prev = Int64((b * (nc - 1) + ck) * H) * C * C  # dPprev [B, nc - 1, H, C, C], index ck = c - 1
             dp_row = Int64(kpos - ck * C) * C
             # S^T / dP^T loads (QB columns of this thread's row)
             ld_s = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(QB), tcgen05.Pack.NONE), Float32)
@@ -1575,9 +1576,9 @@ class ScaBwdDk:
                 # dS^T = P^T (dP^T - delta) scale
                 if const_expr(self.load_dp):
                     cq = q0 // C
-                    dp_base = pDPcur + (m_idx + Int64(h) * C * C + dp_row + Int64(q0 - cq * C))
+                    dp_base = pDPcur + (m_cur + Int64(h) * C * C + dp_row + Int64(q0 - cq * C))
                     if cq != ck:
-                        dp_base = pDPprev + (m_idx + Int64(h) * C * C + dp_row + Int64(q0 - cq * C))
+                        dp_base = pDPprev + (m_prev + Int64(h) * C * C + dp_row + Int64(q0 - cq * C))
                     for e4 in cutlass.range_constexpr(QB // 4):
                         cute.make_tensor(xd.iterator + e4 * 4, cute.make_layout(4)).store(
                             cute.make_tensor((dp_base + e4 * 4).align(16), cute.make_layout(4)).load())
@@ -2559,7 +2560,7 @@ class ScaBwdDvT:
 @cute.jit
 def _dk_block(masked, load_dp, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_elems,
               t2r_s0, t2r_s1, tTR_s0, tTR_s1, t2r_dp0, t2r_dp1, tTR_dp0, tTR_dp1, xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, dbg,
-              pDPc, pDPp, dp_off, ck, h, C):
+              pDPc, pDPp, dp_off, dp_off_p, ck, h, C):
     """One block of ScaBwdDkT for compute group g: P^T = exp2(S^T scale2 - lse2) (masked variant: -inf outside the
     key's queries), dS^T = P^T (dP^T - delta) into the shared-memory A operand of dK; the S^T and dP^T stages are
     released by the warps after their loads. load_dp: dP^T is read from the host-side fp32 GEMMs (V > 256) instead
@@ -2578,7 +2579,7 @@ def _dk_block(masked, load_dp, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel,
         cq = q0 // C
         dp_base = pDPc + (dp_off + Int64(h) * C * C + Int64(q0 - cq * C))
         if cq != ck:
-            dp_base = pDPp + (dp_off + Int64(h) * C * C + Int64(q0 - cq * C))
+            dp_base = pDPp + (dp_off_p + Int64(h) * C * C + Int64(q0 - cq * C))
         for e4 in cutlass.range_constexpr(QB // 4):
             cute.make_tensor(xd.iterator + e4 * 4, cute.make_layout(4)).store(
                 cute.make_tensor((dp_base + e4 * 4).align(16), cute.make_layout(4)).load())
@@ -3003,7 +3004,8 @@ class ScaBwdDkT:
             nxt_del = cute.make_rmem_tensor(cute.make_layout(NL), Float32)
             nxt_km = cute.make_rmem_tensor(cute.make_layout(NL), Int32)
             nxt_kml = Int32(0)
-            dp_off = Int64((ck * B + b) * H) * C * C + Int64(kpos - ck * C) * C  # + h C C: this key row of dPcur / dPprev
+            dp_off = Int64((b * nc + ck) * H) * C * C + Int64(kpos - ck * C) * C  # + h C C: this key row of dPcur [B, nc, H, C, C]
+            dp_off_p = Int64((b * (nc - 1) + ck) * H) * C * C + Int64(kpos - ck * C) * C  # of dPprev [B, nc - 1, H, C, C]
             if n_own > 0:
                 h = kh * self.n_rep + r
                 for u in cutlass.range_constexpr(NL):
@@ -3040,12 +3042,12 @@ class ScaBwdDkT:
                     ph_sf, ph_dpf, ph_dse = _dk_block(
                         True, self.load_dp, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_stage_elems,
                         t2r_s[0], t2r_s[1], tTR_s[0], tTR_s[1], t2r_dp[0], t2r_dp[1], tTR_dp[0], tTR_dp[1],
-                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg, pDPcur, pDPprev, dp_off, ck, h_cur, C)
+                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg, pDPcur, pDPprev, dp_off, dp_off_p, ck, h_cur, C)
                 else:
                     ph_sf, ph_dpf, ph_dse = _dk_block(
                         False, self.load_dp, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_stage_elems,
                         t2r_s[0], t2r_s[1], tTR_s[0], tTR_s[1], t2r_dp[0], t2r_dp[1], tTR_dp[0], tTR_dp[1],
-                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg, pDPcur, pDPprev, dp_off, ck, h_cur, C)
+                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg, pDPcur, pDPprev, dp_off, dp_off_p, ck, h_cur, C)
                 qb = qb_n
                 r = r_n
             cute.arch.mbarrier_wait(raw + DONE, Int32(0))
@@ -3069,6 +3071,7 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     K, V = v.shape[2], v.shape[3]
     C = chunk_size
     nc = L // C
+    n_rep = H // K
     dev = q.device
     dout = dout.contiguous()
     # delta[b, h, q] = sum_v dO O
@@ -3097,7 +3100,6 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         # The cost is that of dense [C x C] GEMMs, so this path only wins when most of the window is attended (few
         # segment boundaries): 7.1B, B200, per layer without boundaries dV 2.9 -> 1.5 ms, dK + dQ 1.8 -> 1.0 ms;
         # with 7 segments per 16K tokens the kernels take 1.1 / 0.9 ms.
-        n_rep = H // K
         pm = torch.empty(nc, B, H, C, 2 * C, dtype=torch.bfloat16, device=dev)  # the kernel also writes the zeros
         f_pm = _compiled(("sca_pmat", H, K, S, C), lambda: ScaPmat(H, K, S, C), lambda: (
             _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
@@ -3169,17 +3171,20 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     f_dv(q.reshape(-1), k.reshape(-1), dout.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), qmax.reshape(-1), dv.reshape(-1),
          B, L, float(scale * LOG2E))
     if V > 256:
-        # dP for the dK / dQ kernels (fp32 GEMMs): dPcur[(c, b, h)] = V_c dO_c^T, dPprev[(c - 1, b, h)] = V_{c-1} dO_c^T
-        vc = _chunk_major(v, H, K, V, C, B, L, nc, dev)  # heads repeated
-        doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
-        # dPcur is only read where the query attends the key (query >= key): the sub-blocks below the diagonal are
-        # zeroed instead of computed (the kernels multiply them by P^T = 0)
-        dp_cur = torch.empty(nc, B, H, C, C, dtype=torch.float32, device=dev)
-        _bmm_triu_nt(vc, doc, dp_cur, C, _tril_sub(C))
-        if nc > 1:
-            dp_prev = torch.bmm(vc[:-1].reshape(-1, C, V), doc[1:].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
-        else:
-            dp_prev = dp_cur
+        # dP for the dK / dQ kernels (fp32 GEMMs): dPcur[b, c, h] = V_c dO_c^T, dPprev[b, c - 1, h] = V_{c-1} dO_c^T,
+        # per head on strided views of v and dout (the chunk and batch dims of a head collapse into one batch
+        # stride, so no chunk-major copies). dPcur is only read where the query attends the key (query >= key):
+        # the sub-blocks below the diagonal are zeroed instead of computed (the kernels multiply them by P^T = 0)
+        dp_cur = torch.empty(B, nc, H, C, C, dtype=torch.float32, device=dev)
+        dp_prev = torch.empty(B, nc - 1, H, C, C, dtype=torch.float32, device=dev) if nc > 1 else dp_cur
+        n_sub = _tril_sub(C)
+        for h in range(H):
+            vv = v[:, :, h // n_rep, :].view(B, nc, C, V)
+            dd = dout[:, :, h, :].view(B, nc, C, V)
+            _bmm_triu_nt(vv, dd, dp_cur[:, :, h], C, n_sub)
+            if nc > 1:
+                for bi in range(B):
+                    torch.bmm(vv[bi, :-1], dd[bi, 1:].transpose(1, 2), out_dtype=torch.float32, out=dp_prev[bi, :, h])
     else:
         dp_cur = dp_prev = torch.zeros(1, dtype=torch.float32, device=dev)
     dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
@@ -3242,15 +3247,15 @@ def _bmm_tril_nt(x, y, out, C, n):
 
 
 def _bmm_triu_nt(x, y, out, C, n):
-    """out[(c, b, h)][i-th row block, i c:] = x[i-th row block] y[i c:]^T (fp32 out [nc, B, H, C, C]), the sub-blocks
-    below the diagonal set to zero."""
+    """out[..., i-th row block, i c:] = x[..., i-th row block, :] y[..., i c:, :]^T (fp32 out [..., C, C]), the sub-blocks
+    below the diagonal set to zero; the batch dims of x, y and out must collapse into one stride."""
     c = C // n
     for i in range(n):
-        a = x[:, :, :, i * c:(i + 1) * c].reshape(-1, c, x.shape[-1])
-        b = y[:, :, :, i * c:].reshape(-1, C - i * c, y.shape[-1]).transpose(1, 2)
-        torch.bmm(a, b, out_dtype=torch.float32, out=out[:, :, :, i * c:(i + 1) * c, i * c:].reshape(-1, c, C - i * c))
+        a = x[..., i * c:(i + 1) * c, :].reshape(-1, c, x.shape[-1])
+        b = y[..., i * c:, :].reshape(-1, C - i * c, y.shape[-1]).transpose(1, 2)
+        torch.bmm(a, b, out_dtype=torch.float32, out=out[..., i * c:(i + 1) * c, i * c:].reshape(-1, c, C - i * c))
         if i > 0:
-            out[:, :, :, i * c:(i + 1) * c, :i * c].zero_()
+            out[..., i * c:(i + 1) * c, :i * c].zero_()
 
 
 def _dkt_fits(S, V):
@@ -3635,8 +3640,8 @@ class ScaBwdDq:
                 do_bar.arrive_and_wait()
             # dP matrices (load_dp mode): dPcur[(c, b, h)][key - cC][q - cC], dPprev[(c - 1, b, h)][key - (c-1)C][q - cC]
             q_in = Int64(qpos - c * C)
-            cur_base = pDPcur + (Int64((c * B + b) * H + h) * C * C + q_in)
-            prev_base = pDPprev + (Int64(((c - 1) * B + b) * H + h) * C * C + q_in)
+            cur_base = pDPcur + (Int64((b * nc + c) * H + h) * C * C + q_in)  # dPcur [B, nc, H, C, C]
+            prev_base = pDPprev + (Int64((b * (nc - 1) + (c - 1)) * H + h) * C * C + q_in)  # dPprev [B, nc - 1, H, C, C]
             ld_s = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(KB), tcgen05.Pack.NONE), Float32)
             tS_r = cute.flat_divide(tS[((None, None), 0, 0)], (self.TM, KB))
             tDP_r = cute.flat_divide(tDP[((None, None), 0, 0)], (self.TM, KB))
@@ -4155,8 +4160,8 @@ class ScaBwdDqT:
             ph_dse = Int32(1)
             # dP matrices (load_dp): dPcur[(c, b, h)][key - cC][q - cC], dPprev[(c - 1, b, h)][key - (c-1)C][q - cC]
             q_in = Int64(qpos - c * C)
-            cur_base = pDPcur + (Int64((c * B + b) * H + h) * C * C + q_in)
-            prev_base = pDPprev + (Int64(((c - 1) * B + b) * H + h) * C * C + q_in)
+            cur_base = pDPcur + (Int64((b * nc + c) * H + h) * C * C + q_in)  # dPcur [B, nc, H, C, C]
+            prev_base = pDPprev + (Int64((b * (nc - 1) + (c - 1)) * H + h) * C * C + q_in)  # dPprev [B, nc - 1, H, C, C]
             for t in cutlass.range(n_own):
                 j = g + 2 * t
                 bstart = kstart + (kb_lo + j) * KB
