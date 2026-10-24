@@ -80,6 +80,16 @@ def _cute_qk(x: torch.Tensor, groups: int, rope_head_dim: int, freqs_cis: Option
     return qk_prep_supported(x, groups, r)
 
 
+def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
+    """Whether the fused CuTe DSL attention output gate (rmsnorm(sca + awk) * gate(rmx) and its backward; Blackwell,
+    bf16, no hidden dropout; env XLLM_CUTE_GATE=0 disables it) handles this input."""
+    try:
+        from xllm.modules.fused_ops.cute.attn_gate import attn_gate_supported
+    except ImportError:
+        return False
+    return attn_gate_supported(x, heads, gate, dropout)
+
+
 class GekkoBlockFunction(torch.autograd.Function):
     """
 
@@ -342,14 +352,14 @@ class GekkoBlockFunction(torch.autograd.Function):
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = attn_gate_fn(F.linear(mx, wr, br))
+            rmx = F.linear(mx, wr, br)
         else:
             sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = attn_gate_fn(F.linear(mx, wr, br))
+            rmx = F.linear(mx, wr, br)
 
             if handle_memory is not None:
                 handle_memory.wait()
@@ -384,9 +394,16 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
-        attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
-        attn = torch.mul(attn, r, out=attn)
-        attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
+        if _cute_gate(sca_out, local_heads, attn_gate_func, hidden_dropout):
+            # add, per-head rmsnorm, gate activation and multiply in one pass
+            from xllm.modules.fused_ops.cute.attn_gate import attn_gate_fwd
+            attn = attn_gate_fwd(sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps)
+            attn_out_rng_state = None
+        else:
+            r = attn_gate_fn(rmx)
+            attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
+            attn = torch.mul(attn, r, out=attn)
+            attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
         # B x L x E -> B x L x D
         xh, _ = reduce_scatter(F.linear(attn, wo, None), parallel_region='model', async_op=False)
@@ -790,10 +807,12 @@ class GekkoBlockFunction(torch.autograd.Function):
         # recompute attn out
         # B x L x E
         rmx = F.linear(mx, wr, br)
-        r = attn_gate_fn(rmx)
-        attn_norm, attn_rstd = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
-        attn = torch.mul(attn_norm, r, out=awk_out)
-        attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
+        cute_gate = _cute_gate(sca_out, local_heads, attn_gate_func, hidden_dropout)
+        if not cute_gate:
+            r = attn_gate_fn(rmx)
+            attn_norm, attn_rstd = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
+            attn = torch.mul(attn_norm, r, out=awk_out)
+            attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
             handle_xh.wait()
@@ -801,9 +820,14 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # B x L x E
         attn_grad = xh_grad.matmul(wo)
-        attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
-        attn_norm_grad = torch.mul(attn_grad, r, out=r)
-        sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
+        if cute_gate:
+            # the recompute of the gate, its backward and the memory-efficient rmsnorm backward in one pass
+            from xllm.modules.fused_ops.cute.attn_gate import attn_gate_bwd
+            sca_out_grad, rmx_grad, attn = attn_gate_bwd(attn_grad, sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps, want_attn=True)
+        else:
+            attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
+            attn_norm_grad = torch.mul(attn_grad, r, out=r)
+            sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
         # B x L x H x E -> B x H x L x E
@@ -896,9 +920,12 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_conv_v = None
 
         # B x L x E
-        r_grad = torch.mul(attn_grad, attn_norm, out=attn_grad)
-        # B*L x D
-        rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
+        if cute_gate:
+            rmx_grad = rearrange(rmx_grad, 'b l d -> (b l) d')
+        else:
+            r_grad = torch.mul(attn_grad, attn_norm, out=attn_grad)
+            # B*L x D
+            rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
         mx_grad = torch.mm(rmx_grad, wr)
 
         # B x H x L x S -> B x L x H x S
