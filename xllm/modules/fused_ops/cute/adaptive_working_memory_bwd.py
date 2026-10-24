@@ -603,16 +603,18 @@ class AwmBwdDelta:
 
 
 class AwmZeroTail:
-    """Zero the rows of the last chunk of dqk, dk [B, L, K, S] and dv [B, L, K, V] (no update uses them)."""
+    """Zero the rows of the last chunk of dqk, dk [B, L, K, S] and dv [B, L, K, V] (no update uses them); with
+    ``skip_dv`` dv is left alone (it accumulates into another gradient)."""
 
-    def __init__(self, K: int, S: int, V: int, C: int):
+    def __init__(self, K: int, S: int, V: int, C: int, skip_dv: bool = False):
         self.K, self.S, self.V, self.C = K, S, V, C
+        self.skip_dv = skip_dv
         self.threads = 256
 
     @cute.jit
     def __call__(self, tDQK: cute.Tensor, tDK: cute.Tensor, tDV: cute.Tensor, B: Int32, L: Int32, stream: cuda.CUstream):
         n1 = B * self.C * self.K * self.S // 8
-        n2 = B * self.C * self.K * self.V // 8
+        n2 = 0 if cutlass.const_expr(self.skip_dv) else B * self.C * self.K * self.V // 8
         grid = (n1 + n2 + self.threads - 1) // self.threads
         self.kernel(tDQK.iterator, tDK.iterator, tDV.iterator, L, n1, n2).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
 
@@ -1218,7 +1220,7 @@ def _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V
     dv[:, :nu * C] = back(torch.bmm(pt.transpose(1, 2), dB), V)
 
 
-def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg):
+def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg, dv_accumulate=False):
     """AwmChunkBwd on Hopper (AwmChunkBwdSm90): rows of each update chunk outside the segment of its last row drop."""
     B, L = k.shape[0], k.shape[1]
     nu = w["nu"]
@@ -1232,7 +1234,7 @@ def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, 
         lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
     sm90 = fwd._sm90()
     c2 = (dlse - delta).contiguous()
-    f = _compiled(("chunkb90", K, S, V, C), lambda: sm90.AwmChunkBwdSm90(K, S, V, C), lambda: (
+    f = _compiled(("chunkb90", K, S, V, C, dv_accumulate), lambda: sm90.AwmChunkBwdSm90(K, S, V, C, dv_accumulate), lambda: (
         *[_fake(BFloat16) for _ in range(5)], _fake(Float32), _fake(Float32), _fake(Int32, 4),
         *[_fake(BFloat16) for _ in range(3)], *([Int32(0)] * 3)))
     f(k.reshape(-1), qk.reshape(-1), v.reshape(-1), dA16.reshape(-1), dB16.reshape(-1), lse2.reshape(-1),
@@ -1316,22 +1318,25 @@ def _recurrence_bwd_sm100(w, dMo, dmem, K, S, V, C, has_prev, has_seg, n_vt):
     return dB16, drp, gmem
 
 
-def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
-    """dqk, dk [B, L, K, S] and dv [B, L, K, V] (bf16) for the update chunks (rows of the last chunk are 0)."""
+def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg, dv_acc=None):
+    """dqk, dk [B, L, K, S] and dv [B, L, K, V] (bf16) for the update chunks (rows of the last chunk are 0).
+    ``dv_acc`` ([B, L, K, V] bf16, contiguous): dv is added into it and returned (TMA reduce-add stores on Hopper)."""
     B, L = k.shape[0], k.shape[1]
     nu = max(w["nu"], 1)
     dev = k.device
     dqk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
     dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
-    dv = torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
-    f_zero = _compiled(("zerotail", K, S, V, C), lambda: AwmZeroTail(K, S, V, C), lambda: (
+    fused_acc = (dv_acc is not None and w["nu"] > 0 and _is_hopper(dev) and not _fwd_mod()._AWM_SM90_CUBLAS
+                 and min(S, 256) == min(V, 256))
+    dv = dv_acc if fused_acc else torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
+    f_zero = _compiled(("zerotail", K, S, V, C, fused_acc), lambda: AwmZeroTail(K, S, V, C, fused_acc), lambda: (
         _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
     f_zero(dqk.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L)  # the last chunk has no update
     if w["nu"] > 0 and _is_hopper(dev):
         if _fwd_mod()._AWM_SM90_CUBLAS or min(S, 256) != min(V, 256):
             _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
         else:
-            _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
+            _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg, fused_acc)
     elif w["nu"] > 0:
         f = _compiled(("chunkb", K, S, V, C, w["R_splits"], has_seg), lambda: AwmChunkBwd(K, S, V, C, w["R_splits"], has_seg),
                       lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32),
@@ -1341,6 +1346,8 @@ def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
         f(qk.reshape(-1), k.reshape(-1), v.reshape(-1), dA16.reshape(-1), dB16.reshape(-1), w["part"].reshape(-1), delta.reshape(-1),
           dlse.reshape(-1), w["seg"].reshape(-1), dqk.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L, nu, w["seg_off"], w["seg_stride"],
           min(num_tiles, _sm_count(dev)))
+    if dv_acc is not None and not fused_acc:
+        dv = torch.add(dv_acc, dv, out=dv_acc)
     return dqk, dk, dv
 
 
@@ -1370,14 +1377,18 @@ def awm_bwd_prepare(query, qkey, key, value, chunk_size, segment_idx=None, recom
     return state, out
 
 
-def awm_bwd_finish(state, out_grad, memory_grad=None, log_norm_term_grad=None):
+def awm_bwd_finish(state, out_grad, memory_grad=None, log_norm_term_grad=None, dv_acc=None):
     """Second half: phases 3', 2' and 1'. Returns dq [B, H, L, S], dqk / dk [B, K, L, S], dv [B, K, L, V] (bf16,
-    views of [B, L, *, D] storage) and None, None for the gradients of the absent input memory / normalizer."""
+    views of [B, L, *, D] storage) and None, None for the gradients of the absent input memory / normalizer.
+    ``dv_acc`` ([B, L, K, V] bf16, contiguous): another gradient of v that dv is added into (returned as dv)."""
     w, H, K, S, V, C, has_seg = (state[n] for n in ("w", "H", "K", "S", "V", "C", "has_seg"))
     dout = _blhs(out_grad.to(torch.bfloat16))
     dq, out_mask, dMo = _phase3_bwd(dout, state["q"], w, H, K, S, V, C, False, has_seg)
     dB16, dA16, delta, dlse, _, _ = _phase2_bwd(w, dMo, memory_grad, log_norm_term_grad, K, S, V, C, False, has_seg)
-    dqk, dk, dv = _phase1_bwd(w, dA16, dB16, delta, dlse, state["qk"], state["k"], state["v"], K, S, V, C, has_seg)
+    if dv_acc is not None and not (dv_acc.is_contiguous() and dv_acc.dtype == torch.bfloat16 and dv_acc.dim() == 4):
+        dv_acc = None
+    dqk, dk, dv = _phase1_bwd(w, dA16, dB16, delta, dlse, state["qk"], state["k"], state["v"], K, S, V, C, has_seg,
+                              dv_acc=dv_acc)
     return dq.transpose(1, 2), dqk.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), None, None
 
 

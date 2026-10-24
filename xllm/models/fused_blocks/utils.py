@@ -83,7 +83,10 @@ def timenorm_bwd(
     eps: float,
     memory_efficient: bool,
     backend: str,
+    residual: Optional[Tensor] = None,
 ):
+    """``residual``: a gradient added to x_grad. The cute kernel reduce-adds its dx into it (``residual`` is
+    overwritten and returned as x_grad); the other backends add afterwards."""
     gamma = gamma + 1.0
     if backend == 'cute':
         assert not memory_efficient
@@ -91,8 +94,12 @@ def timenorm_bwd(
         # per-step counts are recomputed from prev_count and the bos mask
         x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_decay_norm_bwd(
             y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, getattr(cummean, "_xllm_step_count", None),
-            gamma, None, num_groups, beta1, beta2, prev_count=prev_count
+            gamma, None, num_groups, beta1, beta2, prev_count=prev_count,
+            residual=residual if residual is not None and residual.is_contiguous() and residual.dtype == x_or_y.dtype else None,
         )
+        if residual is not None and x_grad is not residual:
+            x_grad = torch.add(x_grad, residual, out=x_grad)
+        return x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad
     elif backend == 'cub':
         assert not memory_efficient
         x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = xllm_ops.group_timestep_decay_norm_cub_bwd(
@@ -104,6 +111,8 @@ def timenorm_bwd(
             y_grad, mean_grad, var_grad, x_or_y, prev_count, bos_mask, cummean, cumrstd,
             gamma, beta, None, num_groups, beta1, beta2, eps, memory_efficient
         )
+    if residual is not None:
+        x_grad = torch.add(x_grad, residual, out=x_grad)
     return x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad
 
 

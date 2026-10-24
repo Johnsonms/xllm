@@ -212,3 +212,20 @@ def test_backward_from_saved_workspace():
     g2 = awm_bwd.adaptive_working_memory_bwd(dout, None, None, q, qk, k, v, C, seg)
     for a, b in zip(g1[:4], g2[:4]):  # the split-K reduce-adds are not bitwise deterministic
         assert rel_err(a, b.double()) < 1e-2
+
+
+@pytest.mark.parametrize("S,V", [(128, 128), (256, 256)])
+def test_backward_dv_accumulate(S, V):
+    """awm_bwd_finish(dv_acc=...) adds dv into the given [B, L, K, V] gradient (TMA reduce-add stores on Hopper)."""
+    B, H, K, L, C = 2, 4, 2, 1024, 256
+    q, qk, k, v, _, _, _, _, _, seg, _ = make_inputs(B, H, K, S, V, L, C, False, 0.5)
+    dout = torch.randn(B, L, H, V, device="cuda").to(torch.bfloat16).transpose(1, 2)
+    state, _ = awm_bwd.awm_bwd_prepare(q, qk, k, v, C, seg)
+    g1 = awm_bwd.awm_bwd_finish(state, dout)
+    other = torch.randn(B, L, K, V, device="cuda").to(torch.bfloat16)
+    acc = other.clone()
+    g2 = awm_bwd.awm_bwd_finish(state, dout, dv_acc=acc)
+    assert g2[3].data_ptr() == acc.data_ptr()
+    assert rel_err(g2[3], (g1[3].double() + other.transpose(1, 2).double())) < 1e-2
+    for a, b in zip(g1[:3], g2[:3]):
+        assert rel_err(a, b.double()) < 1e-2

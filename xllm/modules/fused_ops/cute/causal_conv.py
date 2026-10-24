@@ -31,6 +31,7 @@ VEC = 8
 T = 32
 U = 4  # timesteps per loop iteration (independent loads in flight)
 WIDTH = 4
+HALO = WIDTH - 1
 assert T % U == 0 and U >= WIDTH - 1
 
 
@@ -154,6 +155,13 @@ class ConvFwd:
 
 
 class ConvBwd:
+    """Backward: g = out_grad * silu'(pre) (pre recomputed), dx[t] = sum_lag w[W - 1 - lag] g[t + lag] [valid], and the
+    per-tile weight-gradient partials. A thread owns VB = 4 channels and walks 4 rows per iteration with the last 3 x
+    and g rows in bf16 registers (dx[t - 3] once g[t] is known); packed f32x2 math, mask-free path when no boundary
+    is within the 9-row neighbourhood. Opt-in (XLLM_CUTE_CONV_BWD=1): slower than Triton's backward on B200."""
+
+    VB = 4
+
     def __init__(self, act: bool, has_bos: bool):
         self.act, self.has_bos = act, has_bos
 
@@ -161,112 +169,167 @@ class ConvBwd:
     def __call__(self, tG: cute.Tensor, tX: cute.Tensor, tW: cute.Tensor, tBos: cute.Tensor, tDx: cute.Tensor, tPart: cute.Tensor,
                  B: Int32, L: Int32, D: Int32, stream: cuda.CUstream):
         n_tiles = (L + T - 1) // T
+        VB = self.VB
         self.kernel(tG.iterator, tX.iterator, tW.iterator, tBos.iterator, tDx.iterator, tPart.iterator, L, D, n_tiles).launch(
-            grid=[(D + THREADS * VEC - 1) // (THREADS * VEC), n_tiles, B], block=[THREADS, 1, 1], stream=stream)
+            grid=[(D + THREADS * VB - 1) // (THREADS * VB), n_tiles, B], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, pG: cute.Pointer, pX: cute.Pointer, pW: cute.Pointer, pBos: cute.Pointer, pDx: cute.Pointer, pPart: cute.Pointer,
                L: Int32, D: Int32, n_tiles: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, b = cute.arch.block_idx()
-        c = (bx * THREADS + tidx) * VEC
+        VB = self.VB
+        c = (bx * THREADS + tidx) * VB
         if c < D:
             t0 = by * T
             base = pX + Int64(b) * L * D + c
             gbase = pG + Int64(b) * L * D + c
             dbase = pDx + Int64(b) * L * D + c
             bbase = pBos + Int64(b) * L
-            w = cute.make_rmem_tensor(cute.make_layout((WIDTH, VEC)), Float32)
+            w = cute.make_rmem_tensor(cute.make_layout((WIDTH, VB)), Float32)  # w[lag, k] = weight[W - 1 - lag, c + k]
             for lag in cutlass.range_constexpr(WIDTH):
-                wl = cute.make_tensor((pW + ((WIDTH - 1 - lag) * D + c)).align(32), cute.make_layout(VEC)).load()
-                for k in cutlass.range_constexpr(VEC):
+                wl = cute.make_tensor((pW + ((WIDTH - 1 - lag) * D + c)).align(16), cute.make_layout(VB)).load()
+                for k in cutlass.range_constexpr(VB):
                     w[lag, k] = wl[k]
-            xw = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1, VEC)), Float32)  # x[t - 1 - j]
-            gw = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1, VEC)), Float32)  # g[t - 1 - j]
-            dw = cute.make_rmem_tensor(cute.make_layout((WIDTH, VEC)), Float32)
-            flags = cute.make_rmem_tensor(cute.make_layout(WIDTH - 1), Float32)  # bos[t - 1 - j]
+            dw = cute.make_rmem_tensor(cute.make_layout((WIDTH, VB)), Float32)
             for lag in cutlass.range_constexpr(WIDTH):
-                for k in cutlass.range_constexpr(VEC):
+                for k in cutlass.range_constexpr(VB):
                     dw[lag, k] = 0.0
-            for j in cutlass.range_constexpr(WIDTH - 1):
+            # windows (bf16): xw[j] = x[t - 1 - j], gw[j] = g[t - 1 - j]; flags[j] = bos[t - 1 - j]
+            xw = cute.make_rmem_tensor(cute.make_layout((HALO, VB)), BFloat16)
+            gw = cute.make_rmem_tensor(cute.make_layout((HALO, VB)), BFloat16)
+            flags = cute.make_rmem_tensor(cute.make_layout(HALO), Float32)
+            for j in cutlass.range_constexpr(HALO):
                 flags[j] = 0.0
-                for k in cutlass.range_constexpr(VEC):
-                    gw[j, k] = 0.0
-                    xw[j, k] = 0.0
+                for k in cutlass.range_constexpr(VB):
+                    xw[j, k] = BFloat16(0.0)
+                    gw[j, k] = BFloat16(0.0)
                 tp = t0 - 1 - j
                 if tp >= 0:
-                    xr = cute.make_tensor((base + Int64(tp) * D).align(16), cute.make_layout(VEC)).load().to(Float32)
-                    for k in cutlass.range_constexpr(VEC):
+                    xr = cute.make_tensor((base + Int64(tp) * D).align(8), cute.make_layout(VB)).load()
+                    for k in cutlass.range_constexpr(VB):
                         xw[j, k] = xr[k]
                     if cutlass.const_expr(self.has_bos):
                         flags[j] = cute.make_tensor(bbase + tp, cute.make_layout(1))[0].to(Float32)
-            # rows t0 .. t0 + T + 2 (the last 3 are the halo: g only); dx[t - 3] once g[t] is known
+            # rows t0 .. t0 + T + 2 in groups of 4 (the last 3 are the halo: g only)
             for i4 in cutlass.range((T + WIDTH - 1 + U - 1) // U):
                 tb = t0 + i4 * U
-                xs = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1 + U, VEC)), Float32)  # rows tb - 3 .. tb + 3
-                gs = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1 + U, VEC)), Float32)
-                fl = cute.make_rmem_tensor(cute.make_layout(WIDTH - 1 + U), Float32)
-                gos = cute.make_rmem_tensor(cute.make_layout((U, VEC)), Float32)
-                for j in cutlass.range_constexpr(WIDTH - 1):
-                    fl[j] = flags[WIDTH - 2 - j]
-                    for k in cutlass.range_constexpr(VEC):
-                        xs[j, k] = xw[WIDTH - 2 - j, k]
-                        gs[j, k] = gw[WIDTH - 2 - j, k]
+                xs = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1 + U, VB)), Float32)  # rows tb - 3 .. tb + 3
+                gs = cute.make_rmem_tensor(cute.make_layout((WIDTH - 1 + U, VB)), Float32)
+                fl = cute.make_rmem_tensor(cute.make_layout(WIDTH - 1 + U + HALO), Float32)  # bos of rows tb - 3 .. tb + 6
+                for j in cutlass.range_constexpr(HALO):
+                    fl[j] = flags[HALO - 1 - j]
+                    for k in cutlass.range_constexpr(VB):
+                        xs[j, k] = xw[HALO - 1 - j, k].to(Float32)
+                        gs[j, k] = gw[HALO - 1 - j, k].to(Float32)
+                for u in cutlass.range_constexpr(U + HALO):
+                    tt = tb + u
+                    f = Float32(0.0)
+                    if cutlass.const_expr(self.has_bos):
+                        tc = cutlass.select_(tt < L, tt, L - 1)
+                        f = cutlass.select_(tt < L, cute.make_tensor(bbase + tc, cute.make_layout(1))[0].to(Float32), Float32(0.0))
+                    fl[HALO + u] = f
+                gos = cute.make_rmem_tensor(cute.make_layout((U, VB)), Float32)
                 for u in cutlass.range_constexpr(U):
-                    j = WIDTH - 1 + u
-                    fl[j] = 0.0
-                    for k in cutlass.range_constexpr(VEC):
+                    j = HALO + u
+                    for k in cutlass.range_constexpr(VB):
                         xs[j, k] = 0.0
                         gos[u, k] = 0.0
                     if tb + u < L:
-                        xr = cute.make_tensor((base + Int64(tb + u) * D).align(16), cute.make_layout(VEC)).load().to(Float32)
-                        gr = cute.make_tensor((gbase + Int64(tb + u) * D).align(16), cute.make_layout(VEC)).load().to(Float32)
-                        for k in cutlass.range_constexpr(VEC):
+                        xr = cute.make_tensor((base + Int64(tb + u) * D).align(8), cute.make_layout(VB)).load().to(Float32)
+                        gr = cute.make_tensor((gbase + Int64(tb + u) * D).align(8), cute.make_layout(VB)).load().to(Float32)
+                        for k in cutlass.range_constexpr(VB):
                             xs[j, k] = xr[k]
                             gos[u, k] = gr[k]
-                        if cutlass.const_expr(self.has_bos):
-                            fl[j] = cute.make_tensor(bbase + (tb + u), cute.make_layout(1))[0].to(Float32)
-                for u in cutlass.range_constexpr(U):
-                    j = WIDTH - 1 + u
-                    v1 = 1.0 - fl[j]
-                    v2 = v1 * (1.0 - fl[j - 1])
-                    v3 = v2 * (1.0 - fl[j - 2])
-                    in_tile = (i4 * U + u) < T
-                    for k in cutlass.range_constexpr(VEC):
-                        if cutlass.const_expr(self.act):
-                            pre = xs[j, k] * w[0, k] + xs[j - 1, k] * w[1, k] * v1 + xs[j - 2, k] * w[2, k] * v2 + xs[j - 3, k] * w[3, k] * v3
-                            gs[j, k] = gos[u, k] * _dsilu(pre)
-                        else:
-                            gs[j, k] = gos[u, k]
-                    if in_tile:
-                        for k in cutlass.range_constexpr(VEC):
-                            dw[0, k] = dw[0, k] + gs[j, k] * xs[j, k]
-                            dw[1, k] = dw[1, k] + gs[j, k] * xs[j - 1, k] * v1
-                            dw[2, k] = dw[2, k] + gs[j, k] * xs[j - 2, k] * v2
-                            dw[3, k] = dw[3, k] + gs[j, k] * xs[j - 3, k] * v3
-                for u in cutlass.range_constexpr(U):
-                    # dx of row ts = tb + u - 3 (local index u): g[ts] w0 + g[ts+1] w1 [..] + g[ts+2] w2 [..] + g[ts+3] w3 [..]
-                    ts = tb + u - (WIDTH - 1)
-                    if ts >= t0 and ts < L:
-                        u1 = 1.0 - fl[u + 1]
-                        u2 = u1 * (1.0 - fl[u + 2])
-                        u3 = u2 * (1.0 - fl[u + 3])
-                        dx = cute.make_rmem_tensor(cute.make_layout(VEC), Float32)
-                        for k in cutlass.range_constexpr(VEC):
-                            dx[k] = gs[u, k] * w[0, k] + gs[u + 1, k] * w[1, k] * u1 + gs[u + 2, k] * w[2, k] * u2 + gs[u + 3, k] * w[3, k] * u3
-                        cute.make_tensor((dbase + Int64(ts) * D).align(16), cute.make_layout(VEC)).store(dx.load().to(BFloat16))
-                for j in cutlass.range_constexpr(WIDTH - 1):
-                    # window = the last 3 of the 7 rows: xw[0] = row tb + 3 (= xs[6]), xw[1] = xs[5], xw[2] = xs[4]
+                any_bos = Float32(0.0)
+                for j in cutlass.range_constexpr(1, WIDTH - 1 + U + HALO):
+                    any_bos = any_bos + fl[j]
+                if any_bos == 0.0:
+                    # ---- no boundary near: g, dw, dx without masks
+                    for u in cutlass.range_constexpr(U):
+                        j = HALO + u
+                        in_tile = (i4 * U + u) < T
+                        for k2 in cutlass.range_constexpr(VB // 2):
+                            k = 2 * k2
+                            a0, a1 = cute.arch.mul_packed_f32x2((xs[j, k], xs[j, k + 1]), (w[0, k], w[0, k + 1]))
+                            a0, a1 = cute.arch.fma_packed_f32x2((xs[j - 1, k], xs[j - 1, k + 1]), (w[1, k], w[1, k + 1]), (a0, a1))
+                            a0, a1 = cute.arch.fma_packed_f32x2((xs[j - 2, k], xs[j - 2, k + 1]), (w[2, k], w[2, k + 1]), (a0, a1))
+                            a0, a1 = cute.arch.fma_packed_f32x2((xs[j - 3, k], xs[j - 3, k + 1]), (w[3, k], w[3, k + 1]), (a0, a1))
+                            if cutlass.const_expr(self.act):
+                                g0, g1 = cute.arch.mul_packed_f32x2((gos[u, k], gos[u, k + 1]), (_dsilu(a0), _dsilu(a1)))
+                            else:
+                                g0, g1 = gos[u, k], gos[u, k + 1]
+                            gs[j, k] = g0
+                            gs[j, k + 1] = g1
+                        if in_tile:
+                            for k2 in cutlass.range_constexpr(VB // 2):
+                                k = 2 * k2
+                                for lag in cutlass.range_constexpr(WIDTH):
+                                    dw[lag, k], dw[lag, k + 1] = cute.arch.fma_packed_f32x2(
+                                        (gs[j, k], gs[j, k + 1]), (xs[j - lag, k], xs[j - lag, k + 1]), (dw[lag, k], dw[lag, k + 1]))
+                    for u in cutlass.range_constexpr(U):
+                        ts = tb + u - HALO
+                        if ts >= t0 and ts < L:
+                            dx = cute.make_rmem_tensor(cute.make_layout(VB), Float32)
+                            for k2 in cutlass.range_constexpr(VB // 2):
+                                k = 2 * k2
+                                d0, d1 = cute.arch.mul_packed_f32x2((gs[u, k], gs[u, k + 1]), (w[0, k], w[0, k + 1]))
+                                d0, d1 = cute.arch.fma_packed_f32x2((gs[u + 1, k], gs[u + 1, k + 1]), (w[1, k], w[1, k + 1]), (d0, d1))
+                                d0, d1 = cute.arch.fma_packed_f32x2((gs[u + 2, k], gs[u + 2, k + 1]), (w[2, k], w[2, k + 1]), (d0, d1))
+                                d0, d1 = cute.arch.fma_packed_f32x2((gs[u + 3, k], gs[u + 3, k + 1]), (w[3, k], w[3, k + 1]), (d0, d1))
+                                dx[k] = d0
+                                dx[k + 1] = d1
+                            cute.make_tensor((dbase + Int64(ts) * D).align(8), cute.make_layout(VB)).store(dx.load().to(BFloat16))
+                else:
+                    # ---- masked path
+                    for u in cutlass.range_constexpr(U):
+                        j = HALO + u
+                        v1 = 1.0 - fl[j]
+                        v2 = v1 * (1.0 - fl[j - 1])
+                        v3 = v2 * (1.0 - fl[j - 2])
+                        in_tile = (i4 * U + u) < T
+                        for k2 in cutlass.range_constexpr(VB // 2):
+                            k = 2 * k2
+                            a0, a1 = cute.arch.mul_packed_f32x2((xs[j, k], xs[j, k + 1]), (w[0, k], w[0, k + 1]))
+                            m0, m1 = cute.arch.mul_packed_f32x2((xs[j - 1, k], xs[j - 1, k + 1]), (v1, v1))
+                            a0, a1 = cute.arch.fma_packed_f32x2((m0, m1), (w[1, k], w[1, k + 1]), (a0, a1))
+                            m0, m1 = cute.arch.mul_packed_f32x2((xs[j - 2, k], xs[j - 2, k + 1]), (v2, v2))
+                            a0, a1 = cute.arch.fma_packed_f32x2((m0, m1), (w[2, k], w[2, k + 1]), (a0, a1))
+                            m0, m1 = cute.arch.mul_packed_f32x2((xs[j - 3, k], xs[j - 3, k + 1]), (v3, v3))
+                            a0, a1 = cute.arch.fma_packed_f32x2((m0, m1), (w[3, k], w[3, k + 1]), (a0, a1))
+                            if cutlass.const_expr(self.act):
+                                g0, g1 = cute.arch.mul_packed_f32x2((gos[u, k], gos[u, k + 1]), (_dsilu(a0), _dsilu(a1)))
+                            else:
+                                g0, g1 = gos[u, k], gos[u, k + 1]
+                            gs[j, k] = g0
+                            gs[j, k + 1] = g1
+                        if in_tile:
+                            for k in cutlass.range_constexpr(VB):
+                                dw[0, k] = dw[0, k] + gs[j, k] * xs[j, k]
+                                dw[1, k] = dw[1, k] + gs[j, k] * xs[j - 1, k] * v1
+                                dw[2, k] = dw[2, k] + gs[j, k] * xs[j - 2, k] * v2
+                                dw[3, k] = dw[3, k] + gs[j, k] * xs[j - 3, k] * v3
+                    for u in cutlass.range_constexpr(U):
+                        ts = tb + u - HALO
+                        if ts >= t0 and ts < L:
+                            u1 = 1.0 - fl[u + 1]
+                            u2 = u1 * (1.0 - fl[u + 2])
+                            u3 = u2 * (1.0 - fl[u + 3])
+                            dx = cute.make_rmem_tensor(cute.make_layout(VB), Float32)
+                            for k in cutlass.range_constexpr(VB):
+                                dx[k] = gs[u, k] * w[0, k] + gs[u + 1, k] * w[1, k] * u1 + gs[u + 2, k] * w[2, k] * u2 + gs[u + 3, k] * w[3, k] * u3
+                            cute.make_tensor((dbase + Int64(ts) * D).align(8), cute.make_layout(VB)).store(dx.load().to(BFloat16))
+                for j in cutlass.range_constexpr(HALO):
                     flags[j] = fl[WIDTH - 1 + U - 1 - j]
-                    for k in cutlass.range_constexpr(VEC):
-                        xw[j, k] = xs[WIDTH - 1 + U - 1 - j, k]
-                        gw[j, k] = gs[WIDTH - 1 + U - 1 - j, k]
+                    for k in cutlass.range_constexpr(VB):
+                        xw[j, k] = BFloat16(xs[WIDTH - 1 + U - 1 - j, k])
+                        gw[j, k] = BFloat16(gs[WIDTH - 1 + U - 1 - j, k])
             pp = pPart + (Int64(b * n_tiles + by) * WIDTH) * D + c
             for lag in cutlass.range_constexpr(WIDTH):
-                o = cute.make_rmem_tensor(cute.make_layout(VEC), Float32)
-                for k in cutlass.range_constexpr(VEC):
+                o = cute.make_rmem_tensor(cute.make_layout(VB), Float32)
+                for k in cutlass.range_constexpr(VB):
                     o[k] = dw[lag, k]
-                cute.make_tensor((pp + (WIDTH - 1 - lag) * D).align(32), cute.make_layout(VEC)).store(o.load())
+                cute.make_tensor((pp + (WIDTH - 1 - lag) * D).align(16), cute.make_layout(VB)).store(o.load())
 
 
 def _bos_u8(bos_mask: Optional[torch.Tensor], x: torch.Tensor) -> Tuple[torch.Tensor, bool]:
@@ -301,7 +364,7 @@ def conv_bwd(out_grad: torch.Tensor, x: torch.Tensor, weight: torch.Tensor, bos_
     dx = torch.empty_like(x)
     part = torch.empty(B * n_tiles, WIDTH, D, dtype=torch.float32, device=x.device)
     fn = _compiled(("conv_bwd", act, has_bos), lambda: ConvBwd(act, has_bos), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 32), _fake(Uint8, 1), _fake(BFloat16), _fake(Float32, 32), Int32(0), Int32(0), Int32(0)))
+        _fake(BFloat16, 8), _fake(BFloat16, 8), _fake(Float32, 16), _fake(Uint8, 1), _fake(BFloat16, 8), _fake(Float32, 16), Int32(0), Int32(0), Int32(0)))
     fn(out_grad.contiguous().reshape(-1), x.reshape(-1), w.reshape(-1), bos, dx.reshape(-1), part.reshape(-1), B, L, D)
     dweight = part.sum(0).t().contiguous().to(weight.dtype)
     return dx, dweight
@@ -312,6 +375,6 @@ def conv_supported(x: torch.Tensor, weight: torch.Tensor, bias, initial_state, o
         return False
     if bias is not None or initial_state is not None or output_final_state or final_state_grad is not None:
         return False
-    if weight.shape != (x.shape[-1], WIDTH) or x.shape[-1] % VEC or x.numel() >= 2 ** 31:
+    if weight.shape != (x.shape[-1], WIDTH) or x.shape[-1] % VEC or x.shape[-1] % 4 or x.numel() >= 2 ** 31:
         return False
     return torch.cuda.get_device_capability(x.device)[0] >= 10
