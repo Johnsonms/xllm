@@ -1,4 +1,5 @@
 from typing import Tuple, Optional
+import os
 
 import torch
 from torch import Tensor
@@ -11,6 +12,7 @@ from xllm_extension.ops import (
 )
 import xllm_extension.ops as _xllm_ops
 _MULTISEG_FWD_OUT = getattr(_xllm_ops, "multiseg_attention_fwd_out", None)  # older builds: copy instead
+_ATTN_BWD_OUT = None if os.environ.get("XLLM_SWIFT_BWD_COPY") == "1" else getattr(_xllm_ops, "attention_bwd_out", None)
 try:
     from xattn.ops import (
         flash_sca_fwd,
@@ -232,6 +234,14 @@ def _sequential_sliding_chunk_attention_bwd(
         ws = [t.view(bsz, n_heads, chunk_size, kc) for t, kc in zip(torch.split(w, sizes), splits)]
     else:
         ws = torch.split(w, splits, dim=-1)
+    if _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1:
+        # gradients written in place; the window's previous-chunk rows are accumulated in the GEMMs (beta = 1)
+        for c in range(nc):
+            qbos, eos = c * chunk_size, (c + 1) * chunk_size
+            kvbos = max(qbos - chunk_size, 0)
+            _ATTN_BWD_OUT(grad[:, qbos:eos], query[:, qbos:eos], key[:, kvbos:eos], value[:, kvbos:eos], ws[c], scale,
+                          True, query_grad[:, qbos:eos], key_grad[:, kvbos:eos], value_grad[:, kvbos:eos], qbos - kvbos)
+        return query_grad, key_grad, value_grad, None, None
     for c in range(nc):
         qbos = c * chunk_size
         kvbos = c * chunk_size if c == 0 else (c - 1) * chunk_size

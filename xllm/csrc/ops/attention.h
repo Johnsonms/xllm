@@ -27,6 +27,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> AttentionCUDABwd(
     const torch::Tensor& v, const torch::Tensor& w, double scale,
     bool use_causal_mask);
 
+void AttentionCUDABwdOut(const torch::Tensor& grad_y, const torch::Tensor& q,
+                         const torch::Tensor& k, const torch::Tensor& v,
+                         const torch::Tensor& w, double scale,
+                         bool use_causal_mask, torch::Tensor q_grad,
+                         torch::Tensor k_grad, torch::Tensor v_grad,
+                         int64_t kv_acc_rows);
+
 void DefineAttentionOp(py::module& m);
 
 std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionFwd(

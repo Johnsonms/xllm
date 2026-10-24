@@ -26,7 +26,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> AttentionBwd(
 
 void DefineAttentionOp(py::module& m) {
   m.def("attention_fwd", &AttentionFwd, "AttentionFwd")
-      .def("attention_bwd", &AttentionBwd, "AttentionBwd");
+      .def("attention_bwd", &AttentionBwd, "AttentionBwd")
+      .def("attention_bwd_out", &AttentionCUDABwdOut, "AttentionCUDABwdOut");
 }
 
 std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionFwd(
