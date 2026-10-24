@@ -118,6 +118,7 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 | gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | ~608 ms | ~572 ms |
 | gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | ~547 ms | ~530 ms |
 | gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~837 ms | ~822 ms |
+| gekko-7.1B (swift) | B1 L16384 (the plan's shape) | OOM | ~1.70 s (65 GB) with `recompute_fc1_out` / `recompute_fc3_out` and `expandable_segments` (still OOM without the recompute: 76.6 GB) | - |
 
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
