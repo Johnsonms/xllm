@@ -1,0 +1,69 @@
+=== 09
+kernels matching '.': 293 ms of 293 ms
+   31.7 ms x  56  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(3068): sca_bwd | ?
+   19.8 ms x  28  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(3372): _sca_bwd_dq | ?
+   15.5 ms x  56  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[4096, 32768], [32768, 1536]]
+   13.1 ms x  28  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(4431): sca_fwd | ?
+   13.0 ms x  56  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[32768, 1536], [1536, 4096]]
+   10.0 ms x 168  xllm/modules/fused_ops/conv/triton/triton_causal_conv1d_bwd.py(936): _direct_backward | ?
+    8.5 ms x 112  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[2048, 32768], [32768, 1536]]
+    7.8 ms x 112  xllm/modules/fused_ops/cute/qk_prep.py(243): qk_prep_fwd | ?
+    7.6 ms x  28  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[1536, 32768], [32768, 4096]]
+    7.5 ms x 168  xllm/modules/fused_ops/cute/causal_conv.py(341): conv_fwd | ?
+    7.5 ms x  28  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::addmm [[32768, 1536], [32768, 4096], [4096, 1536], [], [], [32768, 1
+    7.3 ms x  56  xllm/modules/fused_ops/cute/qk_prep.py(269): qk_prep_bwd | ?
+    7.0 ms x  28  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[32768, 4096], [4096, 1536]]
+    6.9 ms x  28  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[32768, 1536], [1536, 4096]]
+    6.7 ms x  28  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[32768, 4096], [4096, 1536]]
+    6.7 ms x  56  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[32768, 1536], [1536, 2048]]
+    6.6 ms x  56  xllm/models/fused_blocks/gekko/gekko.py(98): forward | aten::mm [[32768, 1536], [1536, 2048]]
+    6.5 ms x  28  xllm/modules/fused_ops/cute/swiglu.py(107): swiglu_bwd | ?
+    5.2 ms x 112  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[1024, 32768], [32768, 1536]]
+    4.6 ms x  56  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[1536, 32768], [32768, 2048]]
+    4.6 ms x  28  xllm/modules/fused_ops/cute/attn_gate.py(235): attn_gate_bwd | ?
+=== 4b
+kernels matching '.': 307 ms of 307 ms
+   18.6 ms x  36  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(3068): sca_bwd | ?
+   17.3 ms x  72  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[9216, 8192], [8192, 2560]]
+   15.4 ms x  72  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[8192, 2560], [2560, 9216]]
+   12.8 ms x  36  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(3372): _sca_bwd_dq | ?
+   11.4 ms x 216  xllm/modules/fused_ops/conv/triton/triton_causal_conv1d_bwd.py(936): _direct_backward | ?
+   11.3 ms x  36  ? | aten::_chunk_cat [[[2560], [2560], [4096, 2560], [1024, 2560], [1024, 2560], [1024], [4
+   11.2 ms x  36  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(4431): sca_fwd | ?
+   10.2 ms x  56  ? | aten::_foreach_mul_ [[], []]
+    9.7 ms x  28  ? | aten::_foreach_addcdiv_ [[], [], [], []]
+    9.1 ms x  36  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::addmm [[8192, 2560], [8192, 9216], [9216, 2560], [], [], [8192, 2560
+    8.9 ms x  36  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[8192, 9216], [9216, 2560]]
+    8.7 ms x  36  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[2560, 8192], [8192, 9216]]
+    8.4 ms x  36  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[8192, 9216], [9216, 2560]]
+    8.2 ms x  36  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[8192, 2560], [2560, 9216]]
+    7.6 ms x  72  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[4096, 8192], [8192, 2560]]
+    7.3 ms x  28  ? | aten::_foreach_lerp_ [[], [], []]
+    7.3 ms x  28  ? | aten::_foreach_addcmul_ [[], [], [], []]
+    7.1 ms x  72  xllm/models/fused_blocks/gekko/gekko.py(98): forward | aten::mm [[8192, 2560], [2560, 4096]]
+    6.9 ms x  72  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[8192, 2560], [2560, 4096]]
+    5.4 ms x 144  xllm/modules/fused_ops/cute/qk_prep.py(243): qk_prep_fwd | ?
+    5.2 ms x  28  ? | aten::_foreach_div_ [[], []]
+=== 71
+kernels matching '.': 841 ms of 841 ms
+   48.3 ms x  64  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(3068): sca_bwd | ?
+   46.1 ms x  64  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[8192, 16384], [16384, 4096]]
+   45.0 ms x  64  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[8192, 16384], [16384, 4096]]
+   41.1 ms x  64  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[16384, 4096], [4096, 8192]]
+   41.1 ms x  64  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[16384, 4096], [4096, 8192]]
+   35.6 ms x  32  xllm/modules/fused_ops/cute/sliding_chunk_attention.py(4431): sca_fwd | ?
+   23.2 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[4096, 16384], [16384, 8192]]
+   22.7 ms x  32  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[4096, 16384], [16384, 8192]]
+   22.5 ms x  32  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::addmm [[16384, 4096], [16384, 8192], [8192, 4096], [], [], [16384, 4
+   21.7 ms x  32  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[16384, 4096], [4096, 8192]]
+   21.7 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::mm [[16384, 8192], [8192, 4096]]
+   21.6 ms x  32  xllm/models/fused_blocks/utils.py(688): swiglu_backward | aten::mm [[16384, 8192], [8192, 4096]]
+   21.6 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(529): backward | aten::addmm [[16384, 4096], [16384, 8192], [8192, 4096], [], [], [16384, 40
+   20.9 ms x  32  xllm/models/fused_blocks/utils.py(660): swiglu_forward | aten::mm [[16384, 8192], [8192, 4096]]
+   20.8 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(98): forward | aten::addmm [[8192], [16384, 4096], [4096, 8192], [], []]
+   20.6 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(98): forward | aten::mm [[16384, 8192], [8192, 4096]]
+   20.5 ms x  32  ? | aten::_chunk_cat [[[4096], [4096], [1024, 4096], [1024, 4096], [8192, 4096], [8192], [1
+   20.4 ms x  32  xllm/models/fused_blocks/gekko/gekko.py(98): forward | aten::mm [[16384, 4096], [4096, 8192]]
+   17.7 ms x  96  ? | aten::_foreach_mul_ [[], []]
+   17.5 ms x 192  xllm/modules/fused_ops/conv/triton/triton_causal_conv1d_bwd.py(936): _direct_backward | ?
+   16.7 ms x  48  ? | aten::_foreach_addcdiv_ [[], [], [], []]

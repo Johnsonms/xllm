@@ -548,12 +548,16 @@ the csrc norm kernels); the non-fused modules (`gated_delta_attention.py`, `norm
 the same kernels.
 - Fusing dS into ScaPmat (three variants, §6b) stays slower.
 
-### Remaining (1-GPU shares)
+### Remaining (final per-op profiles: `profile/ops_final_2026-10-24.txt`, kernel ms per step incl. optimizer)
 
-0.9B 319 ms: SCA bwd 70 (DkT 26, DqT 25, DvT 17), SCA fwd 18, linear GEMMs ~95, conv 20, AWM 10, TSDN 5,
-CE GEMMs ~8. 7.1B ~820: linear GEMMs 460 (70-79% of peak), SCA ~115 (fwd 37, dP GEMMs 30, DvT 31, Dk 24,
-Dq 14), conv 34, layernorm ~12, residual adds 11, TSDN 7. 4B 323: GEMMs ~100, SCA 44, conv 18, optimizer
-(outside fwd+bwd) 50, FSDP `_chunk_cat` 11 (harness).
+0.9B (293 ms of kernels; step 315): SCA bwd 51 (DkT + DvT 32, DqT 20), SCA fwd 13, linear GEMMs ~100, conv
+bwd (Triton) 10 + fwd (cute) 7.5, q/k prep 15 (fwd 7.8, bwd 7.3), swiglu bwd 6.5, gate bwd 4.6, AWM ~10.
+4B (307; step 314): SCA 43 (DkDv 19, DqT 13, fwd 11), GEMMs ~110, conv bwd 11, `_chunk_cat` 11 and optimizer
+`_foreach_*` ~40 (FSDP / optimizer, outside fwd+bwd), q/k prep 10. 7.1B (841; step 798): linear GEMMs ~470
+(70-79% of peak), SCA 84 (bwd 48 = DvT 26 + dP GEMMs 34 + DkT 12 + DqT 5, fwd 36), conv bwd 17.5, `_chunk_cat`
+20, optimizer ~50, AWM ~25, gate 16, swiglu 11. The SCA kernels sit at ~78% of the tensor-pipe issue rate
+(N = 32 / 64 MMAs with one shared-memory operand, 512 TMEM columns, one CTA per SM); the next step there is
+structural (2-SM MMAs, or an FA4-style exp2 emulation for S = 128).
 
 ## 7. Dev scripts (`handoff/scripts/`)
 
