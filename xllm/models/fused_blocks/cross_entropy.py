@@ -1,6 +1,5 @@
 from typing import Tuple, Optional
 import math
-import os
 
 import torch
 from torch import Tensor
@@ -26,6 +25,18 @@ def next_power_of_2(n):
         return 1  # Handle non-positive numbers
     exponent = math.ceil(math.log2(n))
     return 2 ** exponent
+
+
+def _cute_ce_supported(x_2d: Tensor, vocab: int) -> bool:
+    """Whether the fused CuTe DSL loss / scores kernel (Blackwell, bf16 logits; env XLLM_CUTE_CE=0 disables it)
+    handles this chunked cross entropy (single model-parallel rank only)."""
+    if x_2d.dtype != torch.bfloat16 or not x_2d.is_cuda:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.cross_entropy import ce_logits_supported
+    except ImportError:
+        return False
+    return ce_logits_supported(x_2d.new_empty((0, vocab)))
 
 
 def _fused_linear_cross_entropy(
@@ -106,9 +117,7 @@ def _fused_linear_cross_entropy(
         x = reshape_gathered_tensor_along_specific_dim(x, gather_dim=2)
 
     x_2d = x.view(-1, mdim)
-    use_fused_rows = (model_parallel_size == 1 and os.environ.get("XLLM_CE_TORCH", "0") != "1"
-                      and x.is_cuda and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-                      and partial_voc_size % 8 == 0)
+    use_cute = model_parallel_size == 1 and _cute_ce_supported(x_2d, partial_voc_size)
     prev_handle = None
     prev_grad = None
     prev_start_index = None
@@ -122,18 +131,16 @@ def _fused_linear_cross_entropy(
         target_1d_chunk = target_1d[start_idx:end_idx]
         target_mask_chunk = target_mask[start_idx:end_idx]
         ignore_index_mask_chunk = ignore_index_mask[start_idx:end_idx]
-        if use_fused_rows:
-            # model-parallel size 1: row statistics, loss and scores (fp32 + bf16) in two passes over bf16 logits
-            from xllm.modules.fused_ops.cute.cross_entropy import ce_rows
-            res = ce_rows(F.linear(inp_chunk, weight), target_1d_chunk, ignore_index_mask_chunk,
-                          loss_flat[start_idx:end_idx] if compute_loss else None, compute_grad)
-            if compute_grad:
-                scores, scores_lp = res
-                curr_grad = torch.mm(scores, weight_fp32)
+        # C x V
+        logits = F.linear(inp_chunk, weight)
+        if use_cute:
+            # loss and softmax scores (fp32 and bf16) from the bf16 logits in one kernel
+            from xllm.modules.fused_ops.cute.cross_entropy import ce_logits
+            loss_chunk, scores, scores_lowp = ce_logits(logits, target_1d_chunk, ignore_index_mask_chunk, compute_loss, compute_grad)
+            if compute_loss:
+                loss_flat[start_idx:end_idx] = loss_chunk
         else:
-            scores_lp = None
-            # C x V
-            partial_logits = F.linear(inp_chunk, weight).float()
+            partial_logits = logits.float()
             # C
             logits_max = torch.max(partial_logits, dim=-1)[0]
             if model_parallel_size > 1:
@@ -172,10 +179,12 @@ def _fused_linear_cross_entropy(
                 scores[arange_1d, target_1d_chunk] -= score_update
                 # zero out ignored index
                 scores.masked_fill_(ignore_index_mask_chunk.unsqueeze(1), value=0.0)
-                # (C x V) x (V x D) -> C x D
-                curr_grad = torch.mm(scores, weight_fp32)
+                scores_lowp = None
 
         if compute_grad:
+            # (C x V) x (V x D) -> C x D
+            curr_grad = torch.mm(scores, weight_fp32)
+
             if prev_grad is not None:
                 if prev_handle is not None:
                     prev_handle.wait()
@@ -191,7 +200,7 @@ def _fused_linear_cross_entropy(
 
             grad_weight = torch.addmm(
                 input=grad_weight,
-                mat1=(scores_lp if scores_lp is not None else scores.to(dtype=x.dtype)).t(),
+                mat1=(scores_lowp if scores_lowp is not None else scores.to(dtype=x.dtype)).t(),
                 mat2=inp_chunk,
                 out=grad_weight,
             )

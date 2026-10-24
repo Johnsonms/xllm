@@ -1,100 +1,93 @@
-"""Fused rotary position embedding (CuTe DSL, any arch): y = rope(x) in one pass over x.
+"""Rotary position embedding (CuTe DSL): one bf16 pass over [B, L, N, D] with fp32 math.
 
-y[b, l, h, :R] = x[b, l, h, :R] rotated pair-wise by freqs_cis[l] (complex multiply, fp32, conjugated for the
-backward), y[b, l, h, R:] = x[b, l, h, R:]. x is [B, L, H, D] with the last dim contiguous and any other strides
-(it is not modified: partial-rope callers keep the input for the normalization backward); y is a new contiguous
-tensor. Replaces the view_as_complex / multiply / type_as / cat chain of apply_rotary_embedding + apply_rope, which
-makes about five passes over the data.
-"""
-from functools import lru_cache
-
-import torch
+The torch version (x.float() -> complex multiply -> bf16 -> torch.cat with the non-rotated tail) runs 4-5 passes
+over the tensor; this kernel reads x once and writes the output once (gekko-0.9B B2 L16K: 68 -> ~5 ms per step).
+``backward`` applies the conjugate (the gradient of the forward)."""
+import os
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32, Int64
+import torch
+from cutlass import BFloat16, Float32, Int32, Int64
 
-TORCH2CUTE = {torch.bfloat16: BFloat16, torch.float16: Float16}
-VEC = 8  # 16 bytes of x per thread
+try:
+    from .adaptive_working_memory import _compiled, _fake
+except ImportError:  # loaded from its file (tests)
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("cute_adaptive_working_memory_fwd",
+                                         os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive_working_memory.py"))
+    _awm = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_awm)
+    _compiled, _fake = _awm._compiled, _awm._fake
 
 
-class RopeKernel:
-    def __init__(self, dtype, D: int, R: int, backward: bool, threads: int = 256):
-        assert D % VEC == 0 and R % VEC == 0 and R <= D
-        self.dtype, self.D, self.R, self.backward, self.threads = dtype, D, R, backward, threads
-        self.vpr = D // VEC  # vectors per row
-        self.rvpr = R // VEC  # rotated vectors per row
+class Rope:
+    """out[b, l, n, :R] = rotate(x[b, l, n, :R], freqs[l]), out[b, l, n, R:] = x[b, l, n, R:] (bf16 in / out).
+    freqs: the fp32 (cos, sin) pairs of the complex64 [L, R / 2] table; a thread handles 8 elements (4 pairs)."""
+
+    THREADS = 256
+
+    def __init__(self, N: int, D: int, R: int, backward: bool):
+        self.N, self.D, self.R, self.backward = N, D, R, backward
+        assert D % 8 == 0 and R % 8 == 0 and 0 < R <= D
 
     @cute.jit
-    def __call__(self, tX: cute.Tensor, tF: cute.Tensor, tY: cute.Tensor, rows: Int32, H: Int32, L: Int32,
-                 sb: Int64, sl: Int64, sh: Int64, stream: cuda.CUstream):
-        total = rows * self.vpr
-        grid = (total + self.threads - 1) // self.threads
-        self.kernel(tX.iterator, tF.iterator, tY.iterator, total, H, L, sb, sl, sh).launch(
-            grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+    def __call__(self, tX: cute.Tensor, tF: cute.Tensor, tOut: cute.Tensor, B: Int32, L: Int32, stream: cuda.CUstream):
+        n_thr = B * L * self.N * (self.D // 8)
+        self.kernel(tX.iterator, tF.iterator, tOut.iterator, L, n_thr).launch(
+            grid=[(n_thr + self.THREADS - 1) // self.THREADS, 1, 1], block=[self.THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, pX: cute.Pointer, pF: cute.Pointer, pY: cute.Pointer, total: Int32, H: Int32, L: Int32,
-               sb: Int64, sl: Int64, sh: Int64):
+    def kernel(self, pX: cute.Pointer, pF: cute.Pointer, pOut: cute.Pointer, L: Int32, n_thr: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        i = bidx * self.threads + tidx
-        if i < total:
-            row = i // self.vpr
-            vv = i % self.vpr
-            h = row % H
-            t = row // H
-            l = t % L
-            b = t // L
-            src = Int64(b) * sb + Int64(l) * sl + Int64(h) * sh + vv * VEC
-            x = cute.make_tensor((pX + src).align(16), cute.make_layout(VEC)).load()
-            y = cute.make_rmem_tensor(cute.make_layout(VEC), self.dtype)
-            if vv < self.rvpr:
-                # (cos, sin) of the VEC / 2 pairs of this vector: freqs_cis[l, 4 vv .. 4 vv + 3] as fp32 pairs
-                f = cute.make_tensor((pF + (Int64(l) * self.R + vv * VEC)).align(32), cute.make_layout(VEC)).load()
-                xf = x.to(Float32)
-                yf = cute.make_rmem_tensor(cute.make_layout(VEC), Float32)
-                for p in cutlass.range_constexpr(VEC // 2):
-                    a, c = xf[2 * p], xf[2 * p + 1]
-                    cs, sn = f[2 * p], f[2 * p + 1]
-                    if cutlass.const_expr(self.backward):
-                        sn = -sn
-                    yf[2 * p] = a * cs - c * sn
-                    yf[2 * p + 1] = a * sn + c * cs
-                y.store(yf.load().to(self.dtype))
+        N, D, R = self.N, self.D, self.R
+        gid = bidx * self.THREADS + tidx
+        if gid < n_thr:
+            e = (gid % (D // 8)) * 8
+            row = gid // (D // 8)  # (b, l, n)
+            l = (row // N) % L
+            off = Int64(row) * D + e
+            x8 = cute.make_tensor((pX + off).align(16), cute.make_layout(8)).load()
+            if e < R:
+                f8 = cute.make_tensor((pF + (Int64(l) * R + e)).align(16), cute.make_layout(8)).load()
+                xf = cute.make_rmem_tensor(cute.make_layout(8), Float32)
+                xf.store(x8.to(Float32))
+                ff = cute.make_rmem_tensor(cute.make_layout(8), Float32)
+                ff.store(f8)
+                of = cute.make_rmem_tensor(cute.make_layout(8), Float32)
+                for i in cutlass.range_constexpr(4):
+                    x0, x1, c = xf[2 * i], xf[2 * i + 1], ff[2 * i]
+                    s = -ff[2 * i + 1] if self.backward else ff[2 * i + 1]
+                    of[2 * i] = x0 * c - x1 * s
+                    of[2 * i + 1] = x0 * s + x1 * c
+                cute.make_tensor((pOut + off).align(16), cute.make_layout(8)).store(of.load().to(BFloat16))
             else:
-                y.store(x)
-            cute.make_tensor((pY + Int64(row) * self.D + vv * VEC).align(16), cute.make_layout(VEC)).store(y.load())
+                cute.make_tensor((pOut + off).align(16), cute.make_layout(8)).store(x8)
 
 
-_COMPILED = {}
+def rope(x: torch.Tensor, freqs_cis: torch.Tensor, rope_dim: Optional[int] = None, backward: bool = False) -> torch.Tensor:
+    """Rotary embedding of x [B, L, N, D] (bf16) over its first rope_dim channels (default D); freqs_cis complex64
+    [L, rope_dim / 2]. backward=True applies the conjugate rotation (the gradient of the forward)."""
+    B, L, N, D = x.shape
+    R = D if rope_dim is None else rope_dim
+    assert x.dtype == torch.bfloat16 and freqs_cis.dtype == torch.complex64 and freqs_cis.shape == (L, R // 2)
+    assert x.numel() < 2 ** 31
+    x = x.contiguous()
+    f = torch.view_as_real(freqs_cis).contiguous()
+    out = torch.empty_like(x)
+    fn = _compiled(("rope", N, D, R, bool(backward)), lambda: Rope(N, D, R, bool(backward)), lambda: (
+        _fake(BFloat16), _fake(Float32), _fake(BFloat16), Int32(0), Int32(0)))
+    fn(x.reshape(-1), f.reshape(-1), out.reshape(-1), B, L)
+    return out
 
 
-def _fake(dtype, align):
-    return cute.runtime.make_fake_compact_tensor(dtype, (cute.sym_int(),), assumed_align=align)
-
-
-def rope(x: torch.Tensor, freqs_cis: torch.Tensor, rope_head_dim: int, backward: bool) -> torch.Tensor:
-    """x [B, L, H, D] (last dim contiguous), freqs_cis [L, rope_head_dim / 2] complex64 -> new [B, L, H, D]."""
-    B, L, H, D = x.shape
-    R = rope_head_dim
-    assert x.stride(3) == 1 and freqs_cis.shape == (L, R // 2)
-    f = torch.view_as_real(freqs_cis.contiguous()).reshape(-1)
-    y = torch.empty(B, L, H, D, dtype=x.dtype, device=x.device)
-    key = (x.dtype, D, R, backward)
-    if key not in _COMPILED:
-        op = RopeKernel(TORCH2CUTE[x.dtype], D, R, backward)
-        _COMPILED[key] = cute.compile(
-            op, _fake(TORCH2CUTE[x.dtype], 16), _fake(Float32, 32), _fake(TORCH2CUTE[x.dtype], 16), Int32(0), Int32(0),
-            Int32(0), Int64(0), Int64(0), Int64(0), cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi")
-    # flat view of x's storage from its first element (strides carry the layout)
-    xs = x.as_strided((x.untyped_storage().nbytes() // x.element_size() - x.storage_offset(),), (1,))
-    _COMPILED[key](xs, f, y.reshape(-1), B * L * H, H, L, x.stride(0), x.stride(1), x.stride(2))
-    return y
-
-
-@lru_cache(maxsize=None)
-def supported(dtype: torch.dtype, D: int, R: int) -> bool:
-    return dtype in TORCH2CUTE and D % VEC == 0 and R % VEC == 0 and 0 < R <= D
+def rope_supported(x: torch.Tensor, rope_dim: int) -> bool:
+    if os.environ.get("XLLM_CUTE_ROPE", "1") == "0" or x.dtype != torch.bfloat16 or not x.is_cuda:
+        return False
+    D = x.shape[-1]
+    if x.dim() != 4 or D % 8 or rope_dim % 8 or rope_dim <= 0 or rope_dim > D or x.numel() >= 2 ** 31:
+        return False
+    return torch.cuda.get_device_capability(x.device)[0] >= 9
