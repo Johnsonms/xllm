@@ -13,6 +13,20 @@ from xllm_extension.ops import (
 import xllm_extension.ops as _xllm_ops
 _MULTISEG_FWD_OUT = getattr(_xllm_ops, "multiseg_attention_fwd_out", None)  # older builds: copy instead
 _ATTN_BWD_OUT = None if os.environ.get("XLLM_SWIFT_BWD_COPY") == "1" else getattr(_xllm_ops, "attention_bwd_out", None)
+_SWIFT_QSPLIT = int(os.environ.get("XLLM_SWIFT_QSPLIT", "2"))
+
+
+def _swift_blocks(seq_len: int, chunk_size: int, split: int):
+    """(query start, query end, key start) of the swift attention calls: every chunk's queries in `split` sub-chunks
+    attending to the keys from the previous chunk's start up to the sub-chunk's end, so most of the causal triangle's
+    masked half is never computed (split 2: 17% less GEMM / softmax work at 2 chunks). split 1 = one call per chunk."""
+    cq = chunk_size // split
+    return [(c * chunk_size + s * cq, c * chunk_size + (s + 1) * cq, max(c - 1, 0) * chunk_size)
+            for c in range(seq_len // chunk_size) for s in range(split)]
+
+
+def _swift_w_numel(blocks, bsz: int, n_heads: int) -> int:
+    return sum(bsz * n_heads * (qe - qb) * (qe - kb) for qb, qe, kb in blocks)
 try:
     from xattn.ops import (
         flash_sca_fwd,
@@ -156,6 +170,21 @@ def _sequential_sliding_chunk_attention_fwd(
     else:
         offset = None
         attn_w = None
+    split = _SWIFT_QSPLIT
+    if (save_attention_matrix and segment_idx is not None and _MULTISEG_FWD_OUT is not None and
+            _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1 and split > 1 and
+            chunk_size % (8 * split) == 0):
+        blocks = _swift_blocks(seq_len, chunk_size, split)
+        attn_w = torch.empty(_swift_w_numel(blocks, bsz, n_heads), dtype=value.dtype, device=value.device)
+        w_off = 0
+        for qb, qe, kb in blocks:
+            w_shape = (bsz, n_heads, qe - qb, qe - kb)
+            n_w = w_shape[0] * w_shape[1] * w_shape[2] * w_shape[3]
+            _MULTISEG_FWD_OUT(query[:, qb:qe], key[:, kb:qe], value[:, kb:qe], segment_idx[:, qb:qe],
+                              segment_idx[:, kb:qe], scale, dropout, True, attn_w[w_off:w_off + n_w].view(w_shape),
+                              out[:, qb:qe])
+            w_off += n_w
+        return out, attn_w
     for c in range(nc):
         qbos = c * chunk_size
         kvbos = c * chunk_size if c == 0 else (c - 1) * chunk_size
@@ -181,9 +210,9 @@ def _sequential_sliding_chunk_attention_fwd(
             # the probabilities go straight into their chunk-major slot of attn_w (no copy)
             w_shape = (bsz, n_heads, q.shape[1], k.shape[1])
             n_w = w_shape[0] * w_shape[1] * w_shape[2] * w_shape[3]
-            y = _MULTISEG_FWD_OUT(q, k, v, q_idx, k_idx, scale, dropout, True, attn_w[w_off:w_off + n_w].view(w_shape))
+            _MULTISEG_FWD_OUT(q, k, v, q_idx, k_idx, scale, dropout, True, attn_w[w_off:w_off + n_w].view(w_shape),
+                              out[:, qbos:eos])
             w_off += n_w
-            out[:, qbos:eos] = y
             continue
         if q_idx is None:
             y, w = attention_fwd(q, k, v, scale, dropout, True)
@@ -229,19 +258,26 @@ def _sequential_sliding_chunk_attention_bwd(
         prev_key_grad = None
         prev_value_grad = None
 
+    if _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1 and w.dim() == 1:
+        # gradients written in place; key rows already written by earlier calls are accumulated in the GEMMs (beta = 1).
+        # The forward's call layout (sub-chunks or one call per chunk) follows from the attention buffer's size.
+        blocks = _swift_blocks(seq_len, chunk_size, _SWIFT_QSPLIT) if _SWIFT_QSPLIT > 1 else []
+        if _swift_w_numel(blocks, bsz, n_heads) != w.numel():
+            blocks = _swift_blocks(seq_len, chunk_size, 1)
+        w_off = 0
+        for qb, qe, kb in blocks:
+            w_shape = (bsz, n_heads, qe - qb, qe - kb)
+            n_w = w_shape[0] * w_shape[1] * w_shape[2] * w_shape[3]
+            _ATTN_BWD_OUT(grad[:, qb:qe], query[:, qb:qe], key[:, kb:qe], value[:, kb:qe],
+                          w[w_off:w_off + n_w].view(w_shape), scale, True, query_grad[:, qb:qe], key_grad[:, kb:qe],
+                          value_grad[:, kb:qe], qb - kb)
+            w_off += n_w
+        return query_grad, key_grad, value_grad, None, None
     if w.dim() == 1:  # chunk-major flat buffer of _sequential_sliding_chunk_attention_fwd
         sizes = [bsz * n_heads * chunk_size * kc for kc in splits]
         ws = [t.view(bsz, n_heads, chunk_size, kc) for t, kc in zip(torch.split(w, sizes), splits)]
     else:
         ws = torch.split(w, splits, dim=-1)
-    if _ATTN_BWD_OUT is not None and prev_key_chunk is None and n_rep == 1:
-        # gradients written in place; the window's previous-chunk rows are accumulated in the GEMMs (beta = 1)
-        for c in range(nc):
-            qbos, eos = c * chunk_size, (c + 1) * chunk_size
-            kvbos = max(qbos - chunk_size, 0)
-            _ATTN_BWD_OUT(grad[:, qbos:eos], query[:, qbos:eos], key[:, kvbos:eos], value[:, kvbos:eos], ws[c], scale,
-                          True, query_grad[:, qbos:eos], key_grad[:, kvbos:eos], value_grad[:, kvbos:eos], qbos - kvbos)
-        return query_grad, key_grad, value_grad, None, None
     for c in range(nc):
         qbos = c * chunk_size
         kvbos = c * chunk_size if c == 0 else (c - 1) * chunk_size

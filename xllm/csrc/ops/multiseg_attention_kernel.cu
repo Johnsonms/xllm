@@ -132,26 +132,27 @@ void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k
     blas::GemmStridedBatchedCUDA<T>(
         handle, blas::TransposeOp::kN, blas::TransposeOp::kN, B, L1, H2, L2,
         /*alpha=*/T_ACC(1), w_data, L2, L1 * L2, v_data, H2, L2 * H2,
-        /*beta=*/T_ACC(0), y_data, H2, L1 * H2);
+        /*beta=*/T_ACC(0), y_data, y.stride(1), y.stride(0));
   } else {
     MakeGemmBatchedInputsCUDAKernel<T>
         <<<1, cuda_utils::kCUDANumThreads, 0, cuda_stream>>>(
             B, N, w_data, N * L1 * L2, L1 * L2, v_data, L2 * N * H2, H2, y_data,
-            L1 * N * H2, H2, a_ptr_data, b_ptr_data, c_ptr_data);
+            y.stride(0), H2, a_ptr_data, b_ptr_data, c_ptr_data);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     blas::GemmBatchedCUDA<T>(handle, blas::TransposeOp::kN,
                              blas::TransposeOp::kN, B * N, L1, H2, L2,
                              /*alpha=*/T_ACC(1), a_ptr_data, L2, b_ptr_data,
-                             N * H2, /*beta=*/T_ACC(0), c_ptr_data, N * H2);
+                             N * H2, /*beta=*/T_ACC(0), c_ptr_data, y.stride(1));
   }
 }
 
 }  // namespace
 
-torch::Tensor MultiSegAttentionCUDAFwdOut(
+void MultiSegAttentionCUDAFwdOut(
     const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
     const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
-    double scale, double dropout, bool use_causal_mask, torch::Tensor w) {
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w,
+    torch::Tensor y) {
   const int64_t B = q.size(0);
   const int64_t L1 = q.size(1);
   const int64_t L2 = k.size(1);
@@ -160,8 +161,9 @@ torch::Tensor MultiSegAttentionCUDAFwdOut(
   TORCH_CHECK(w.is_contiguous() && w.scalar_type() == v.scalar_type() && w.dim() == 4 && w.size(0) == B &&
               w.size(1) == N && w.size(2) == L1 && w.size(3) == L2,
               "multiseg_attention_fwd_out: w must be a contiguous [B, N, L1, L2] tensor of v's dtype");
-  torch::Tensor y = torch::empty(
-      {B, L1, N, H2}, v.options().memory_format(at::MemoryFormat::Contiguous));
+  TORCH_CHECK(y.scalar_type() == v.scalar_type() && y.dim() == 4 && y.size(0) == B && y.size(1) == L1 &&
+              y.size(2) == N && y.size(3) == H2 && y.stride(3) == 1 && y.stride(2) == H2 && y.stride(1) == N * H2,
+              "multiseg_attention_fwd_out: y must be a [B, L1, N, V] view with contiguous rows");
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf, at::kBFloat16, q.scalar_type(), "MultiSegAttentionCUDAFwdOut", [&]() {
         MultiSegAttentionCUDAFwdImpl<scalar_t>(
@@ -169,7 +171,6 @@ torch::Tensor MultiSegAttentionCUDAFwdOut(
             *(v.expect_contiguous()),  *(q_segment_idx.expect_contiguous()),
             *(k_segment_idx.expect_contiguous()), scale, dropout, use_causal_mask, y, w);
       });
-  return y;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionCUDAFwd(
