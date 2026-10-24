@@ -106,6 +106,7 @@ class OptimConf(Config):
 class ModelConf(Config):
     arch: str = "transformer"  # Architecture: transformer or gekko
     ddp_backend: str = 'fsdp2'  # Distributed parameter sharding implementation: fsdp1 or fsdp2
+    fsdp_layers_per_group: int = 1  # FSDP2 + gekko only: consecutive layers sharing one FSDP parameter group (one all-gather / reduce-scatter and one set of hooks per group; layer 0 always stays alone). >1 cuts the per-step CPU overhead of the FSDP hooks (launch-bound models: gekko-4B 8 GPUs -4% at 4) at the cost of keeping that many layers unsharded at once.
     num_layers: int = 8
     model_dim: int = 1024  # Dimensions of token hidden state and residual stream
     # Attention

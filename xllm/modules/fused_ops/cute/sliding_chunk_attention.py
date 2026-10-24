@@ -1470,22 +1470,47 @@ class RowDot:
 # Host side
 # ======================================================================================================
 
+# Every layer of a training step derives the same kmin / qmax from the same segment_idx tensor (and the backward
+# derives them again): a one-entry cache per helper, keyed on the identity and version of its input, saves the
+# ~0.3 ms of host time per call that made the forward of the smaller models launch-bound. Holding a reference to
+# the key tensor keeps its id from being reused while the entry is alive.
+_SEG_CACHE: dict = {}
+
+
+def _cached(name, src, make):
+    key = (id(src), src._version, src.shape)
+    hit = _SEG_CACHE.get(name)
+    if hit is not None and hit[0] == key:
+        return hit[2]
+    out = make()
+    _SEG_CACHE[name] = (key, src, out)
+    return out
+
+
 def segment_starts(segment_idx: Optional[torch.Tensor], B: int, L: int, device) -> torch.Tensor:
     """kmin[b, t]: the first position of the segment of position t (0 without segments), int32 [B, L]."""
     if segment_idx is None:
         return torch.zeros(B, L, dtype=torch.int32, device=device)
-    seg = segment_idx[:, :L]
-    idx = torch.arange(L, device=device, dtype=torch.int32).expand(B, L)
-    new = torch.ones(B, L, dtype=torch.bool, device=device)
-    new[:, 1:] = seg[:, 1:] != seg[:, :-1]
-    return torch.cummax(torch.where(new, idx, torch.zeros_like(idx)), dim=1).values.to(torch.int32)
+
+    def make():
+        seg = segment_idx[:, :L]
+        idx = torch.arange(L, device=device, dtype=torch.int32).expand(B, L)
+        new = torch.ones(B, L, dtype=torch.bool, device=device)
+        new[:, 1:] = seg[:, 1:] != seg[:, :-1]
+        return torch.cummax(torch.where(new, idx, torch.zeros_like(idx)), dim=1).values.to(torch.int32)
+
+    return _cached(("kmin", L), segment_idx, make)
 
 
 def query_limits(kmin: torch.Tensor) -> torch.Tensor:
     """qmax[b, k]: the last query whose segment starts at or before key k (int32 [B, L]); kmin is nondecreasing."""
     B, L = kmin.shape
-    pos = torch.arange(L, device=kmin.device, dtype=kmin.dtype).expand(B, L).contiguous()
-    return (torch.searchsorted(kmin.contiguous(), pos, right=True) - 1).to(torch.int32)
+
+    def make():
+        pos = torch.arange(L, device=kmin.device, dtype=kmin.dtype).expand(B, L).contiguous()
+        return (torch.searchsorted(kmin.contiguous(), pos, right=True) - 1).to(torch.int32)
+
+    return _cached("qmax", kmin, make)
 
 
 def sca_bwd_dv(q, k, dout, lse2, kmin, qmax, chunk_size, scale):
