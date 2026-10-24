@@ -37,6 +37,25 @@ __global__ void MakeGemmBatchedInputsCUDAKernel(
   }
 }
 
+// C[b, n] = alpha op(A[b, n]) op(B[b, n]) + beta C[b, n] over the (batch, head) pairs of [B, L, N, H] style operands
+// (outer / inner = batch / head strides). With one batch the heads are a single strided batch (no pointer arrays).
+template <typename T>
+void HeadBatchedGemm(cublasHandle_t handle, cudaStream_t stream, blas::TransposeOp transa, blas::TransposeOp transb,
+                     int64_t B, int64_t N, int64_t m, int64_t n, int64_t k, at::opmath_type<T> alpha, const T* a,
+                     int64_t outer_a, int64_t inner_a, int64_t lda, const T* b, int64_t outer_b, int64_t inner_b,
+                     int64_t ldb, at::opmath_type<T> beta, T* c, int64_t outer_c, int64_t inner_c, int64_t ldc,
+                     const T** a_ptr, const T** b_ptr, T** c_ptr) {
+  if (B == 1) {
+    blas::GemmStridedBatchedCUDA<T>(handle, transa, transb, N, m, n, k, alpha, a, lda, inner_a, b, ldb, inner_b, beta,
+                                    c, ldc, inner_c);
+    return;
+  }
+  MakeGemmBatchedInputsCUDAKernel<T><<<1, cuda_utils::kCUDANumThreads, 0, stream>>>(
+      B, N, a, outer_a, inner_a, b, outer_b, inner_b, c, outer_c, inner_c, a_ptr, b_ptr, c_ptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  blas::GemmBatchedCUDA<T>(handle, transa, transb, B * N, m, n, k, alpha, a_ptr, lda, b_ptr, ldb, beta, c_ptr, ldc);
+}
+
 template <typename T>
 void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k,
                           const torch::Tensor& v, const torch::Tensor& q_segment_idx,
@@ -77,15 +96,9 @@ void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k
         static_cast<T_ACC>(scale), q_data, H1, L1 * H1, k_data, H1, L2 * H1,
         /*beta=*/T_ACC(0), w_data, L2, L1 * L2);
   } else {
-    MakeGemmBatchedInputsCUDAKernel<T>
-        <<<1, cuda_utils::kCUDANumThreads, 0, cuda_stream>>>(
-            B, N, q_data, L1 * N * H1, H1, k_data, L2 * N * H1, H1, w_data,
-            N * L1 * L2, L1 * L2, a_ptr_data, b_ptr_data, c_ptr_data);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    blas::GemmBatchedCUDA<T>(
-        handle, blas::TransposeOp::kN, blas::TransposeOp::kT, B * N, L1, L2, H1,
-        static_cast<T_ACC>(scale), a_ptr_data, N * H1, b_ptr_data, N * H1,
-        /*beta=*/T_ACC(0), c_ptr_data, L2);
+    HeadBatchedGemm<T>(handle, cuda_stream, blas::TransposeOp::kN, blas::TransposeOp::kT, B, N, L1, L2, H1, static_cast<T_ACC>(scale),
+                       q_data, L1 * N * H1, H1, N * H1, k_data, L2 * N * H1, H1, N * H1,
+                       /*beta=*/T_ACC(0), w_data, N * L1 * L2, L1 * L2, L2, a_ptr_data, b_ptr_data, c_ptr_data);
   }
 
   constexpr int64_t kShmSize = 0;
@@ -134,15 +147,9 @@ void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k
         /*alpha=*/T_ACC(1), w_data, L2, L1 * L2, v_data, H2, L2 * H2,
         /*beta=*/T_ACC(0), y_data, y.stride(1), y.stride(0));
   } else {
-    MakeGemmBatchedInputsCUDAKernel<T>
-        <<<1, cuda_utils::kCUDANumThreads, 0, cuda_stream>>>(
-            B, N, w_data, N * L1 * L2, L1 * L2, v_data, L2 * N * H2, H2, y_data,
-            y.stride(0), H2, a_ptr_data, b_ptr_data, c_ptr_data);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    blas::GemmBatchedCUDA<T>(handle, blas::TransposeOp::kN,
-                             blas::TransposeOp::kN, B * N, L1, H2, L2,
-                             /*alpha=*/T_ACC(1), a_ptr_data, L2, b_ptr_data,
-                             N * H2, /*beta=*/T_ACC(0), c_ptr_data, y.stride(1));
+    HeadBatchedGemm<T>(handle, cuda_stream, blas::TransposeOp::kN, blas::TransposeOp::kN, B, N, L1, H2, L2, /*alpha=*/T_ACC(1),
+                       w_data, N * L1 * L2, L1 * L2, L2, v_data, L2 * N * H2, H2, N * H2,
+                       /*beta=*/T_ACC(0), y_data, y.stride(0), H2, y.stride(1), a_ptr_data, b_ptr_data, c_ptr_data);
   }
 }
 

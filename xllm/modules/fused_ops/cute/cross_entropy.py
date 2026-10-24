@@ -45,8 +45,8 @@ def _block_reduce(v: Float32, red: cute.Tensor, tidx: Int32, is_max: cutlass.Con
 
 
 class CeLogits:
-    def __init__(self, V: int, want_loss: bool, want_grad: bool):
-        self.V, self.want_loss, self.want_grad = V, want_loss, want_grad
+    def __init__(self, V: int, want_loss: bool, want_grad: bool, want_fp32: bool = True):
+        self.V, self.want_loss, self.want_grad, self.want_fp32 = V, want_loss, want_grad, want_fp32
         assert V % VEC == 0
 
     @cute.jit
@@ -97,14 +97,16 @@ class CeLogits:
                     p = cute.math.exp(x8[k] - m, fastmath=True) * inv
                     p = p - 1.0 if i * VEC + k == tgt else p
                     sc[k] = 0.0 if ignored else p
-                cute.make_tensor((o32 + i * VEC).align(16), cute.make_layout(VEC)).store(sc.load())
+                if cutlass.const_expr(self.want_fp32):
+                    cute.make_tensor((o32 + i * VEC).align(16), cute.make_layout(VEC)).store(sc.load())
                 cute.make_tensor((o16 + i * VEC).align(16), cute.make_layout(VEC)).store(sc.load().to(BFloat16))
 
 
-def ce_logits(logits: torch.Tensor, targets: torch.Tensor, ignore_mask: torch.Tensor, want_loss: bool, want_grad: bool
-              ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+def ce_logits(logits: torch.Tensor, targets: torch.Tensor, ignore_mask: torch.Tensor, want_loss: bool, want_grad: bool,
+              want_fp32: bool = True) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """(loss fp32 [C] or None, scores fp32 [C, V] or None, scores bf16 [C, V] or None) for bf16 logits [C, V], int64
-    targets [C] (in [0, V)) and a bool ignore mask [C] (rows with loss and scores 0)."""
+    targets [C] (in [0, V)) and a bool ignore mask [C] (rows with loss and scores 0). want_fp32=False skips the fp32
+    scores (None)."""
     C, V = logits.shape
     assert logits.dtype == torch.bfloat16 and targets.shape == (C,) and ignore_mask.shape == (C,)
     logits = logits.contiguous()
@@ -112,12 +114,13 @@ def ce_logits(logits: torch.Tensor, targets: torch.Tensor, ignore_mask: torch.Te
     t = targets.to(torch.int32).contiguous()
     ign = ignore_mask.to(torch.uint8).contiguous()
     loss = torch.empty(C, dtype=torch.float32, device=dev) if want_loss else None
-    s32 = torch.empty(C, V, dtype=torch.float32, device=dev) if want_grad else None
+    s32 = torch.empty(C, V, dtype=torch.float32, device=dev) if want_grad and want_fp32 else None
     s16 = torch.empty(C, V, dtype=torch.bfloat16, device=dev) if want_grad else None
     dummy32 = loss if loss is not None else torch.empty(16, dtype=torch.float32, device=dev)
-    fn = _compiled(("ce_logits", V, want_loss, want_grad), lambda: CeLogits(V, want_loss, want_grad), lambda: (
+    fp32 = bool(want_fp32) and want_grad
+    fn = _compiled(("ce_logits", V, want_loss, want_grad, fp32), lambda: CeLogits(V, want_loss, want_grad, fp32), lambda: (
         _fake(BFloat16), _fake(Int32, 4), _fake(Uint8, 1), _fake(Float32, 4), _fake(Float32), _fake(BFloat16), Int32(0)))
-    fn(logits.reshape(-1), t, ign, (loss if want_loss else dummy32), (s32 if want_grad else dummy32).reshape(-1),
+    fn(logits.reshape(-1), t, ign, (loss if want_loss else dummy32), (s32 if s32 is not None else dummy32).reshape(-1),
        (s16 if want_grad else logits).reshape(-1), C)
     return loss, s32, s16
 
