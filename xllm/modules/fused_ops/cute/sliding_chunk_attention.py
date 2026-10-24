@@ -732,6 +732,236 @@ class ScaFwdT:
             tmem.free(tmem_ptr)
 
 
+class ScaPmat:
+    """P = exp2(S scale2 - lse2) (bf16) of the forward, materialized chunk-major for the large-V backward:
+    Pm[(c, b, h)][q - cC][k - (c - 1) C] for the queries q of chunk c and the keys k of chunks c - 1 and c
+    (columns [0, C) of chunk 0 are unused). Masked / skipped entries are zero (the buffer is zeroed by the host),
+    so dV of the keys of chunk c is the cuBLAS GEMM Pm[c][:, C:]^T dO_c + Pm[c + 1][:, :C]^T dO_{c+1}.
+
+    One (batch, head, chunk, 128-row q tile) per CTA; the q tile in TMEM as the A operand of S = Q K^T (64-key
+    blocks), 4 softmax warps (thread = row) write their 64 bf16 values per block straight to global memory.
+    TMEM: Q (S/2 columns) + S x 2: 256 columns for S = 256, two CTAs per SM."""
+
+    def __init__(self, H: int, K: int, S: int, C: int, KB: int = 64, k_stages: int = 3):
+        self.H, self.K, self.S, self.C, self.KB = H, K, S, C, KB
+        self.n_rep = H // K
+        self.TM = 128
+        self.k_stages = k_stages
+        self.num_softmax_warps = 4
+        self.mma_warp = 4
+        self.tma_warp = 5
+        self.threads = 32 * 6
+        self.row_tiles = C // self.TM
+        assert H % K == 0 and S % 64 == 0 and S <= 256 and C % KB == 0 and C % 128 == 0 and KB == 64
+        self.tmem_q = 0
+        self.tmem_s = S // 2
+        total = self.tmem_s + 2 * KB
+        self.tmem_cols = max(32, 1 << (total - 1).bit_length())
+
+    @cute.jit
+    def __call__(self, tQ: cute.Tensor, tK: cute.Tensor, tLse: cute.Tensor, tKmin: cute.Tensor, tPm: cute.Tensor,
+                 B: Int32, L: Int32, scale2: Float32, stream: cuda.CUstream):
+        H, K, S, KB = self.H, self.K, self.S, self.KB
+        nc = L // self.C
+        mK = cute.make_tensor(tK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        tm_qk = cute.make_tiled_mma(tcgen05.MmaF16BF16Op(
+            BFloat16, Float32, (self.TM, KB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.TMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K))
+        q_layout = sm100_utils.make_smem_layout_a(tm_qk, (self.TM, KB, S), BFloat16, 1)  # TMEM A operand
+        k_layout = sm100_utils.make_smem_layout_b(tm_qk, (self.TM, KB, S), BFloat16, self.k_stages)
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        tma_k, mK_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mK, cute.slice_(k_layout, (None, None, None, 0)), (self.TM, KB, S), tm_qk)
+        num_tiles = B * nc * H * self.row_tiles
+        self.kernel(tm_qk, tma_k, mK_t, tQ.iterator, tLse.iterator, tKmin.iterator, tPm.iterator, q_layout, k_layout,
+                    B, L, nc, scale2).launch(grid=[num_tiles, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, tm_qk: cute.TiledMma, tma_k: cute.CopyAtom, mK: cute.Tensor, pQ: cute.Pointer, pLse: cute.Pointer,
+               pKmin: cute.Pointer, pPm: cute.Pointer, q_layout: cute.ComposedLayout, k_layout: cute.ComposedLayout,
+               B: Int32, L: Int32, nc: Int32, scale2: Float32):
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        H, K, S, KB, C = self.H, self.K, self.S, self.KB, self.C
+        rt = bidx % self.row_tiles
+        t1 = bidx // self.row_tiles
+        h = t1 % H
+        t2 = t1 // H
+        c = t2 % nc
+        b = t2 // nc
+        kh = h // self.n_rep
+        q0 = c * C + rt * self.TM
+        kstart = Int32(0)
+        if c > 0:
+            kstart = (c - 1) * C
+        kmin0 = cute.make_tensor(pKmin + (b * L + q0), cute.make_layout(1))[0]
+        kb_lo = (kmin0 - kstart) // KB
+        if kb_lo < 0:
+            kb_lo = Int32(0)
+        kb_hi = (q0 + self.TM - 1 - kstart) // KB
+        n_blocks = kb_hi - kb_lo + 1
+        kblk0 = kstart // KB + kb_lo
+
+        if warp == self.tma_warp:
+            cpasync.prefetch_descriptor(tma_k)
+
+        @cute.struct
+        class SharedStorage:
+            k_mbar: cute.struct.MemRange[cutlass.Int64, self.k_stages * 2]
+            raw_mbar: cute.struct.MemRange[cutlass.Int64, 4]
+            tmem_holding: Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        raw = storage.raw_mbar.data_ptr()
+        S_FULL, S_EMPTY = 0, 2
+        if warp == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(raw + (S_FULL + i), 1)
+                    cute.arch.mbarrier_init(raw + (S_EMPTY + i), self.num_softmax_warps)
+            cute.arch.mbarrier_init_fence()
+        tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * (self.num_softmax_warps + 1))
+        q_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 * (self.num_softmax_warps + 1))
+        tmem = utils.TmemAllocator(storage.tmem_holding.ptr, barrier_for_retrieve=tmem_bar, allocator_warp_id=0)
+        one = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        k_bytes = cute.size_in_bytes(BFloat16, cute.select(k_layout, mode=[0, 1, 2]))
+        k_prod, k_cons = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.k_mbar.data_ptr(), num_stages=self.k_stages, producer_group=one, consumer_group=one,
+            tx_count=k_bytes).make_participants()
+        cute.arch.barrier()
+        sK = smem.allocate_tensor(BFloat16, k_layout.outer, byte_alignment=1024, swizzle=k_layout.inner)
+        gK = cute.local_tile(mK, (KB, S), (None, None, None, None))
+        thr_qk = tm_qk.get_slice(0)
+        tKs, tKg = cpasync.tma_partition(tma_k, 0, cute.make_layout(1), cute.group_modes(sK, 0, 3), cute.group_modes(thr_qk.partition_B(gK), 0, 3))
+        tCrK = tm_qk.make_fragment_B(sK)
+        s_fake = tm_qk.make_fragment_C(cute.append(tm_qk.partition_shape_C((self.TM, KB)), 2))
+        tQ_fake = cute.make_tensor(cute.make_ptr(BFloat16, 0, cute.AddressSpace.tmem), q_layout.outer)
+        tQr_fake = tm_qk.make_fragment_A(tQ_fake)[(None, None, None, 0)]
+
+        if warp == self.tma_warp:
+            for j in cutlass.range(n_blocks):
+                hk = k_prod.acquire_and_advance()
+                cute.copy(tma_k, tKg[(None, kblk0 + j, 0, kh, b)], tKs[(None, hk.index)], tma_bar_ptr=hk.barrier)
+            k_prod.tail()
+        elif warp == self.mma_warp:
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+            tS = cute.make_tensor(tmem_ptr + self.tmem_s, s_fake.layout)
+            tQr = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_q, dtype=BFloat16), tQr_fake.layout)
+            q_bar.arrive_and_wait()
+            op_qk = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, KB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.TMEM,
+                                         tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
+            ph_se0, ph_se1 = Int32(0), Int32(0)
+            for jj in cutlass.range_constexpr(2):
+                if jj < n_blocks:
+                    hk = k_cons.wait_and_advance()
+                    _umma(op_qk, tS[(None, None, None, jj)], tQr, tCrK, hk.index, False, raw + (S_FULL + jj))
+                    hk.release()
+            n_pairs = (n_blocks + 1) // 2
+            for jp in cutlass.range(n_pairs):
+                j = 2 * jp
+                if j + 2 < n_blocks:
+                    cute.arch.mbarrier_wait(raw + (S_EMPTY + 0), ph_se0)
+                    ph_se0 ^= 1
+                    hk = k_cons.wait_and_advance()
+                    _umma(op_qk, tS[(None, None, None, 0)], tQr, tCrK, hk.index, False, raw + S_FULL)
+                    hk.release()
+                if j + 3 < n_blocks:
+                    cute.arch.mbarrier_wait(raw + (S_EMPTY + 1), ph_se1)
+                    ph_se1 ^= 1
+                    hk = k_cons.wait_and_advance()
+                    _umma(op_qk, tS[(None, None, None, 1)], tQr, tCrK, hk.index, False, raw + (S_FULL + 1))
+                    hk.release()
+        else:
+            tmem.allocate(self.tmem_cols)
+            tmem.relinquish_alloc_permit()
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+            tS = cute.make_tensor(tmem_ptr + self.tmem_s, s_fake.layout)
+            tQr = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_q, dtype=BFloat16), tQr_fake.layout)
+            trow = tidx % 128
+            qpos = q0 + trow
+            kmin_row = cute.make_tensor(pKmin + (b * L + qpos), cute.make_layout(1))[0]
+            kmin_last = cute.make_tensor(pKmin + (b * L + q0 + self.TM - 1), cute.make_layout(1))[0]
+            neg_lse = -cute.make_tensor(pLse + ((b * H + h) * L + qpos), cute.make_layout(1))[0]
+            # q tile -> TMEM (A operand of S): this thread's row
+            st_q = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition(S // 2), tcgen05.Unpack.NONE), BFloat16)
+            r2t_q = tcgen05.make_tmem_copy(st_q, tQr)
+            thr_q = r2t_q.get_slice(trow)
+            tRT_tQ = thr_q.partition_D(tQr)
+            tRT_cq = thr_q.partition_S(thr_qk.partition_A(cute.make_identity_tensor((self.TM, S))))
+            rQ = cute.make_rmem_tensor((S,), BFloat16)
+            q_ptr = pQ + (Int64(b * L + qpos) * H + h) * S
+            for e8 in cutlass.range_constexpr(S // 8):
+                cute.make_tensor(rQ.iterator + e8 * 8, cute.make_layout(8)).store(
+                    cute.make_tensor((q_ptr + e8 * 8).align(16), cute.make_layout(8)).load())
+            cute.copy(r2t_q, cute.make_tensor(rQ.iterator, cute.make_layout(tRT_cq.shape)), tRT_tQ)
+            cute.arch.fence_view_async_tmem_store()
+            q_bar.arrive_and_wait()
+            ld_s = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(KB), tcgen05.Pack.NONE), Float32)
+            tS_r = [cute.flat_divide(tS[((None, None), 0, 0, i)], (self.TM, KB)) for i in range(2)]
+            t2r_s = [tcgen05.make_tmem_copy(ld_s, tS_r[i][(None, None, 0, 0)]) for i in range(2)]
+            tTR_s = [t2r_s[i].get_slice(trow).partition_S(tS_r[i]) for i in range(2)]
+            tTR_s = [cute.group_modes(tTR_s[i], 3, cute.rank(tTR_s[i])) for i in range(2)]
+            xs = cute.make_rmem_tensor(t2r_s[0].get_slice(trow).partition_D(cute.make_identity_tensor((self.TM, KB))).shape, Float32)
+            pbf = cute.make_rmem_tensor(xs.shape, BFloat16)
+            # this row of Pm: [(c, b, h)][qpos - cC][key - (c - 1) C]
+            row_ptr = pPm + (Int64((c * B + b) * H + h) * C + (qpos - c * C)) * (2 * C)
+            ph_sf0, ph_sf1 = Int32(0), Int32(0)
+            for j in cutlass.range(n_blocks):
+                bstart = kstart + (kb_lo + j) * KB
+                stg = j % 2
+                if stg == 0:
+                    cute.arch.mbarrier_wait(raw + (S_FULL + 0), ph_sf0)
+                    ph_sf0 ^= 1
+                    cute.copy(t2r_s[0], tTR_s[0][(None, None, None, 0)], xs)
+                else:
+                    cute.arch.mbarrier_wait(raw + (S_FULL + 1), ph_sf1)
+                    ph_sf1 ^= 1
+                    cute.copy(t2r_s[1], tTR_s[1][(None, None, None, 0)], xs)
+                cute.arch.fence_view_async_tmem_load()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(raw + (S_EMPTY + stg))
+                masked = cute.arch.make_warp_uniform(Int32((bstart < kmin_last) | (bstart + KB - 1 > q0)))
+                if masked != 0:
+                    lo = kmin_row - bstart
+                    hi = qpos - bstart
+                    for e in cutlass.range_constexpr(KB):
+                        keep = (e >= lo) & (e <= hi)
+                        xs[e] = cutlass.select_(keep, xs[e], Float32(float('-inf')))
+                for e2 in cutlass.range_constexpr(KB // 2):
+                    y0, y1 = cute.arch.fma_packed_f32x2((xs[2 * e2], xs[2 * e2 + 1]), (scale2, scale2), (neg_lse, neg_lse))
+                    xs[2 * e2] = cute.math.exp2(y0, fastmath=True)
+                    xs[2 * e2 + 1] = cute.math.exp2(y1, fastmath=True)
+                pbf.store(xs.load().to(BFloat16))
+                col0 = bstart - kstart
+                if c == 0:
+                    col0 = col0 + C
+                blk_ptr = row_ptr + col0
+                for e8 in cutlass.range_constexpr(KB // 8):
+                    cute.make_tensor((blk_ptr + e8 * 8).align(16), cute.make_layout(8)).store(
+                        cute.make_tensor(pbf.iterator + e8 * 8, cute.make_layout(8)).load())
+            # zeros for the columns of this row the GEMM reads but no block wrote: before the first block (segment
+            # start of the tile) and after the last one (causal); chunk 0 starts at column C
+            zb = cute.make_rmem_tensor((8,), BFloat16)
+            for e in cutlass.range_constexpr(8):
+                zb[e] = BFloat16(0.0)
+            cstart = Int32(0)
+            if c == 0:
+                cstart = C
+            cfirst = cstart + kb_lo * KB
+            clast = cstart + (kb_hi + 1) * KB
+            for col in cutlass.range(cstart, cfirst, 8):
+                cute.make_tensor((row_ptr + col).align(16), cute.make_layout(8)).store(
+                    cute.make_tensor(zb.iterator, cute.make_layout(8)).load())
+            for col in cutlass.range(clast, 2 * C, 8):
+                cute.make_tensor((row_ptr + col).align(16), cute.make_layout(8)).store(
+                    cute.make_tensor(zb.iterator, cute.make_layout(8)).load())
+            cute.arch.barrier(barrier_id=2, number_of_threads=32 * self.num_softmax_warps)
+            tmem.free(tmem_ptr)
+
+
 class ScaBwdDv:
     """dv[keys of a 128-row tile] = sum over the attending queries P^T dO, for one (batch, kv head, key tile) per CTA
     (shapes that do not fit ScaBwdDkDv: S + V > 256).
@@ -1960,6 +2190,7 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
     f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
     dv = torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
+    doc = None  # chunk-major dO [nc, B, H, C, V], made once when the large-V path needs it
     if 3 * (S + V) // 2 + 4 * 32 <= 512 and os.environ.get("SCA_FUSED_DKDV", "1") == "1":
         # dK and dV in one pass (S^T / P^T computed once)
         dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
@@ -1970,21 +2201,37 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
                kmin.reshape(-1), qmax.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L, float(scale * LOG2E), float(scale))
         dp_cur = dp_prev = torch.zeros(1, dtype=torch.float32, device=dev)
         return _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev), dk, dv
-    f_dv = _compiled(("sca_bwd_dv", H, K, S, V, C), lambda: ScaBwdDv(H, K, S, V, C), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
-        _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
-    f_dv(q.reshape(-1), k.reshape(-1), dout.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), qmax.reshape(-1), dv.reshape(-1),
-         B, L, float(scale * LOG2E))
+    if V > 256 and _use_pmat_dv(qmax, B, L, C):
+        # dV from the materialized bf16 P (chunk-major [C queries x 2C keys]) with cuBLAS: the v-slab kernel recomputes S^T
+        # V / 256 times, which costs as much as its own MMAs. Its cost is that of dense [C x C] GEMMs, so it only wins
+        # when most of the window is attended (few segment boundaries): 7.1B, B200: 1.5 ms vs 2.9 ms per layer without
+        # boundaries, 1.5 vs 1.1 with 7 segments per 16K tokens
+        n_rep = H // K
+        pm = torch.empty(nc, B, H, C, 2 * C, dtype=torch.bfloat16, device=dev)  # the kernel also writes the zeros
+        f_pm = _compiled(("sca_pmat", H, K, S, C), lambda: ScaPmat(H, K, S, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+        f_pm(q.reshape(-1), k.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), _col2d(pm), B, L, float(scale * LOG2E))
+        doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
+        # keys of chunk c: own queries (columns [C, 2C) of chunk c) and the queries of chunk c + 1 (columns [0, C))
+        outc = torch.bmm(pm[:, :, :, :, C:].reshape(-1, C, C).transpose(1, 2), doc.view(-1, C, V))
+        if nc > 1:
+            outc.view(nc, B, H, C, V)[:-1].view(-1, C, V).baddbmm_(pm[1:, :, :, :, :C].reshape(-1, C, C).transpose(1, 2), doc[1:].view(-1, C, V))
+        outc = outc.view(nc, B, K, n_rep, C, V)
+        dvc = outc[:, :, :, 0] if n_rep == 1 else outc.float().sum(3).to(torch.bfloat16)
+        f_un = _compiled(("sca_cmuncopy", K, V, C), lambda: ChunkMajorUncopy(K, V, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+        f_un(dvc.contiguous().reshape(-1), dv.reshape(-1), B, L)
+    else:
+        f_dv = _compiled(("sca_bwd_dv", H, K, S, V, C), lambda: ScaBwdDv(H, K, S, V, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
+            _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+        f_dv(q.reshape(-1), k.reshape(-1), dout.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), qmax.reshape(-1), dv.reshape(-1),
+             B, L, float(scale * LOG2E))
     if V > 256:
         # dP for the dK / dQ kernels (fp32 GEMMs): dPcur[(c, b, h)] = V_c dO_c^T, dPprev[(c - 1, b, h)] = V_{c-1} dO_c^T
-        f_cp = _compiled(("sca_cmcopy", H, K, V, C), lambda: ChunkMajorCopy(H, K, V, C), lambda: (
-            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
-        f_cp2 = _compiled(("sca_cmcopy", H, H, V, C), lambda: ChunkMajorCopy(H, H, V, C), lambda: (
-            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
-        vc = torch.empty(nc, B, H, C, V, dtype=torch.bfloat16, device=dev)  # heads repeated
-        doc = torch.empty(nc, B, H, C, V, dtype=torch.bfloat16, device=dev)
-        f_cp(v.reshape(-1), vc.reshape(-1), B, L)
-        f_cp2(dout.reshape(-1), doc.reshape(-1), B, L)
+        vc = _chunk_major(v, H, K, V, C, B, L, nc, dev)  # heads repeated
+        if doc is None:
+            doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
         dp_cur = torch.bmm(vc.view(-1, C, V), doc.view(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
         if nc > 1:
             dp_prev = torch.bmm(vc[:-1].reshape(-1, C, V), doc[1:].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
@@ -2001,6 +2248,28 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
          qmax.reshape(-1), dk.reshape(-1), _col2d(dp_prev), _col2d(dp_cur), B, L, float(scale * LOG2E), float(scale))
     dq = _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev)
     return dq, dk, dv
+
+
+def _use_pmat_dv(qmax, B, L, C):
+    """Attended fraction of the (key tile, query) pairs (1 without segment boundaries) from qmax, with one device
+    sync; the dense-GEMM dV path wins above ~0.5. SCA_DV_PMAT=0/1 forces the kernel / the GEMM path."""
+    env = os.environ.get("SCA_DV_PMAT", "auto")
+    if env in ("0", "1"):
+        return env == "1"
+    k0 = torch.arange(0, L, 128, device=qmax.device)
+    cap = torch.minimum((k0 // C + 2) * C - 1, torch.full_like(k0, L - 1))
+    attended = (torch.minimum(qmax[:, k0 + 127].long(), cap) - k0 + 1).clamp_(min=0).sum()
+    full = (cap - k0 + 1).sum() * B
+    return attended.item() > 0.5 * full.item()
+
+
+def _chunk_major(x, H, K, V, C, B, L, nc, dev):
+    """[nc, B, H, C, V] copy of x [B, L, K, V] with the kv heads repeated to H (ChunkMajorCopy)."""
+    f_cp = _compiled(("sca_cmcopy", H, K, V, C), lambda: ChunkMajorCopy(H, K, V, C), lambda: (
+        _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+    out = torch.empty(nc, B, H, C, V, dtype=torch.bfloat16, device=dev)
+    f_cp(x.reshape(-1), out.reshape(-1), B, L)
+    return out
 
 
 def _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev):
@@ -2754,6 +3023,40 @@ class ScaBwdDqT:
             tmem.relinquish_alloc_permit()
             cute.arch.barrier(barrier_id=2, number_of_threads=32 * self.num_cw)
             tmem.free(tmem_ptr)
+
+
+class ChunkMajorUncopy:
+    """out[b, c C + t, k, :] = x[c, b, k, t, :] (bf16 rows of V): the chunk-major GEMM output back into the
+    sequence layout (torch's permute copy of the same bytes runs at ~0.75 TB/s)."""
+
+    def __init__(self, K: int, V: int, C: int):
+        self.K, self.V, self.C = K, V, C
+        assert V % 8 == 0
+
+    @cute.jit
+    def __call__(self, tX: cute.Tensor, tOut: cute.Tensor, B: Int32, L: Int32, stream: cuda.CUstream):
+        rows = B * L * self.K
+        self.kernel(tX.iterator, tOut.iterator, B, L).launch(grid=[rows, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, pX: cute.Pointer, pOut: cute.Pointer, B: Int32, L: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        K, V, C = self.K, self.V, self.C
+        # output row (b, l, k) in order
+        k = bidx % K
+        r1 = bidx // K
+        l = r1 % L
+        b = r1 // L
+        c = l // C
+        t = l - c * C
+        src = pX + (((Int64(c * B + b) * K + k) * C + t) * V)
+        dst = pOut + (Int64(bidx) * V)
+        for i in cutlass.range_constexpr(V // 8 // 128 if V // 8 >= 128 else 1):
+            e = (i * 128 + tidx) * 8
+            if e < V:
+                cute.make_tensor((dst + e).align(16), cute.make_layout(8)).store(
+                    cute.make_tensor((src + e).align(16), cute.make_layout(8)).load())
 
 
 class ChunkMajorCopy:
