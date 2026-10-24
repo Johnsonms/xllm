@@ -667,7 +667,9 @@ def swiglu_forward(
     w3: Optional[Tensor],
     dropout: float,
     swiglu: bool,
+    residual: Optional[Tensor] = None,
 ):
+    """With ``residual`` ([tokens, D]), returns residual + fc2(hidden) from one GEMM (the add in its epilogue)."""
     # fc1 & fc3
     if swiglu:
         h1 = F.linear(x, w1)
@@ -684,7 +686,7 @@ def swiglu_forward(
         hidden = F.silu(h1)
 
     hidden, hidden_rng_state = memory_efficient_dropout_fwd(hidden, dropout, True)
-    out = F.linear(hidden, w2)
+    out = F.linear(hidden, w2) if residual is None else torch.addmm(residual, hidden, w2.t())
     return h1, h3, out, hidden_rng_state
 
 

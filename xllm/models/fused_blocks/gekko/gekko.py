@@ -6,6 +6,7 @@ import torch
 from torch.nn import functional as F
 from einops import rearrange
 
+from xllm.distributed import get_model_parallel_world_size
 from xllm.distributed.utils import reshape_gathered_tensor_along_specific_dim
 from xllm.modules.context_parallel import (
     should_send_to_next,
@@ -407,11 +408,17 @@ class GekkoBlockFunction(torch.autograd.Function):
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
         # B x L x E -> B x L x D
-        xh, _ = reduce_scatter(F.linear(attn, wo, None), parallel_region='model', async_op=False)
-        xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
+        fuse_residual = dropout == 0.0 and get_model_parallel_world_size() == 1
+        if fuse_residual:
+            # residual + attn wo^T in one GEMM (the add runs in its epilogue; reduce-scatter / dropout are no-ops)
+            xh_rng_state = None
+            xo = torch.addmm(residual.reshape(-1, residual.shape[-1]), attn.reshape(-1, attn.shape[-1]), wo.t()).view_as(residual)
+        else:
+            xh, _ = reduce_scatter(F.linear(attn, wo, None), parallel_region='model', async_op=False)
+            xh, xh_rng_state = memory_efficient_dropout_fwd(xh, dropout, True)
 
-        # residual
-        xo = torch.add(xh, residual, out=xh)
+            # residual
+            xo = torch.add(xh, residual, out=xh)
         residual = xo
 
         if send_to_next:
@@ -432,12 +439,19 @@ class GekkoBlockFunction(torch.autograd.Function):
         xf, _ = all_gather(xf, parallel_region='model', async_op=False)
 
         xf = rearrange(xf, 'b l d -> (b l) d')
-        h1, h3, out, hidden_rng_state = swiglu_forward(xf, fc1_w, fc2_w, fc3_w, hidden_dropout, swiglu)
-        out = rearrange(out, '(b l) d -> b l d', b=bsz)
-        out, _ = reduce_scatter(out, parallel_region='model', async_op=False)
-        out, out_rng_state = memory_efficient_dropout_fwd(out, dropout, True)
-        # residual
-        out = torch.add(out, residual)
+        if fuse_residual:
+            # the residual add runs in the epilogue of the fc2 GEMM
+            h1, h3, out, hidden_rng_state = swiglu_forward(xf, fc1_w, fc2_w, fc3_w, hidden_dropout, swiglu,
+                                                           residual=residual.reshape(-1, residual.shape[-1]))
+            out = out.view_as(residual)
+            out_rng_state = None
+        else:
+            h1, h3, out, hidden_rng_state = swiglu_forward(xf, fc1_w, fc2_w, fc3_w, hidden_dropout, swiglu)
+            out = rearrange(out, '(b l) d -> b l d', b=bsz)
+            out, _ = reduce_scatter(out, parallel_region='model', async_op=False)
+            out, out_rng_state = memory_efficient_dropout_fwd(out, dropout, True)
+            # residual
+            out = torch.add(out, residual)
 
         ctx.save_for_backward(
             x,  # (bsz, slen, d/MP)
