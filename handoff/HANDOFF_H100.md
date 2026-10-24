@@ -170,7 +170,8 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
-- Also tried, no gain: swift dK / dV as one beta = 1 GEMM after zeroing the new rows (2159 -> 2233 us, slower than
+- Also tried, no gain: keeping the FFN norm / TSDN outputs too under `XLLM_GEKKO_SAVE_QK_PREP` (8 GPUs -3 / -4 ms
+  for +5 GB; slower on 1 GPU at 74 GB, allocator pressure); swift dK / dV as one beta = 1 GEMM after zeroing the new rows (2159 -> 2233 us, slower than
   the beta = 1 / beta = 0 pair); the B200 CuTe conv backward rework on H100 (232-268 vs Triton 154-166 us); quack's plain GEMM vs cuBLAS on the projection shapes (wins on some, e.g. K=1024 accumulates
   217 -> 170 us, loses on others); merging the q / k / v / r projections into one GEMM (forward equal, only the
   accumulated input gradient gains ~15%, eaten by the extra copies); Triton conv backward block / warp configs (the
