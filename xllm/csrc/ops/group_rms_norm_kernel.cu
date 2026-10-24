@@ -1,4 +1,5 @@
 #include <ATen/AccumulateType.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <ATen/DeviceGuard.h>
 #include <ATen/core/TensorBase.h>
 #include <c10/core/ScalarType.h>
@@ -273,7 +274,9 @@ __global__ void GammaBwdSmallKernel(
 template <typename T, typename T_ACC, bool kMemoryEfficient>
 __global__ void GammaBwdLargeKernel(
     int64_t outer_size, int64_t inner_size, const T* y_grad, const T* x_or_y,
-    const T_ACC* rstd, T* gamma_grad, const T* __restrict__ gamma) {
+    const T_ACC* rstd, T* gamma_grad, const T* __restrict__ gamma, T_ACC* gamma_grad_acc) {
+  // gridDim.z splits the rows: with more than one split the partial sums are added into gamma_grad_acc (fp32,
+  // zeroed by the caller, cast into gamma_grad afterwards) instead of being written
 
   __shared__ T_ACC sum1_shared[cuda_utils::kWarpSize][cuda_utils::kWarpSize + 1];
 
@@ -296,8 +299,10 @@ __global__ void GammaBwdLargeKernel(
     inv_w = T_ACC(1) / gamma[j + group_offset];
   }
 
-  // Iterate over batch dimension with bounds checking
-  for (int64_t i = threadIdx.y; i < outer_size; i += blockDim.y) {
+  // Iterate over this split's rows with bounds checking
+  const int64_t rows_per_split = (outer_size + gridDim.z - 1) / gridDim.z;
+  const int64_t row_end = std::min<int64_t>(outer_size, (blockIdx.z + 1) * rows_per_split);
+  for (int64_t i = blockIdx.z * rows_per_split + threadIdx.y; i < row_end; i += blockDim.y) {
     if (valid_channel) {
       const T_ACC dy_acc = static_cast<T_ACC>(y_grad[i * inner_size + j + group_offset]);
       const T_ACC v = rstd[i * kNumGroups + group_id];
@@ -325,7 +330,11 @@ __global__ void GammaBwdLargeKernel(
   if (threadIdx.x == 0) {
     const int64_t k = blockIdx.x * blockDim.x + threadIdx.y;
     if (k < num_channels_per_group) {
-      gamma_grad[k + group_offset] = sum1;
+      if (gridDim.z == 1) {
+        gamma_grad[k + group_offset] = sum1;
+      } else {
+        atomicAdd(gamma_grad_acc + k + group_offset, sum1);
+      }
     }
   }
 }
@@ -395,7 +404,7 @@ __global__ void GammaBwdLargeKernel(
     if (true) {                                                                      \
       const int64_t num_blocks_x = utils::DivUp<int64_t>(channels_per_group, 32);    \
       const int64_t num_blocks_y = num_groups;                                       \
-      dim3 grid_size(num_blocks_x, num_blocks_y);                                    \
+      dim3 grid_size(num_blocks_x, num_blocks_y, gamma_bwd_splits);                  \
       cuda_utils::LaunchKernel(LargeKernelFunc<T, T_ACC, memory_efficient>,          \
       grid_size, dim3(32, 32), 0, cuda_stream, __VA_ARGS__);                         \
     }                                                                                \
@@ -468,6 +477,17 @@ void GroupRMSNormCUDABwdAffineImpl(
   const int64_t shm_size = sizeof(T_ACC) * cuda_utils::kWarpSize + sizeof(T_ACC) * block_size * 2;
   at::cuda::OptionalCUDAGuard guard(at::device_of(x_or_y));
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
+  // the gamma reduction runs over all rows: split them so that about 4 blocks per SM run
+  const int64_t gamma_bwd_blocks = utils::DivUp<int64_t>(channels_per_group, 32) * num_groups;
+  const int64_t num_sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t gamma_bwd_splits = std::max<int64_t>(1, std::min<int64_t>(
+      utils::DivUp<int64_t>(4 * num_sms, gamma_bwd_blocks), utils::DivUp<int64_t>(outer_size, 256)));
+  torch::Tensor gamma_grad_acc;
+  T_ACC* gamma_grad_acc_data = nullptr;
+  if (gamma_bwd_splits > 1) {
+    gamma_grad_acc = torch::zeros({inner_size}, gamma_grad.options().dtype(c10::CppTypeToScalarType<T_ACC>::value));
+    gamma_grad_acc_data = gamma_grad_acc.data_ptr<T_ACC>();
+  }
 
   BOOL_SWITCH(
       memory_efficient, MemoryEfficient,
@@ -479,8 +499,12 @@ void GroupRMSNormCUDABwdAffineImpl(
       DISPATCH_GAMMA_BWD_CUDA_KERNEL(
           GammaBwdSmallKernel, GammaBwdLargeKernel, T, T_ACC, outer_size,
           inner_size, num_groups, channels_per_group, MemoryEfficient, cuda_stream,
-          outer_size, inner_size, y_grad_data, x_or_y_data, rstd_data, gamma_grad_data, gamma_data);
+          outer_size, inner_size, y_grad_data, x_or_y_data, rstd_data, gamma_grad_data, gamma_data,
+          gamma_grad_acc_data);
   );
+  if (gamma_bwd_splits > 1) {
+    gamma_grad.copy_(gamma_grad_acc);
+  }
 }
 
 template <typename T>
