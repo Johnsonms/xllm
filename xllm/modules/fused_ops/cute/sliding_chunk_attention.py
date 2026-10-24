@@ -2223,8 +2223,12 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
             _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
         cur = (slice(None),) * 4 + (slice(C, None),)   # columns [C, 2C): the keys of the row's own chunk
         prv = (slice(None),) * 4 + (slice(None, C),)   # columns [0, C): the keys of the previous chunk
-        # dV_c = P_c[:, C:]^T dO_c + P_{c+1}[:, :C]^T dO_{c+1}
-        outc = torch.bmm(pm[cur].reshape(-1, C, C).transpose(1, 2), doc.view(-1, C, V))
+        # dV_c = P_c[:, C:]^T dO_c + P_{c+1}[:, :C]^T dO_{c+1}; the causal [C x C] block of P_c is lower triangular:
+        # its sub-blocks above the diagonal are skipped (n_sub x n_sub sub-blocks: 10 / 16 of the flops at 4)
+        n_sub = _tril_sub(C)
+        outc = torch.empty(nc, B, H, C, V, dtype=torch.bfloat16, device=dev)
+        _bmm_tril_tn(pm, doc, outc, C, n_sub)
+        outc = outc.view(-1, C, V)
         if nc > 1:
             outc.view(nc, B, H, C, V)[:-1].view(-1, C, V).baddbmm_(pm[1:][prv].reshape(-1, C, C).transpose(1, 2), doc[1:].view(-1, C, V))
         outc = outc.view(nc, B, K, n_rep, C, V)
@@ -2232,7 +2236,9 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         f_un(dvc.contiguous().reshape(-1), dv.reshape(-1), B, L)
         del outc, dvc
         # dS = P (dP - delta) scale with dP = dO V^T (fp32 GEMMs, [queries x keys])
-        dpq_cur = torch.bmm(doc.view(-1, C, V), vc.view(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
+        # (dPq_cur only below the diagonal sub-blocks: ScaDsMat never reads dP past the row's 8-aligned diagonal)
+        dpq_cur = torch.empty(nc, B, H, C, C, dtype=torch.float32, device=dev)
+        _bmm_tril_nt(doc, vc, dpq_cur, C, n_sub)
         if nc > 1:
             dpq_prev = torch.bmm(doc[1:].reshape(-1, C, V), vc[:-1].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
         else:
@@ -2243,13 +2249,17 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         f_ds(_col2d(pm), _col2d(dpq_cur), _col2d(dpq_prev), delta.reshape(-1), _col2d(ds), B, L, float(scale))
         del pm, dpq_cur, dpq_prev
         # dQ_c = dS_c[:, C:] K_c + dS_c[:, :C] K_{c-1}
-        dqc = torch.bmm(ds[cur].reshape(-1, C, C), kc.view(-1, C, S))
+        dqc = torch.empty(nc, B, H, C, S, dtype=torch.bfloat16, device=dev)
+        _bmm_tril_nn(ds, kc, dqc, C, n_sub)
+        dqc = dqc.view(-1, C, S)
         if nc > 1:
             dqc.view(nc, B, H, C, S)[1:].view(-1, C, S).baddbmm_(ds[1:][prv].reshape(-1, C, C), kc[:-1].view(-1, C, S))
         dq = torch.empty(B, L, H, S, dtype=torch.bfloat16, device=dev)
         f_unq(dqc.reshape(-1), dq.reshape(-1), B, L)
         # dK_c = dS_c[:, C:]^T Q_c + dS_{c+1}[:, :C]^T Q_{c+1}
-        dkc = torch.bmm(ds[cur].reshape(-1, C, C).transpose(1, 2), qc.view(-1, C, S))
+        dkc = torch.empty(nc, B, H, C, S, dtype=torch.bfloat16, device=dev)
+        _bmm_tril_tn(ds, qc, dkc, C, n_sub)
+        dkc = dkc.view(-1, C, S)
         if nc > 1:
             dkc.view(nc, B, H, C, S)[:-1].view(-1, C, S).baddbmm_(ds[1:][prv].reshape(-1, C, C).transpose(1, 2), qc[1:].view(-1, C, S))
         dkc = dkc.view(nc, B, K, n_rep, C, S)
@@ -2282,6 +2292,48 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
          qmax.reshape(-1), dk.reshape(-1), _col2d(dp_prev), _col2d(dp_cur), B, L, float(scale * LOG2E), float(scale))
     dq = _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev)
     return dq, dk, dv
+
+
+def _tril_sub(C):
+    """Sub-blocks per side for the causal [C x C] GEMMs (env SCA_TRIL_N; 4 skips 6 of 16 sub-blocks, 8 skips 28 of 64
+    but the smaller GEMMs run less efficiently: 7.1B C=4096 per layer cur-chunk dV 616 -> 481 / 544 us, dP 736 -> 501 / 507)."""
+    n = int(os.environ.get("SCA_TRIL_N", "4"))
+    while n > 1 and C % (n * 64):
+        n //= 2
+    return n
+
+
+def _bmm_tril_tn(pm, x, out, C, n):
+    """out[(c, b, h)] = P[:, C:]^T x per (c, b, h) for the chunk-major P / dS [nc, B, H, C, 2C] (bf16, lower triangular
+    in its [C, 2C) columns), x [nc, B, H, C, X] -> out [nc, B, H, C, X]: row block i of P only touches out[:(i + 1) c]."""
+    c = C // n
+    for i in range(n - 1, -1, -1):
+        a = pm[:, :, :, i * c:(i + 1) * c, C:C + (i + 1) * c].reshape(-1, c, (i + 1) * c).transpose(1, 2)
+        b = x[:, :, :, i * c:(i + 1) * c].reshape(-1, c, x.shape[-1])
+        o = out[:, :, :, :(i + 1) * c].reshape(-1, (i + 1) * c, out.shape[-1])
+        if i == n - 1:
+            torch.bmm(a, b, out=o)
+        else:
+            o.baddbmm_(a, b)
+
+
+def _bmm_tril_nn(ds, x, out, C, n):
+    """out[(c, b, h)] = dS[:, C:] x: row block i of dS only reads x[:(i + 1) c]."""
+    c = C // n
+    for i in range(n):
+        a = ds[:, :, :, i * c:(i + 1) * c, C:C + (i + 1) * c].reshape(-1, c, (i + 1) * c)
+        b = x[:, :, :, :(i + 1) * c].reshape(-1, (i + 1) * c, x.shape[-1])
+        torch.bmm(a, b, out=out[:, :, :, i * c:(i + 1) * c].reshape(-1, c, out.shape[-1]))
+
+
+def _bmm_tril_nt(x, y, out, C, n):
+    """out[(c, b, h)][i-th row block, :(i + 1) c] = x[i-th row block] y[:(i + 1) c]^T (fp32 out [nc, B, H, C, C]):
+    the sub-blocks above the diagonal are left unwritten."""
+    c = C // n
+    for i in range(n):
+        a = x[:, :, :, i * c:(i + 1) * c].reshape(-1, c, x.shape[-1])
+        b = y[:, :, :, :(i + 1) * c].reshape(-1, (i + 1) * c, y.shape[-1]).transpose(1, 2)
+        torch.bmm(a, b, out_dtype=torch.float32, out=out[:, :, :, i * c:(i + 1) * c, :(i + 1) * c].reshape(-1, c, (i + 1) * c))
 
 
 def _use_pmat_dv(qmax, B, L, C):
@@ -3097,13 +3149,18 @@ class ScaDsMat:
         cur = pDPc + Int64(bidx) * C
         prv = pDPp + Int64(((c - 1) * B + b) * H + h) * C * C + Int64(t) * C
         n_it = (C + 8 * 128 - 1) // (8 * 128)
+        lim = (t // 8 + 1) * 8  # P is zero past the diagonal and dP is not written there (sub-blocked GEMM)
         for i in cutlass.range_constexpr(n_it):
             e = (i * 128 + tidx) * 8
             if e < C:
                 # columns [C, 2C): the keys of the row's own chunk
-                p8 = cute.make_tensor((prow + (C + e)).align(16), cute.make_layout(8)).load().to(Float32)
-                d8 = cute.make_tensor((cur + e).align(16), cute.make_layout(8)).load()
-                cute.make_tensor((dsrow + (C + e)).align(16), cute.make_layout(8)).store((p8 * (d8 * scale + d_s)).to(BFloat16))
+                if e < lim:
+                    p8 = cute.make_tensor((prow + (C + e)).align(16), cute.make_layout(8)).load().to(Float32)
+                    d8 = cute.make_tensor((cur + e).align(16), cute.make_layout(8)).load()
+                    cute.make_tensor((dsrow + (C + e)).align(16), cute.make_layout(8)).store((p8 * (d8 * scale + d_s)).to(BFloat16))
+                else:
+                    z8 = cute.make_tensor((prow + (C + e)).align(16), cute.make_layout(8)).load().to(Float32)
+                    cute.make_tensor((dsrow + (C + e)).align(16), cute.make_layout(8)).store((z8 * 0.0).to(BFloat16))
         if c > 0:
             for i in cutlass.range_constexpr(n_it):
                 e = (i * 128 + tidx) * 8
