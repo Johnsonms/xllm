@@ -112,3 +112,23 @@ def test_gate_kernels(gate):
     dx, dm = gate_bwd(g, x, m, gate)
     torch.testing.assert_close(dx.double(), xd.grad, atol=0.1, rtol=1e-2)
     torch.testing.assert_close(dm.double(), md.grad, atol=0.1, rtol=1e-2)
+
+
+def test_cross_entropy_rows():
+    from xllm.modules.fused_ops.cute.cross_entropy import ce_rows
+    torch.manual_seed(0)
+    C, V = 256, 4000
+    logits = (torch.randn(C, V, device="cuda") * 4).bfloat16()
+    t = torch.randint(0, V, (C,), device="cuda")
+    ign = torch.rand(C, device="cuda") < 0.1
+    l = logits.double()
+    lse = torch.logsumexp(l, -1)
+    ref_loss = (lse - l[torch.arange(C), t]).masked_fill(ign, 0.0)
+    ref_s = torch.softmax(l, -1)
+    ref_s[torch.arange(C), t] -= 1.0
+    ref_s.masked_fill_(ign[:, None], 0.0)
+    loss = torch.empty(C, device="cuda")
+    s32, s16 = ce_rows(logits, t, ign, loss, True)
+    torch.testing.assert_close(loss.double(), ref_loss, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(s32.double(), ref_s, atol=1e-6, rtol=1e-4)
+    torch.testing.assert_close(s16.double(), ref_s, atol=1e-3, rtol=1e-2)

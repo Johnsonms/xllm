@@ -1,5 +1,6 @@
 from typing import Tuple, Optional
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -105,6 +106,9 @@ def _fused_linear_cross_entropy(
         x = reshape_gathered_tensor_along_specific_dim(x, gather_dim=2)
 
     x_2d = x.view(-1, mdim)
+    use_fused_rows = (model_parallel_size == 1 and os.environ.get("XLLM_CE_TORCH", "0") != "1"
+                      and x.is_cuda and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+                      and partial_voc_size % 8 == 0)
     prev_handle = None
     prev_grad = None
     prev_start_index = None
@@ -118,49 +122,60 @@ def _fused_linear_cross_entropy(
         target_1d_chunk = target_1d[start_idx:end_idx]
         target_mask_chunk = target_mask[start_idx:end_idx]
         ignore_index_mask_chunk = ignore_index_mask[start_idx:end_idx]
-        # C x V
-        partial_logits = F.linear(inp_chunk, weight).float()
-        # C
-        logits_max = torch.max(partial_logits, dim=-1)[0]
-        if model_parallel_size > 1:
-            torch.distributed.all_reduce(
-                logits_max,
-                op=torch.distributed.ReduceOp.MAX,
-                group=get_model_parallel_group(),
-            )
-        partial_logits = partial_logits - logits_max.unsqueeze(1)
-        # C
-        arange_1d = torch.arange(partial_logits.shape[0], device=partial_logits.device)
-        if compute_loss:
-            predicted_logits = partial_logits[arange_1d, target_1d_chunk]
-            predicted_logits = predicted_logits.clone().contiguous()
-            predicted_logits[target_mask_chunk] = 0.0
-            predicted_logits, handle_pred = all_reduce(predicted_logits, parallel_region='model', async_op=True)
+        if use_fused_rows:
+            # model-parallel size 1: row statistics, loss and scores (fp32 + bf16) in two passes over bf16 logits
+            from xllm.modules.fused_ops.cute.cross_entropy import ce_rows
+            res = ce_rows(F.linear(inp_chunk, weight), target_1d_chunk, ignore_index_mask_chunk,
+                          loss_flat[start_idx:end_idx] if compute_loss else None, compute_grad)
+            if compute_grad:
+                scores, scores_lp = res
+                curr_grad = torch.mm(scores, weight_fp32)
         else:
-            predicted_logits, handle_pred = None, None
+            scores_lp = None
+            # C x V
+            partial_logits = F.linear(inp_chunk, weight).float()
+            # C
+            logits_max = torch.max(partial_logits, dim=-1)[0]
+            if model_parallel_size > 1:
+                torch.distributed.all_reduce(
+                    logits_max,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=get_model_parallel_group(),
+                )
+            partial_logits = partial_logits - logits_max.unsqueeze(1)
+            # C
+            arange_1d = torch.arange(partial_logits.shape[0], device=partial_logits.device)
+            if compute_loss:
+                predicted_logits = partial_logits[arange_1d, target_1d_chunk]
+                predicted_logits = predicted_logits.clone().contiguous()
+                predicted_logits[target_mask_chunk] = 0.0
+                predicted_logits, handle_pred = all_reduce(predicted_logits, parallel_region='model', async_op=True)
+            else:
+                predicted_logits, handle_pred = None, None
 
-        # C x V
-        exp_logits = torch.exp(partial_logits, out=partial_logits)
-        sum_exp_logits = exp_logits.sum(dim=-1)
+            # C x V
+            exp_logits = torch.exp(partial_logits, out=partial_logits)
+            sum_exp_logits = exp_logits.sum(dim=-1)
 
-        if handle_pred is not None:
-            handle_pred.wait()
+            if handle_pred is not None:
+                handle_pred.wait()
 
-        sum_exp_logits, _ = all_reduce(sum_exp_logits, parallel_region='model', async_op=False)
+            sum_exp_logits, _ = all_reduce(sum_exp_logits, parallel_region='model', async_op=False)
 
-        if compute_loss:
-            loss_flat[start_idx:end_idx] = torch.log(sum_exp_logits) - predicted_logits
+            if compute_loss:
+                loss_flat[start_idx:end_idx] = torch.log(sum_exp_logits) - predicted_logits
+
+            if compute_grad:
+                # softmax scores C x V
+                scores = torch.div(exp_logits, sum_exp_logits.unsqueeze(dim=-1), out=exp_logits)
+                score_update = 1.0 - target_mask_chunk.float()
+                scores[arange_1d, target_1d_chunk] -= score_update
+                # zero out ignored index
+                scores.masked_fill_(ignore_index_mask_chunk.unsqueeze(1), value=0.0)
+                # (C x V) x (V x D) -> C x D
+                curr_grad = torch.mm(scores, weight_fp32)
 
         if compute_grad:
-            # softmax scores C x V
-            scores = torch.div(exp_logits, sum_exp_logits.unsqueeze(dim=-1), out=exp_logits)
-            score_update = 1.0 - target_mask_chunk.float()
-            scores[arange_1d, target_1d_chunk] -= score_update
-            # zero out ignored index
-            scores.masked_fill_(ignore_index_mask_chunk.unsqueeze(1), value=0.0)
-            # (C x V) x (V x D) -> C x D
-            curr_grad = torch.mm(scores, weight_fp32)
-
             if prev_grad is not None:
                 if prev_handle is not None:
                     prev_handle.wait()
@@ -176,7 +191,7 @@ def _fused_linear_cross_entropy(
 
             grad_weight = torch.addmm(
                 input=grad_weight,
-                mat1=scores.t().to(dtype=x.dtype),
+                mat1=(scores_lp if scores_lp is not None else scores.to(dtype=x.dtype)).t(),
                 mat2=inp_chunk,
                 out=grad_weight,
             )
