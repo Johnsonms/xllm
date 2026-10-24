@@ -1204,12 +1204,12 @@ def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, 
     else:
         lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
     sm90 = fwd._sm90()
+    c2 = (dlse - delta).contiguous()
     f = _compiled(("chunkb90", K, S, V, C), lambda: sm90.AwmChunkBwdSm90(K, S, V, C), lambda: (
-        *[_fake(BFloat16) for _ in range(5)], _fake(Float32), _fake(Float32), _fake(Float32), _fake(Int32, 4),
+        *[_fake(BFloat16) for _ in range(5)], _fake(Float32), _fake(Float32), _fake(Int32, 4),
         *[_fake(BFloat16) for _ in range(3)], *([Int32(0)] * 3)))
     f(k.reshape(-1), qk.reshape(-1), v.reshape(-1), dA16.reshape(-1), dB16.reshape(-1), lse2.reshape(-1),
-      delta.contiguous().reshape(-1), dlse.contiguous().reshape(-1), lo.reshape(-1), dk.reshape(-1), dqk.reshape(-1),
-      dv.reshape(-1), B, L, nu)
+      c2.reshape(-1), lo.reshape(-1), dk.reshape(-1), dqk.reshape(-1), dv.reshape(-1), B, L, nu)
 
 
 def _phase3_bwd(dout, q, w, H, K, S, V, C, has_prev, has_seg):
