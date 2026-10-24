@@ -2548,6 +2548,473 @@ class ScaBwdDvT:
             tmem.free(tmem_ptr)
 
 
+@cute.jit
+def _dk_block(masked, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_elems,
+              t2r_s0, t2r_s1, tTR_s0, tTR_s1, t2r_dp0, t2r_dp1, tTR_dp0, tTR_dp1, xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, dbg):
+    """One block of ScaBwdDkT for compute group g: P^T = exp2(S^T scale2 - lse2) (masked variant: -inf outside the
+    key's queries), dS^T = P^T (dP^T - delta) into the shared-memory A operand of dK; the S^T and dP^T stages are
+    released by the warps after their loads. Returns the advanced barrier phases."""
+    cute.arch.mbarrier_wait(raw + (_S_FULL + g), ph_sf)
+    ph_sf ^= 1
+    if g == 0:
+        cute.copy(t2r_s0, tTR_s0[(None, None, None, 0)], xs)
+    else:
+        cute.copy(t2r_s1, tTR_s1[(None, None, None, 0)], xs)
+    cute.arch.fence_view_async_tmem_load()
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive(raw + (_S_EMPTY + g))
+    if const_expr(dbg == 0):
+        if const_expr(masked):
+            lo = kpos - q0
+            for e4 in cutlass.range_constexpr(QB // 4):
+                km4 = cute.make_tensor((sKm.iterator + (slot + e4 * 4)).align(16), cute.make_layout(4)).load()
+                for i in cutlass.range_constexpr(4):
+                    e = e4 * 4 + i
+                    keep = (kpos >= km4[i]) & (e >= lo)
+                    xs[e] = cutlass.select_(keep, xs[e], Float32(float('-inf')))
+        for e4 in cutlass.range_constexpr(QB // 4):
+            l4 = cute.make_tensor((sLse.iterator + (slot + e4 * 4)).align(16), cute.make_layout(4)).load()
+            y0, y1 = cute.arch.fma_packed_f32x2((xs[4 * e4], xs[4 * e4 + 1]), (scale2, scale2), (-l4[0], -l4[1]))
+            y2, y3 = cute.arch.fma_packed_f32x2((xs[4 * e4 + 2], xs[4 * e4 + 3]), (scale2, scale2), (-l4[2], -l4[3]))
+            xs[4 * e4] = cute.math.exp2(y0, fastmath=True)
+            xs[4 * e4 + 1] = cute.math.exp2(y1, fastmath=True)
+            xs[4 * e4 + 2] = cute.math.exp2(y2, fastmath=True)
+            xs[4 * e4 + 3] = cute.math.exp2(y3, fastmath=True)
+    cute.arch.mbarrier_wait(raw + (_DP_FULL + g), ph_dpf)
+    ph_dpf ^= 1
+    if g == 0:
+        cute.copy(t2r_dp0, tTR_dp0[(None, None, None, 0)], xd)
+    else:
+        cute.copy(t2r_dp1, tTR_dp1[(None, None, None, 0)], xd)
+    cute.arch.fence_view_async_tmem_load()
+    with cute.arch.elect_one():
+        cute.arch.mbarrier_arrive(raw + (_DP_EMPTY + g))
+    if const_expr(dbg == 0):
+        for e4 in cutlass.range_constexpr(QB // 4):
+            d4 = cute.make_tensor((sDel.iterator + (slot + e4 * 4)).align(16), cute.make_layout(4)).load()
+            d0, d1 = cute.arch.sub_packed_f32x2((xd[4 * e4], xd[4 * e4 + 1]), (d4[0], d4[1]))
+            d2, d3 = cute.arch.sub_packed_f32x2((xd[4 * e4 + 2], xd[4 * e4 + 3]), (d4[2], d4[3]))
+            xd[4 * e4], xd[4 * e4 + 1] = cute.arch.mul_packed_f32x2((xs[4 * e4], xs[4 * e4 + 1]), (d0, d1))
+            xd[4 * e4 + 2], xd[4 * e4 + 3] = cute.arch.mul_packed_f32x2((xs[4 * e4 + 2], xs[4 * e4 + 3]), (d2, d3))
+        dsb.store(xd.load().to(BFloat16))
+    cute.arch.mbarrier_wait(raw + (_DS_EMPTY + g), ph_dse)
+    ph_dse ^= 1
+    ds_base = pDSs + (g * ds_elems + QB * trow)
+    for e8 in cutlass.range_constexpr(QB // 8):
+        cute.make_tensor((ds_base + 8 * (e8 ^ ((trow >> 1) & 3))).align(16), cute.make_layout(8)).store(
+            cute.make_tensor(dsb.iterator + e8 * 8, cute.make_layout(8)).load())
+    cute.arch.fence_view_async_shared()
+    cute.arch.mbarrier_arrive(raw + (_DS_FULL + g))
+    return ph_sf, ph_dpf, ph_dse
+
+
+class ScaBwdDkT:
+    """dk of a 128-key tile for one (batch, kv head, key tile) per CTA with the V tile as the TMEM A operand of
+    dP^T = V dO^T: the shapes ScaBwdDkDv cannot hold (S + V > 256) but where V / 2 + 4 QB + S <= 512 (gekko-0.9B:
+    S = V = 256 -> exactly 512 columns). The K tile stays in shared memory (TMA, A operand of S^T = K Q^T) and
+    dS^T (bf16) is the shared-memory A operand of dK += dS^T Q; ScaBwdDk also keeps V in TMEM but runs 64-query
+    blocks with a single stage of S^T / dP^T.
+
+    Structure as ScaBwdDkDv without dV: 32-query blocks (heads of the kv group x attending blocks), S^T and dP^T
+    double buffered (their stages are released by the compute warps after the loads), two groups of 4 compute warps
+    alternating blocks; the MMA warp issues, per block j, dK_{j-1}, dP^T_{j+1} and S^T_{j+2}.
+    TMEM: V, S^T x 2, dP^T x 2, dK."""
+
+    def __init__(self, H: int, K: int, S: int, V: int, C: int, QB: int = 32, q_stages: int = 4, do_stages: int = 3):
+        self.H, self.K, self.S, self.V, self.C, self.QB = H, K, S, V, C, QB
+        self.n_rep = H // K
+        self.TM = 128
+        self.q_stages = q_stages
+        self.do_stages = do_stages
+        self.num_cw = 8
+        self.mma_warp = 8
+        self.tma_warp = 9
+        self.threads = 32 * 10
+        assert H % K == 0 and S % 64 == 0 and V % 64 == 0 and V <= 256 and C % 128 == 0 and C % QB == 0 and QB == 32
+        self.tmem_v = 0
+        self.tmem_s = V // 2
+        self.tmem_dp = self.tmem_s + 2 * QB
+        self.tmem_dk = self.tmem_dp + 2 * QB
+        total = self.tmem_dk + S
+        assert total <= 512
+        self.tmem_cols = max(32, 1 << (total - 1).bit_length())
+        self.dbg = int(os.environ.get("SCA_DBG", "0"))
+
+    @cute.jit
+    def __call__(self, tQ: cute.Tensor, tK: cute.Tensor, tV: cute.Tensor, tDO: cute.Tensor, tLse: cute.Tensor,
+                 tDelta: cute.Tensor, tKmin: cute.Tensor, tQmax: cute.Tensor, tDK: cute.Tensor,
+                 B: Int32, L: Int32, scale2: Float32, scale: Float32, stream: cuda.CUstream):
+        H, K, S, V, QB = self.H, self.K, self.S, self.V, self.QB
+        nc = L // self.C
+        mK = cute.make_tensor(tK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mQ = cute.make_tensor(tQ.iterator, cute.make_layout((L, S, H, B), stride=(H * S, 1, S, L * H * S)))
+        mDO = cute.make_tensor(tDO.iterator, cute.make_layout((L, V, H, B), stride=(H * V, 1, V, L * H * V)))
+        # S^T = K Q^T: smem A (K-major), smem B (K-major)
+        tm_s = cute.make_tiled_mma(tcgen05.MmaF16BF16Op(
+            BFloat16, Float32, (self.TM, QB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K))
+        # dP^T = V dO^T: TMEM A, smem B (K-major)
+        tm_dp = cute.make_tiled_mma(tcgen05.MmaF16BF16Op(
+            BFloat16, Float32, (self.TM, QB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.TMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K))
+        # dK += dS^T Q: smem A (K-major), smem B (MN-major)
+        tm_dk = cute.make_tiled_mma(tcgen05.MmaF16BF16Op(
+            BFloat16, Float32, (self.TM, S, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+            tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN))
+        a_layout = sm100_utils.make_smem_layout_a(tm_s, (self.TM, QB, S), BFloat16, 1)
+        v_layout = sm100_utils.make_smem_layout_a(tm_dp, (self.TM, QB, V), BFloat16, 1)  # TMEM A operand
+        q_layout = sm100_utils.make_smem_layout_b(tm_s, (self.TM, QB, S), BFloat16, self.q_stages)
+        qmn_layout = sm100_utils.make_smem_layout_b(tm_dk, (self.TM, S, QB), BFloat16, self.q_stages)  # same bytes
+        do_layout = sm100_utils.make_smem_layout_b(tm_dp, (self.TM, QB, V), BFloat16, self.do_stages)
+        ds_layout = sm100_utils.make_smem_layout_a(tm_dk, (self.TM, S, QB), BFloat16, 2)
+        tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+        tma_a, mK_t = cute.nvgpu.make_tiled_tma_atom_A(tma_op, mK, cute.slice_(a_layout, (None, None, None, 0)), (self.TM, QB, S), tm_s)
+        tma_q, mQ_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mQ, cute.slice_(q_layout, (None, None, None, 0)), (self.TM, QB, S), tm_s)
+        tma_do, mDO_t = cute.nvgpu.make_tiled_tma_atom_B(tma_op, mDO, cute.slice_(do_layout, (None, None, None, 0)), (self.TM, QB, V), tm_dp)
+        num_tiles = B * K * (L // self.TM)
+        self.kernel(tm_s, tm_dp, tm_dk, tma_a, mK_t, tma_q, mQ_t, tma_do, mDO_t, tV.iterator, tLse.iterator,
+                    tDelta.iterator, tKmin.iterator, tQmax.iterator, tDK.iterator, a_layout, v_layout,
+                    q_layout, qmn_layout, do_layout, ds_layout, B, L, nc, scale2, scale).launch(
+            grid=[num_tiles, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, tm_s: cute.TiledMma, tm_dp: cute.TiledMma, tm_dk: cute.TiledMma, tma_a: cute.CopyAtom,
+               mK: cute.Tensor, tma_q: cute.CopyAtom, mQ: cute.Tensor, tma_do: cute.CopyAtom, mDO: cute.Tensor,
+               pV: cute.Pointer, pLse: cute.Pointer, pDelta: cute.Pointer, pKmin: cute.Pointer, pQmax: cute.Pointer,
+               pDK: cute.Pointer, a_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout,
+               q_layout: cute.ComposedLayout, qmn_layout: cute.ComposedLayout, do_layout: cute.ComposedLayout,
+               ds_layout: cute.ComposedLayout, B: Int32, L: Int32, nc: Int32, scale2: Float32, scale: Float32):
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        H, K, S, V, QB, C = self.H, self.K, self.S, self.V, self.QB, self.C
+        key_tiles = L // self.TM
+        kt = bidx % key_tiles
+        t1 = bidx // key_tiles
+        kh = t1 % K
+        b = t1 // K
+        k0 = kt * self.TM
+        ck = k0 // C
+        qmax = cute.make_tensor(pQmax + (b * L + k0 + self.TM - 1), cute.make_layout(1))[0]
+        q_end = (ck + 2) * C - 1
+        if q_end > L - 1:
+            q_end = L - 1
+        if qmax < q_end:
+            q_end = qmax
+        qb_lo = k0 // QB
+        qb_hi = q_end // QB
+        n_qb = qb_hi - qb_lo + 1
+        n_blocks = n_qb * self.n_rep
+
+        if warp == self.tma_warp:
+            cpasync.prefetch_descriptor(tma_a)
+            cpasync.prefetch_descriptor(tma_q)
+            cpasync.prefetch_descriptor(tma_do)
+
+        @cute.struct
+        class SharedStorage:
+            a_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            q_mbar: cute.struct.MemRange[cutlass.Int64, self.q_stages * 2]
+            do_mbar: cute.struct.MemRange[cutlass.Int64, self.do_stages * 2]
+            raw_mbar: cute.struct.MemRange[cutlass.Int64, 16]
+            tmem_holding: Int32
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        raw = storage.raw_mbar.data_ptr()
+        S_FULL, S_EMPTY, DP_FULL, DP_EMPTY, DS_FULL, DS_EMPTY, DONE = _S_FULL, _S_EMPTY, _DP_FULL, _DP_EMPTY, _DS_FULL, _DS_EMPTY, _DONE
+        if warp == 0:
+            with cute.arch.elect_one():
+                for i in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(raw + (S_FULL + i), 1)
+                    cute.arch.mbarrier_init(raw + (S_EMPTY + i), 4)
+                    cute.arch.mbarrier_init(raw + (DP_FULL + i), 1)
+                    cute.arch.mbarrier_init(raw + (DP_EMPTY + i), 4)
+                    cute.arch.mbarrier_init(raw + (DS_FULL + i), 128)
+                    cute.arch.mbarrier_init(raw + (DS_EMPTY + i), 1)
+                cute.arch.mbarrier_init(raw + DONE, 1)
+            cute.arch.mbarrier_init_fence()
+        tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * (self.num_cw + 1))
+        kv_bar = pipeline.NamedBarrier(barrier_id=4, num_threads=32 * (self.num_cw + 1))
+        tmem = utils.TmemAllocator(storage.tmem_holding.ptr, barrier_for_retrieve=tmem_bar, allocator_warp_id=0)
+        one = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        a_bytes = cute.size_in_bytes(BFloat16, cute.select(a_layout, mode=[0, 1, 2]))
+        q_bytes = cute.size_in_bytes(BFloat16, cute.select(q_layout, mode=[0, 1, 2]))
+        do_bytes = cute.size_in_bytes(BFloat16, cute.select(do_layout, mode=[0, 1, 2]))
+        a_prod, a_cons = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.a_mbar.data_ptr(), num_stages=1, producer_group=one, consumer_group=one,
+            tx_count=a_bytes).make_participants()
+        q_prod, q_cons = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.q_mbar.data_ptr(), num_stages=self.q_stages, producer_group=one, consumer_group=one,
+            tx_count=q_bytes).make_participants()
+        do_prod, do_cons = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.do_mbar.data_ptr(), num_stages=self.do_stages, producer_group=one, consumer_group=one,
+            tx_count=do_bytes).make_participants()
+        cute.arch.barrier()
+        sLse = smem.allocate_tensor(Float32, cute.make_layout(self.num_cw * QB), byte_alignment=16)
+        sDel = smem.allocate_tensor(Float32, cute.make_layout(self.num_cw * QB), byte_alignment=16)
+        sKm = smem.allocate_tensor(Int32, cute.make_layout(self.num_cw * QB), byte_alignment=16)
+        pA = smem.allocate_array(BFloat16, cute.cosize(a_layout.outer), byte_alignment=1024)
+        sA = cute.make_tensor(cute.recast_ptr(pA, swizzle_=a_layout.inner), a_layout.outer)
+        pQ = smem.allocate_array(BFloat16, cute.cosize(q_layout.outer), byte_alignment=1024)
+        sQ = cute.make_tensor(cute.recast_ptr(pQ, swizzle_=q_layout.inner), q_layout.outer)
+        sQmn = cute.make_tensor(cute.recast_ptr(pQ, swizzle_=qmn_layout.inner), qmn_layout.outer)
+        pDOs = smem.allocate_array(BFloat16, cute.cosize(do_layout.outer), byte_alignment=1024)
+        sDO = cute.make_tensor(cute.recast_ptr(pDOs, swizzle_=do_layout.inner), do_layout.outer)
+        pDSs = smem.allocate_array(BFloat16, cute.cosize(ds_layout.outer), byte_alignment=1024)
+        sDS = cute.make_tensor(cute.recast_ptr(pDSs, swizzle_=ds_layout.inner), ds_layout.outer)
+        ds_stage_elems = cute.cosize(cute.select(ds_layout.outer, mode=[0, 1, 2]))
+
+        gA = cute.local_tile(mK, (self.TM, S), (None, None, None, None))
+        gQ = cute.local_tile(mQ, (QB, S), (None, None, None, None))
+        gDO = cute.local_tile(mDO, (QB, V), (None, None, None, None))
+        thr_s = tm_s.get_slice(0)
+        thr_dp = tm_dp.get_slice(0)
+        tAs, tAg = cpasync.tma_partition(tma_a, 0, cute.make_layout(1), cute.group_modes(sA, 0, 3), cute.group_modes(thr_s.partition_A(gA), 0, 3))
+        tQs, tQg = cpasync.tma_partition(tma_q, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(thr_s.partition_B(gQ), 0, 3))
+        tDOs, tDOg = cpasync.tma_partition(tma_do, 0, cute.make_layout(1), cute.group_modes(sDO, 0, 3), cute.group_modes(thr_dp.partition_B(gDO), 0, 3))
+        tCrA = tm_s.make_fragment_A(sA)
+        tCrQ = tm_s.make_fragment_B(sQ)
+        tCrDO = tm_dp.make_fragment_B(sDO)
+        tCrQmn = tm_dk.make_fragment_B(sQmn)
+        tCrDS = tm_dk.make_fragment_A(sDS)
+        s_fake = tm_s.make_fragment_C(cute.append(tm_s.partition_shape_C((self.TM, QB)), 2))
+        dk_fake = tm_dk.make_fragment_C(tm_dk.partition_shape_C((self.TM, S)))
+        tV_fake = cute.make_tensor(cute.make_ptr(BFloat16, 0, cute.AddressSpace.tmem), v_layout.outer)
+        tVr_fake = tm_dp.make_fragment_A(tV_fake)[(None, None, None, 0)]
+
+        if warp == self.tma_warp:
+            ha = a_prod.acquire_and_advance()
+            cute.copy(tma_a, tAg[(None, kt, 0, kh, b)], tAs[(None, ha.index)], tma_bar_ptr=ha.barrier)
+            for j in cutlass.range(n_blocks):
+                r = j // n_qb
+                qb = qb_lo + j - r * n_qb
+                h = kh * self.n_rep + r
+                hq = q_prod.acquire_and_advance()
+                cute.copy(tma_q, tQg[(None, qb, 0, h, b)], tQs[(None, hq.index)], tma_bar_ptr=hq.barrier)
+                hd = do_prod.acquire_and_advance()
+                cute.copy(tma_do, tDOg[(None, qb, 0, h, b)], tDOs[(None, hd.index)], tma_bar_ptr=hd.barrier)
+            a_prod.tail()
+            q_prod.tail()
+            do_prod.tail()
+        elif warp == self.mma_warp:
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+            tS = cute.make_tensor(tmem_ptr + self.tmem_s, s_fake.layout)
+            tDP = cute.make_tensor(tmem_ptr + self.tmem_dp, s_fake.layout)
+            tDK = cute.make_tensor(tmem_ptr + self.tmem_dk, dk_fake.layout)
+            tVr = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_v, dtype=BFloat16), tVr_fake.layout)
+            kv_bar.arrive_and_wait()  # V tile stored in TMEM by the compute warps
+            a_cons.wait()
+            tCrA0 = tCrA[(None, None, None, 0)]
+            op_s = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, QB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+                                        tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
+            op_dp = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, QB, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.TMEM,
+                                         tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.K)
+            op_dk = tcgen05.MmaF16BF16Op(BFloat16, Float32, (self.TM, S, 16), tcgen05.CtaGroup.ONE, tcgen05.OperandSource.SMEM,
+                                         tcgen05.OperandMajorMode.K, tcgen05.OperandMajorMode.MN)
+            q_rel = q_cons.clone()
+            if const_expr(self.dbg == 3):
+                for j in cutlass.range(n_blocks):
+                    hq = q_cons.wait_and_advance()
+                    hd = do_cons.wait_and_advance()
+                    _umma(op_s, tS[(None, None, None, 0)], tCrA0, tCrQ, hq.index, False, raw + S_FULL)
+                    _umma(op_dp, tDP[(None, None, None, 0)], tVr, tCrDO, hd.index, False, raw + DP_FULL)
+                    _umma(op_dk, tDK, tCrDS[(None, None, None, 0)], tCrQmn, hq.index, True, raw + DS_EMPTY)
+                    hq.release()
+                    hd.release()
+            else:
+                # both stages are filled in the prologue: the first wait on an empty barrier is for its first release
+                ph_se0, ph_se1 = Int32(0), Int32(0)
+                ph_dpe0, ph_dpe1 = Int32(0), Int32(0)
+                ph_dsf0, ph_dsf1 = Int32(0), Int32(0)
+                # prologue: S^T_0, dP^T_0, S^T_1, dP^T_1
+                hq = q_cons.wait_and_advance()
+                _umma(op_s, tS[(None, None, None, 0)], tCrA0, tCrQ, hq.index, False, raw + S_FULL)
+                hd = do_cons.wait_and_advance()
+                _umma(op_dp, tDP[(None, None, None, 0)], tVr, tCrDO, hd.index, False, raw + DP_FULL)
+                hd.release()
+                if n_blocks > 1:
+                    hq = q_cons.wait_and_advance()
+                    _umma(op_s, tS[(None, None, None, 1)], tCrA0, tCrQ, hq.index, False, raw + (S_FULL + 1))
+                    hd = do_cons.wait_and_advance()
+                    _umma(op_dp, tDP[(None, None, None, 1)], tVr, tCrDO, hd.index, False, raw + (DP_FULL + 1))
+                    hd.release()
+                n_pairs = (n_blocks + 1) // 2
+                for jp in cutlass.range(n_pairs):
+                    j = 2 * jp
+                    # ---- block j (stage 0): dK_{j-1}, then S^T_{j+2} / dP^T_{j+2} into stage 0 once the warps freed it
+                    if j >= 1:
+                        cute.arch.mbarrier_wait(raw + (DS_FULL + 1), ph_dsf1)
+                        ph_dsf1 ^= 1
+                        _umma(op_dk, tDK, tCrDS[(None, None, None, 1)], tCrQmn, q_rel.current_handle().index, True, raw + (DS_EMPTY + 1))
+                        q_rel.release()
+                        q_rel.advance()
+                    if j + 2 < n_blocks:
+                        cute.arch.mbarrier_wait(raw + (S_EMPTY + 0), ph_se0)
+                        ph_se0 ^= 1
+                        hq = q_cons.wait_and_advance()
+                        _umma(op_s, tS[(None, None, None, 0)], tCrA0, tCrQ, hq.index, False, raw + S_FULL)
+                        cute.arch.mbarrier_wait(raw + (DP_EMPTY + 0), ph_dpe0)
+                        ph_dpe0 ^= 1
+                        hd = do_cons.wait_and_advance()
+                        _umma(op_dp, tDP[(None, None, None, 0)], tVr, tCrDO, hd.index, False, raw + DP_FULL)
+                        hd.release()
+                    # ---- block j + 1 (stage 1): dK_j, then S^T_{j+3} / dP^T_{j+3} into stage 1
+                    if j + 1 < n_blocks:
+                        cute.arch.mbarrier_wait(raw + (DS_FULL + 0), ph_dsf0)
+                        ph_dsf0 ^= 1
+                        _umma(op_dk, tDK, tCrDS[(None, None, None, 0)], tCrQmn, q_rel.current_handle().index, True, raw + DS_EMPTY)
+                        q_rel.release()
+                        q_rel.advance()
+                        if j + 3 < n_blocks:
+                            cute.arch.mbarrier_wait(raw + (S_EMPTY + 1), ph_se1)
+                            ph_se1 ^= 1
+                            hq = q_cons.wait_and_advance()
+                            _umma(op_s, tS[(None, None, None, 1)], tCrA0, tCrQ, hq.index, False, raw + (S_FULL + 1))
+                            cute.arch.mbarrier_wait(raw + (DP_EMPTY + 1), ph_dpe1)
+                            ph_dpe1 ^= 1
+                            hd = do_cons.wait_and_advance()
+                            _umma(op_dp, tDP[(None, None, None, 1)], tVr, tCrDO, hd.index, False, raw + (DP_FULL + 1))
+                            hd.release()
+                # dK_{n-1}
+                if n_blocks % 2 == 1:
+                    cute.arch.mbarrier_wait(raw + (DS_FULL + 0), ph_dsf0)
+                    _umma(op_dk, tDK, tCrDS[(None, None, None, 0)], tCrQmn, q_rel.current_handle().index, True, raw + DS_EMPTY)
+                else:
+                    cute.arch.mbarrier_wait(raw + (DS_FULL + 1), ph_dsf1)
+                    _umma(op_dk, tDK, tCrDS[(None, None, None, 1)], tCrQmn, q_rel.current_handle().index, True, raw + (DS_EMPTY + 1))
+                q_rel.release()
+                q_rel.advance()
+            a_cons.release()
+            with cute.arch.elect_one():
+                tcgen05.commit(raw + DONE)
+        else:
+            tmem.allocate(self.tmem_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+            tS = cute.make_tensor(tmem_ptr + self.tmem_s, s_fake.layout)
+            tDP = cute.make_tensor(tmem_ptr + self.tmem_dp, s_fake.layout)
+            tDK = cute.make_tensor(tmem_ptr + self.tmem_dk, dk_fake.layout)
+            tVr = cute.make_tensor(cute.recast_ptr(tmem_ptr + self.tmem_v, dtype=BFloat16), tVr_fake.layout)
+            grp = warp // 4
+            trow = tidx % 128
+            kpos = k0 + trow
+            if grp == 1:
+                st_v = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition(V // 2), tcgen05.Unpack.NONE), BFloat16)
+                r2t_v = tcgen05.make_tmem_copy(st_v, tVr)
+                thr_v = r2t_v.get_slice(trow)
+                tRT_tV = thr_v.partition_D(tVr)
+                tRT_cv = thr_v.partition_S(thr_dp.partition_A(cute.make_identity_tensor((self.TM, V))))
+                rV = cute.make_rmem_tensor((V,), BFloat16)
+                v_ptr = pV + (Int64(b * L + kpos) * K + kh) * V
+                for e8 in cutlass.range_constexpr(V // 8):
+                    cute.make_tensor(rV.iterator + e8 * 8, cute.make_layout(8)).store(
+                        cute.make_tensor((v_ptr + e8 * 8).align(16), cute.make_layout(8)).load())
+                cute.copy(r2t_v, cute.make_tensor(rV.iterator, cute.make_layout(tRT_cv.shape)), tRT_tV)
+            else:
+                st_z = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition(32), tcgen05.Unpack.NONE), Float32)
+                zr = cute.make_rmem_tensor((32,), Float32)
+                for e in cutlass.range_constexpr(32):
+                    zr[e] = Float32(0.0)
+                tDK_z = cute.flat_divide(tDK[((None, None), 0, 0)], (self.TM, 32))
+                r2t_zk = tcgen05.make_tmem_copy(st_z, tDK_z[(None, None, 0, 0)])
+                tRT_zk = r2t_zk.get_slice(trow).partition_D(tDK_z)
+                tRT_zk = cute.group_modes(tRT_zk, 3, cute.rank(tRT_zk))
+                zr_v = cute.make_tensor(zr.iterator, cute.make_layout(r2t_zk.get_slice(trow).partition_S(cute.make_identity_tensor((self.TM, 32))).shape))
+                for piece in cutlass.range_constexpr(S // 32):
+                    cute.copy(r2t_zk, zr_v, tRT_zk[(None, None, None, piece)])
+            cute.arch.fence_view_async_tmem_store()
+            kv_bar.arrive_and_wait()
+            ld_s = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(QB), tcgen05.Pack.NONE), Float32)
+            tS_r = [cute.flat_divide(tS[((None, None), 0, 0, i)], (self.TM, QB)) for i in range(2)]
+            tDP_r = [cute.flat_divide(tDP[((None, None), 0, 0, i)], (self.TM, QB)) for i in range(2)]
+            t2r_s = [tcgen05.make_tmem_copy(ld_s, tS_r[i][(None, None, 0, 0)]) for i in range(2)]
+            t2r_dp = [tcgen05.make_tmem_copy(ld_s, tDP_r[i][(None, None, 0, 0)]) for i in range(2)]
+            tTR_s = [t2r_s[i].get_slice(trow).partition_S(tS_r[i]) for i in range(2)]
+            tTR_s = [cute.group_modes(tTR_s[i], 3, cute.rank(tTR_s[i])) for i in range(2)]
+            tTR_dp = [t2r_dp[i].get_slice(trow).partition_S(tDP_r[i]) for i in range(2)]
+            tTR_dp = [cute.group_modes(tTR_dp[i], 3, cute.rank(tTR_dp[i])) for i in range(2)]
+            xs = cute.make_rmem_tensor(t2r_s[0].get_slice(trow).partition_D(cute.make_identity_tensor((self.TM, QB))).shape, Float32)
+            xd = cute.make_rmem_tensor(xs.shape, Float32)
+            dsb = cute.make_rmem_tensor(xs.shape, BFloat16)
+            ld_o = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(32), tcgen05.Pack.NONE), Float32)
+            tDK_r = cute.flat_divide(tDK[((None, None), 0, 0)], (self.TM, 32))
+            t2r_dk = tcgen05.make_tmem_copy(ld_o, tDK_r[(None, None, 0, 0)])
+            tTR_dk = t2r_dk.get_slice(trow).partition_S(tDK_r)
+            tTR_dk = cute.group_modes(tTR_dk, 3, cute.rank(tTR_dk))
+            ov = cute.make_rmem_tensor(t2r_dk.get_slice(trow).partition_D(cute.make_identity_tensor((self.TM, 32))).shape, Float32)
+            obf = cute.make_rmem_tensor(ov.shape, BFloat16)
+            g = grp
+            n_own = (n_blocks - g + 1) // 2
+            if const_expr(self.dbg == 3):
+                n_own = Int32(0)
+            ph_sf = Int32(0)
+            ph_dpf = Int32(0)
+            ph_dse = Int32(1)
+            lane = tidx % 32
+            slot = warp * QB
+            r = g // n_qb
+            qb = qb_lo + g - r * n_qb
+            nxt_lse = Float32(0.0)
+            nxt_del = Float32(0.0)
+            nxt_km = Int32(0)
+            nxt_kml = Int32(0)
+            if n_own > 0:
+                h = kh * self.n_rep + r
+                nxt_lse = cute.make_tensor(pLse + ((b * H + h) * L + qb * QB + lane), cute.make_layout(1))[0]
+                nxt_del = cute.make_tensor(pDelta + ((b * H + h) * L + qb * QB + lane), cute.make_layout(1))[0]
+                nxt_km = cute.make_tensor(pKmin + (b * L + qb * QB + lane), cute.make_layout(1))[0]
+                nxt_kml = cute.make_tensor(pKmin + (b * L + qb * QB + QB - 1), cute.make_layout(1))[0]
+            for t in cutlass.range(n_own):
+                q0 = qb * QB
+                kmin_last = nxt_kml
+                sLse[slot + lane] = nxt_lse
+                sDel[slot + lane] = nxt_del
+                sKm[slot + lane] = nxt_km
+                cute.arch.sync_warp()
+                qb_n = qb + 2
+                r_n = r
+                if qb_n > qb_hi:
+                    qb_n = qb_n - n_qb
+                    r_n = r_n + 1
+                if qb_n > qb_hi:
+                    qb_n = qb_n - n_qb
+                    r_n = r_n + 1
+                if t + 1 < n_own:
+                    h_n = kh * self.n_rep + r_n
+                    nxt_lse = cute.make_tensor(pLse + ((b * H + h_n) * L + qb_n * QB + lane), cute.make_layout(1))[0]
+                    nxt_del = cute.make_tensor(pDelta + ((b * H + h_n) * L + qb_n * QB + lane), cute.make_layout(1))[0]
+                    nxt_km = cute.make_tensor(pKmin + (b * L + qb_n * QB + lane), cute.make_layout(1))[0]
+                    nxt_kml = cute.make_tensor(pKmin + (b * L + qb_n * QB + QB - 1), cute.make_layout(1))[0]
+                masked = cute.arch.make_warp_uniform(Int32((q0 < k0 + self.TM - 1) | (kmin_last > k0)))
+                if masked != 0:
+                    ph_sf, ph_dpf, ph_dse = _dk_block(
+                        True, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_stage_elems,
+                        t2r_s[0], t2r_s[1], tTR_s[0], tTR_s[1], t2r_dp[0], t2r_dp[1], tTR_dp[0], tTR_dp[1],
+                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg)
+                else:
+                    ph_sf, ph_dpf, ph_dse = _dk_block(
+                        False, g, slot, trow, kpos, q0, scale2, raw, sLse, sDel, sKm, pDSs, ds_stage_elems,
+                        t2r_s[0], t2r_s[1], tTR_s[0], tTR_s[1], t2r_dp[0], t2r_dp[1], tTR_dp[0], tTR_dp[1],
+                        xs, xd, dsb, ph_sf, ph_dpf, ph_dse, QB, self.dbg)
+                qb = qb_n
+                r = r_n
+            cute.arch.mbarrier_wait(raw + DONE, Int32(0))
+            if grp == 1:
+                row_ptr = pDK + (Int64(b * L + kpos) * K + kh) * S
+                for piece in cutlass.range_constexpr(S // 32):
+                    cute.copy(t2r_dk, tTR_dk[(None, None, None, piece)], ov)
+                    cute.arch.fence_view_async_tmem_load()
+                    obf.store((ov.load() * scale).to(BFloat16))
+                    for e8 in cutlass.range_constexpr(4):
+                        cute.make_tensor((row_ptr + (piece * 32 + e8 * 8)).align(16), cute.make_layout(8)).store(
+                            cute.make_tensor(obf.iterator + e8 * 8, cute.make_layout(8)).load())
+            tmem.relinquish_alloc_permit()
+            cute.arch.barrier(barrier_id=2, number_of_threads=32 * self.num_cw)
+            tmem.free(tmem_ptr)
+
+
 def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     """Gradients of sca_fwd: dq [B, L, H, S], dk [B, L, K, S], dv [B, L, K, V] (bf16)."""
     B, L, H, S = q.shape
@@ -2639,7 +3106,7 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
         f_unk(dkc.contiguous().reshape(-1), dk.reshape(-1), B, L)
         return dq, dk, dv
-    if S // 2 + 64 + min(V, 256) <= 512 and os.environ.get("SCA_DV_TMEM", "1") == "1":
+    if S in (64, 128, 256) and S // 2 + 64 + min(V, 256) <= 512 and os.environ.get("SCA_DV_TMEM", "1") == "1":  # K tile -> TMEM store
         f_dv = _compiled(("sca_bwd_dvt", H, K, S, V, C), lambda: ScaBwdDvT(H, K, S, V, C), lambda: (
             _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
             _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
@@ -2661,6 +3128,14 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     else:
         dp_cur = dp_prev = torch.zeros(1, dtype=torch.float32, device=dev)
     dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
+    if V in (64, 128, 256) and V // 2 + 128 + S <= 512 and os.environ.get("SCA_DK_TMEM", "1") == "1":  # V tile -> TMEM store
+        f_dkt = _compiled(("sca_bwd_dkt", H, K, S, V, C), lambda: ScaBwdDkT(H, K, S, V, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4),
+            _fake(Int32, 4), _fake(Int32, 4), _fake(BFloat16), Int32(0), Int32(0), Float32(0.0), Float32(0.0)))
+        f_dkt(q.reshape(-1), k.reshape(-1), v.reshape(-1), dout.reshape(-1), lse2.reshape(-1), delta.reshape(-1), kmin.reshape(-1),
+              qmax.reshape(-1), dk.reshape(-1), B, L, float(scale * LOG2E), float(scale))
+        dq = _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev)
+        return dq, dk, dv
     f_dk = _compiled(("sca_bwd_dk", H, K, S, V, C), lambda: ScaBwdDk(H, K, S, V, C), lambda: (
         _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4),
         _fake(Int32, 4), _fake(Int32, 4), _fake(BFloat16), _fake2(Float32), _fake2(Float32), Int32(0), Int32(0),
