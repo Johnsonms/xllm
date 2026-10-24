@@ -93,6 +93,16 @@ def _cute_conv_supported(x, weight, bias, initial_state, output_final_state, fin
     return conv_supported(x, weight, bias, initial_state, output_final_state, final_state_grad)
 
 
+def _sm90_conv_supported(x, weight, bias, initial_state, output_final_state, final_state_grad=None) -> bool:
+    """The Hopper CuTe DSL causal conv (bf16, width 4, no bias / state, channels a multiple of 256; env XLLM_CONV_SM90=0
+    disables it)."""
+    try:
+        from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_supported
+    except ImportError:
+        return False
+    return conv_act_supported(x, weight, bias, initial_state, output_final_state, final_state_grad)
+
+
 def _causal_conv1d_fwd(
     x: Tensor,
     weight: Tensor,
@@ -112,6 +122,9 @@ def _causal_conv1d_fwd(
         if _cute_conv_supported(x, weight, bias, initial_state, output_final_state):
             from xllm.modules.fused_ops.cute.causal_conv import conv_fwd
             return conv_fwd(x, weight, bos_mask, activation), None, None
+        if _sm90_conv_supported(x, weight, bias, initial_state, output_final_state):
+            from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_fwd
+            return conv_act_fwd(x, weight, bos_mask, activation), None, None
         return _triton_causal_conv1d_fwd(
             x, weight, bias, initial_state, bos_mask, output_final_state, activation, deterministic
         )
@@ -139,6 +152,10 @@ def _causal_conv1d_bwd(
         if os.environ.get("XLLM_CUTE_CONV_BWD", "0") == "1" and _cute_conv_supported(x, weight, bias, initial_state, False, final_state_grad):
             from xllm.modules.fused_ops.cute.causal_conv import conv_bwd
             x_grad, w_grad = conv_bwd(out_grad, x, weight, bos_mask, activation)
+            return x_grad, None, w_grad, None
+        if _sm90_conv_supported(x, weight, bias, initial_state, False, final_state_grad):
+            from xllm.modules.fused_ops.cute.causal_conv_sm90 import conv_act_bwd
+            x_grad, w_grad = conv_act_bwd(out_grad, x, weight, bos_mask, activation)
             return x_grad, None, w_grad, None
         return _triton_causal_conv1d_bwd(
             out_grad, final_state_grad, x, weight, bias, initial_state, bos_mask, activation, deterministic
