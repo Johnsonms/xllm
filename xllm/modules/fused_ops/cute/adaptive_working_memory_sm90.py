@@ -489,8 +489,9 @@ class AwmChunkBwdSm90:
     the TMA loads and stores; results leave through shared memory and TMA stores. The rows of the last chunk (no
     update) are zeroed by the caller."""
 
-    def __init__(self, K: int, S: int, V: int, C: int):
+    def __init__(self, K: int, S: int, V: int, C: int, dv_accumulate: bool = False):
         self.K, self.S, self.V, self.C = K, S, V, C
+        self.dv_accumulate = dv_accumulate  # dv tiles reduce-added (TMA) into dv, which holds another gradient
         self.TM, self.KB = 128, 64
         self.N = min(S, 256)  # N of every tile (dP^T, dqk, dv)
         assert S % self.KB == 0 and S <= 256 and V % self.N == 0 and C % self.TM == 0 and min(V, 256) == self.N
@@ -540,7 +541,8 @@ class AwmChunkBwdSm90:
         tma_k, mK_t = cpasync.make_tiled_tma_atom(g2s, mK, cute.slice_(p_layout, (None, None, 0)), (self.TM, S))
         tma_dk, mDK_t = cpasync.make_tiled_tma_atom(s2g, mDK, epi_one, epi_tile)
         tma_dqk, mDQK_t = cpasync.make_tiled_tma_atom(s2g, mDQK, epi_one, epi_tile)
-        tma_dv, mDV_t = cpasync.make_tiled_tma_atom(s2g, mDV, epi_one, epi_tile)
+        dv_op = cpasync.CopyReduceBulkTensorTileS2GOp() if cutlass.const_expr(self.dv_accumulate) else s2g
+        tma_dv, mDV_t = cpasync.make_tiled_tma_atom(dv_op, mDV, epi_one, epi_tile)
         assert cute.cosize(b2_layout) == cute.cosize(b1_layout) and cute.cosize(epi_layout) <= cute.cosize(a1_layout)
 
         @cute.struct
