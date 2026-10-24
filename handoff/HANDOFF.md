@@ -487,6 +487,24 @@ SCA (`sliding_chunk_attention.py`):
   fixed-cost GEMM path avoids straggling (8 x B200 7.1B: kernel path 893, forced GEMM 870, auto 884 ms;
   `SCA_PMAT_FRAC` overrides).
 
+### Later the same day (commits dad795e .. 202e81e)
+
+- `ScaBwdDvT` runs 64-query blocks where K / 2 + 128 + min(V, 256) <= 512 (3 q + 2 dO stages): 0.9B dV 624
+  -> 513 us, 7.1B 977 -> 813.
+- `ScaBwdDkT(load_dp=True)` for V > 256: no V tile / dO blocks / dP^T MMAs, the compute warps read their key
+  row of the fp32 dPcur / dPprev GEMMs per 64-query block: 7.1B dK 750 -> 485 us (kernel-path backward
+  3208 -> 3055 us/layer). `ScaBwdDq` (load_dp) is the remaining old-style kernel on 7.1B (311 us).
+- The gate kernels were instruction bound (ncu: 51 instructions per element, math-pipe throttle): with
+  beta = ln 2, softplus(x) = log2(1 + 2^x) and its derivative 1 / (1 + 2^-x) (ex2 + lg2 / rcp): forward
+  116 -> 79 us (0.9B), 247 -> 167 (7.1B), same numerics. The q/k prep backward with exp2 + rcp and packed
+  f32x2 rope: 245 -> 211 us. Lesson: on B200 a memory-bound elementwise kernel needs < ~10 instructions per
+  element to reach bandwidth; scalar fp32 math and precise `log1p` / `1.0 / x` keep these at ~4 TB/s.
+- End-to-end parity, all new paths vs all torch paths with the old extension (same batches, 3 steps): losses
+  agree to 1-3e-4 and grad norms to 2e-4 on 0.9B / 4B / 7.1B (in-process steps 526 -> 316, 386 -> 274,
+  907 -> 769 ms).
+- 8 GPUs (per-rank batches): 7.1B 873 ms (1017 at the start of the day), 4B 358 (504), 0.9B 383;
+  `fsdp_layers_per_group=4` now only buys 4 ms on the 4B. `TORCH_BLAS_PREFER_CUBLASLT=1` is slower (835 vs 813).
+
 ### Tried, not kept
 
 - CuTe causal conv1d (width 4, bos resets, silu): a register-walk kernel (`conv/causal_conv_draft.py`) and a
