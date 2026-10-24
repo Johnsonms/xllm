@@ -8,6 +8,7 @@ A row takes max(1, C / 256) warps (8 channels per lane, 16-byte loads); in the b
 of one group so the weight / bias gradient partials stay in registers (partial[slot, C], summed on the host).
 The extension's kernels run at ~1.7 TB/s on these shapes; these run at ~5-6 TB/s."""
 import os
+from typing import Optional
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -112,20 +113,21 @@ class LnFwd:
 
 
 class LnBwd:
-    def __init__(self, G: int, C: int, n_slots: int):
-        self.G, self.C, self.n_slots = G, C, n_slots
+    def __init__(self, G: int, C: int, n_slots: int, has_res: bool = False):
+        self.G, self.C, self.n_slots, self.has_res = G, C, n_slots, has_res
         self.WPR, self.E, self.RPC = _tiling(C)
         assert C % 32 == 0 and self.E in (4, 8) and self.WPR * self.RPC <= MAX_WARPS and n_slots % (G * self.RPC) == 0
 
     @cute.jit
     def __call__(self, tDy: cute.Tensor, tX: cute.Tensor, tMean: cute.Tensor, tRstd: cute.Tensor, tW: cute.Tensor, tDx: cute.Tensor,
-                 tPart: cute.Tensor, rows: Int32, stream: cuda.CUstream):
-        self.kernel(tDy.iterator, tX.iterator, tMean.iterator, tRstd.iterator, tW.iterator, tDx.iterator, tPart.iterator, rows).launch(
+                 tPart: cute.Tensor, tRes: cute.Tensor, rows: Int32, stream: cuda.CUstream):
+        self.kernel(tDy.iterator, tX.iterator, tMean.iterator, tRstd.iterator, tW.iterator, tDx.iterator, tPart.iterator, tRes.iterator,
+                    rows).launch(
             grid=[self.n_slots // self.RPC, 1, 1], block=[32 * self.WPR * self.RPC, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, pDy: cute.Pointer, pX: cute.Pointer, pMean: cute.Pointer, pRstd: cute.Pointer, pW: cute.Pointer, pDx: cute.Pointer,
-               pPart: cute.Pointer, rows: Int32):
+               pPart: cute.Pointer, pRes: cute.Pointer, rows: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         G, C, E, WPR, RPC = self.G, self.C, self.E, self.WPR, self.RPC
@@ -167,6 +169,8 @@ class LnBwd:
             dx = cute.make_rmem_tensor(cute.make_layout(E), Float32)
             for k in cutlass.range_constexpr(E):
                 dx[k] = rstd * (dy[k] - s1 - xh[k] * s2)
+            if cutlass.const_expr(self.has_res):  # residual gradient added before the bf16 rounding
+                dx.store(dx.load() + cute.make_tensor((pRes + off).align(2 * E), cute.make_layout(E)).load().to(Float32))
             cute.make_tensor((pDx + off).align(2 * E), cute.make_layout(E)).store(dx.load().to(BFloat16))
         pw = pPart + (Int64(slot) * C + col)
         cute.make_tensor(pw.align(4 * E), cute.make_layout(E)).store(acc_w.load())
@@ -192,8 +196,10 @@ def ln_fwd(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, ep
     return y, mean, rstd
 
 
-def ln_bwd(dy: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, G: int):
-    """(dx bf16 [B, L, D], dweight bf16 [D], dbias bf16 [D]) of ln_fwd (weight raw, as given to ln_fwd)."""
+def ln_bwd(dy: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor, weight: torch.Tensor, G: int,
+           residual: Optional[torch.Tensor] = None):
+    """(dx bf16 [B, L, D], dweight bf16 [D], dbias bf16 [D]) of ln_fwd (weight raw, as given to ln_fwd); with
+    ``residual`` (bf16 [B, L, D]) dx includes it (the residual branch's gradient, added in fp32)."""
     B, L, D = x.shape
     C = D // G
     rows = B * L * G
@@ -205,9 +211,12 @@ def ln_bwd(dy: torch.Tensor, x: torch.Tensor, mean: torch.Tensor, rstd: torch.Te
     w = (weight + 1.0).to(torch.bfloat16).reshape(-1)
     dx = torch.empty_like(x)
     part = torch.empty(2 * n_slots, C, dtype=torch.float32, device=dev)
-    fn = _compiled(("ln_bwd", G, C, n_slots), lambda: LnBwd(G, C, n_slots), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4), _fake(BFloat16), _fake(BFloat16), _fake(Float32), Int32(0)))
-    fn(dy.contiguous().reshape(-1), x.reshape(-1), mean.reshape(-1), rstd.reshape(-1), w, dx.reshape(-1), part.reshape(-1), rows)
+    has_res = residual is not None
+    fn = _compiled(("ln_bwd", G, C, n_slots, has_res), lambda: LnBwd(G, C, n_slots, has_res), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4), _fake(BFloat16), _fake(BFloat16), _fake(Float32),
+        _fake(BFloat16), Int32(0)))
+    res = residual.contiguous().reshape(-1) if has_res else dx.reshape(-1)
+    fn(dy.contiguous().reshape(-1), x.reshape(-1), mean.reshape(-1), rstd.reshape(-1), w, dx.reshape(-1), part.reshape(-1), res, rows)
     sums = part.view(2, n_slots // G, G, C).sum(1).reshape(2, D)
     return dx, sums[0].to(torch.bfloat16), sums[1].to(torch.bfloat16)
 

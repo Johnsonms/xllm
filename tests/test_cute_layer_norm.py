@@ -37,6 +37,10 @@ def test_layer_norm(B, L, D, G):
     assert torch.allclose(dx.float(), xf.grad, atol=3e-2, rtol=2e-2)
     assert torch.allclose(dw.float(), wf.grad, atol=1e-2 * wf.grad.abs().max().item(), rtol=1e-2)
     assert torch.allclose(db.float(), bf.grad, atol=1e-2 * bf.grad.abs().max().item(), rtol=1e-2)
+    res = torch.randn_like(x)
+    dx2, dw2, db2 = ln.ln_bwd(dy, x, mean, rstd, w, G, residual=res)
+    assert torch.allclose(dx2.float(), xf.grad + res.float(), atol=3e-2, rtol=2e-2)
+    assert torch.equal(dw2, dw) and torch.equal(db2, db)
 
 
 def test_layer_norm_supported():

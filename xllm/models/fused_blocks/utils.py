@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, List, Any
 import math
+import os
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -316,15 +317,20 @@ def layernorm_bwd(
     weight: Optional[Tensor],
     bias: Optional[Tensor],
     num_groups: int,
+    residual: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    """``residual``: a gradient added to x_grad (in the cute kernel's epilogue when it runs)."""
     xdim = x.shape[-1]
     if _cute_ln(x, weight, bias, num_groups):
         from xllm.modules.fused_ops.cute.layer_norm import ln_bwd
-        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups)
+        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups, residual=residual)
     if weight is not None:
-        return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
-        return xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+    if residual is not None:
+        x_grad = torch.add(x_grad, residual, out=x_grad)
+    return x_grad, w_grad, b_grad
 
 
 def rmsnorm_fwd(
@@ -391,12 +397,15 @@ def layer_or_rmsnorm_bwd(
     bias: Optional[Tensor],
     num_groups: int,
     apply_rmsnorm: bool,
+    residual: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     if apply_rmsnorm:
         x_grad, w_grad = rmsnorm_bwd(y_grad, x, rstd, weight, num_groups)
         b_grad = None
+        if residual is not None:
+            x_grad = torch.add(x_grad, residual, out=x_grad)
     else:
-        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups)
+        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups, residual=residual)
 
     return x_grad, w_grad, b_grad
 
@@ -660,6 +669,32 @@ def _cute_swiglu(h1: Tensor, dropout: float) -> bool:
     return swiglu_supported(h1, dropout)
 
 
+_QUACK_GEMM = None
+
+
+def _quack_swiglu(x: Tensor, w1: Tensor, dropout: float) -> bool:
+    """Whether quack's fused SwiGLU GEMMs (``quack-kernels``, CuTe DSL, Hopper / Blackwell; optional, used when
+    installed; env XLLM_QUACK_FFN=0 disables them) handle this FFN: fc1 / fc3 as one GEMM over [w1; w3] with
+    silu(h1) * h3 in its epilogue, and the fc2 input-gradient GEMM with the SwiGLU backward in its epilogue."""
+    global _QUACK_GEMM
+    if os.environ.get("XLLM_QUACK_FFN", "1") == "0" or dropout > 0 or x.dtype != torch.bfloat16 or not x.is_cuda:
+        return False
+    if w1.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[-1] % 8 or w1.shape[0] % 8:
+        return False
+    if _QUACK_GEMM is None:
+        try:
+            from quack.gemm_interface import gemm, gemm_dgated, gemm_gated
+            _QUACK_GEMM = (gemm_gated, gemm_dgated, gemm)
+        except Exception:
+            _QUACK_GEMM = False
+    return bool(_QUACK_GEMM) and torch.cuda.get_device_capability(x.device)[0] >= 9
+
+
+def _is_packed_swiglu(h3: Optional[Tensor]) -> bool:
+    """swiglu_forward's quack path returns the interleaved pre-activation [h1 | h3] as h1 and an empty h3."""
+    return h3 is not None and h3.numel() == 0
+
+
 def swiglu_forward(
     x: Tensor,
     w1: Tensor,
@@ -669,9 +704,15 @@ def swiglu_forward(
     swiglu: bool,
     residual: Optional[Tensor] = None,
 ):
-    """With ``residual`` ([tokens, D]), returns residual + fc2(hidden) from one GEMM (the add in its epilogue)."""
+    """With ``residual`` ([tokens, D]), returns residual + fc2(hidden) from one GEMM (the add in its epilogue).
+    On the quack path h1 is the interleaved pre-activation [h1 | h3] ([tokens, 2 E]) and h3 an empty marker
+    (swiglu_backward handles both forms; a recomputed h1 / h3 pair takes the unfused backward)."""
     # fc1 & fc3
-    if swiglu:
+    if swiglu and _quack_swiglu(x, w1, dropout):
+        gemm_gated = _QUACK_GEMM[0]
+        h1, hidden = gemm_gated(x, torch.cat([w1, w3]).t(), activation="swiglu", concat_layout=("B",))
+        h3 = h1.new_empty(0)
+    elif swiglu:
         h1 = F.linear(x, w1)
         h3 = F.linear(x, w3)
         if _cute_swiglu(h1, dropout):
@@ -708,33 +749,47 @@ def swiglu_backward(
     norm_groups: int,
     apply_rmsnorm: bool,
     gather_before_norm: bool,
+    residual_grad: Optional[Tensor] = None,
 ):
+    """``residual_grad`` ([B, L, D], local): added to x_grad (fused into the norm backward when possible)."""
     assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
     bsz, seq_len, _ = x.shape
 
-    # B*L x D, D x E -> B*L x E
-    h_grad = torch.mm(y_grad, w2)
-    if h3 is not None and _cute_swiglu(h1, dropout):
-        # the recompute of hidden and both gradients in one pass
-        from xllm.modules.fused_ops.cute.swiglu import swiglu_bwd
-        h, h1_grad, h3_grad = swiglu_bwd(h1, h3, h_grad)
+    # quack forward: h1 is the packed [h1 | h3] (2 E wide); a caller that recomputed only one of them hands over
+    # an unpacked h1 with the empty marker (repacked here) or the packed h1 with a recomputed h3 (ignored)
+    packed = _is_packed_swiglu(h3) or (w3 is not None and h1.shape[-1] == 2 * w1.shape[0])
+    if packed and h1.shape[-1] != 2 * w1.shape[0]:
+        h1 = _QUACK_GEMM[2](xf, torch.cat([w1, w3]).t(), concat_layout=("B",))
+    if packed:
+        # fc2 input gradient with the SwiGLU backward in its epilogue: interleaved d[h1 | h3] and the recomputed hidden
+        _, gemm_dgated, gemm = _QUACK_GEMM
+        w13 = torch.cat([w1, w3])
+        h13_grad, h = gemm_dgated(y_grad.contiguous(), w2, h1, activation="swiglu", dynamic_scheduler=True)
+        xf_grad = gemm(h13_grad, w13, dynamic_scheduler=True, concat_layout=("B",))
     else:
-        # B*L x E
-        h1s = F.silu(h1)
-        h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
-        h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
-
-        if h3 is not None:
-            h1s_grad = h_grad * h3
-            h3_grad = h_grad * h1s
+        # B*L x D, D x E -> B*L x E
+        h_grad = torch.mm(y_grad, w2)
+        if h3 is not None and _cute_swiglu(h1, dropout):
+            # the recompute of hidden and both gradients in one pass
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_bwd
+            h, h1_grad, h3_grad = swiglu_bwd(h1, h3, h_grad)
         else:
-            h1s_grad = h_grad
-            h3_grad = None
+            # B*L x E
+            h1s = F.silu(h1)
+            h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
+            h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
 
-        h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
-    xf_grad = h1_grad.matmul(w1)
-    if h3_grad is not None:
-        xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
+            if h3 is not None:
+                h1s_grad = h_grad * h3
+                h3_grad = h_grad * h1s
+            else:
+                h1s_grad = h_grad
+                h3_grad = None
+
+            h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
+        xf_grad = h1_grad.matmul(w1)
+        if h3_grad is not None:
+            xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
 
     handle_norm_w = None
     handle_norm_b = None
@@ -752,8 +807,12 @@ def swiglu_backward(
         xf_grad, handle = reduce_scatter(xf_grad, parallel_region='model', async_op=True)
 
     # E x B*L, B*L x D -> E x D
-    w1_grad = torch.mm(h1_grad.t(), xf)
-    w3_grad = None if h3_grad is None else torch.mm(h3_grad.t(), xf)
+    if packed:
+        # [w1; w3] gradient in one GEMM from the interleaved d[h1 | h3] (concat output: two contiguous halves)
+        w1_grad, w3_grad = _QUACK_GEMM[2](h13_grad.t(), xf, dynamic_scheduler=True, concat_layout=("out",)).chunk(2)
+    else:
+        w1_grad = torch.mm(h1_grad.t(), xf)
+        w3_grad = None if h3_grad is None else torch.mm(h3_grad.t(), xf)
     w2_grad = torch.mm(y_grad.t(), h)
 
     # wait for x_grad
@@ -766,8 +825,10 @@ def swiglu_backward(
 
     if not gather_before_norm:
         x_grad, norm_w_grad, norm_b_grad = layer_or_rmsnorm_bwd(
-            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm
+            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm, residual=residual_grad
         )
+    elif residual_grad is not None:
+        x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
     return x_grad, w1_grad, w2_grad, w3_grad, norm_w_grad, norm_b_grad
 
