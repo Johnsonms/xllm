@@ -50,6 +50,8 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | fused AdamW by default (`OptimConf.fused`) | 702d594 | optimizer 29 -> 16 ms (1 GPU), 17 -> 13 (8 GPU) |
 | CE row kernels (`cute/cross_entropy.py`, MP 1) | 2b4e274 | CE 43 -> 25 ms; step 660 -> 644 |
 | group norm backward in CuTe, fused gamma/beta | 652077e | norm 42 -> 32 ms; steady ~630 -> ~620 |
+| AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
+| xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
 
 All fused kernels have torch / extension fallbacks behind env switches (`XLLM_ROPE_TORCH`, `XLLM_SOFTMAX_BWD_TORCH`,
 `XLLM_SWIGLU_TORCH`, `XLLM_GATE_TORCH`, `XLLM_NORM_EXT`, `XLLM_CE_TORCH`, `AWM_SM90_CUBLAS`) and tests in
@@ -57,6 +59,26 @@ All fused kernels have torch / extension fallbacks behind env switches (`XLLM_RO
 
 Evaluated and not adopted: FA4 SM90 (CuTe) SCA via `mask_mod` + block sparsity (correct, 10-25% slower than xattn);
 xattn `segment_idx` route (slower than its BOS route); fewer out-GEMM stages (slower).
+
+### swift SCA (gekko-7.1B, V = 2048; per layer at B1 L8192, fwd + bwd)
+
+| Item | Commit | Effect |
+|---|---|---|
+| chunk-major saved attention matrices | eec3021 | no strided copies |
+| interval-mask softmax kernel (binary search for the segment's key range, 16 B vectors, 256-thread rows) + in-place attention matrix | 1afb985 | fwd 2128 -> 1577 us |
+| backward writes q / k / v gradients in place, window overlap accumulated in the GEMMs (`attention_bwd_out`, beta = 1) | 03c6156 | bwd 2929 -> 2765 us, bitwise equal |
+| query sub-chunks (`XLLM_SWIFT_QSPLIT`, default 2) skip the masked causal half; output written in place | a94bda8 | fwd+bwd 4261 -> 3827 us; dk / dv rel err vs fp32 4.5e-3 -> 4.7e-3 |
+
+8 GPUs, gekko-7.1B B1 L8192: ~940 -> ~866 ms over these items, peak 51.8 -> 49.4 GiB, losses within 2e-4.
+
+### xattn patch (local, `h100_scripts/patches/xattn-1.1.1-varlen-hdim256-bwd-stage2.patch`)
+
+xattn's BOS (EOS-packed) route runs the backward as varlen, and `RunAttentionBwdSm90Kernel` only takes the 2-stage
+Q / dO pipeline for non-varlen (`UseDenseStage2 = ... && !kVarlen`), although its shared-memory estimate fits for
+D = V = 256. Allowing it for varlen D = V = 256 (one instantiation unit,
+`sliding_chunk_attention_bwd_hdim256_vdim256_bf16_sm90.cu`, ~3 min with ninja + relink) takes the 0.9B EOS backward
+from ~362 to ~449 TFLOPS (4.8 -> 3.9 ms/layer); dk / dv bitwise equal, dq within 1 bf16 ulp (atomic order). Installed
+in this node's venv (original at `~/xattn_cuda.orig.so`); belongs upstream in xattn. 4B (D = 128) already uses 2 stages.
 
 ### Merge with the B200 fused kernels (bd125c4)
 
@@ -70,6 +92,9 @@ fallback, xattn bos guard, awm_workspace fix, residual adds in the wo / fc2 GEMM
 to the backward, fused AdamW, swift chunk-major attention matrices; `cute/group_norm.py` / `cute/softmax_bwd.py`
 remain with tests but the gekko block now uses the B200 kernels. 0.9B steady step ~596 -> ~570 ms.
 Lesson: fetch the B200 branch before starting new fused kernels to avoid duplicate work.
+Second merge (15ccbff): B200's packed f32x2 rope / softmax math in `cute/qk_prep.py` does not compile below sm_100
+("F32x2 intrinsics are not supported"); c0dc6f2 routes it through `_mul2` / `_fma2` (packed on Blackwell, scalar
+pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to run on both.
 
 ## 4. 8 GPUs (FSDP2, everything above, xattn SCA except 7.1B)
 
@@ -77,7 +102,7 @@ Lesson: fetch the B200 branch before starting new fused kernels to avoid duplica
 |---|---|---|---|---|
 | gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 686 ms (after the B200 merge) | 598 ms |
 | gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | 554 ms | 526 ms |
-| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~915-945 ms | - |
+| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~866 ms (swift items above) | - |
 
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
@@ -85,6 +110,7 @@ Lesson: fetch the B200 branch before starting new fused kernels to avoid duplica
   concurrent GEMMs instead (in isolation the 4B FFN GEMMs run at ~770 TFLOPS). Config, not code (4B, 8 GPUs):
   `NCCL_PROTO=Simple` 577 -> 568 ms; bf16 reduce-scatter (`fp32_reduce_scatter=False`) 568; both 558 (losses equal
   to 4 decimals). NVLS is not available on this node (no algorithm for fp32 reduce-scatter).
+  Same on 7.1B: ~883 -> ~878 (Simple) -> ~862 ms (Simple + bf16 reduce-scatter), losses equal to 4 decimals.
 - cuBLAS efficiency (plan §3.6): 7.1B shapes 755-790 TFLOPS (76-80% of dense peak), 4B ~770, 0.9B (K = 1536)
   ~680. Nothing to do kernel-side.
 
@@ -107,9 +133,12 @@ Lesson: fetch the B200 branch before starting new fused kernels to avoid duplica
 - SCA on 0.9B / 4B is xattn (19-26% of the step). Its BOS route packs segments as varlen sequences: with EOS
   segments the backward launches ~4x the CTAs (13,056 vs 3,280 at 0.9B) and drops from 51% to 38.5% SM throughput.
   A fix belongs in xattn (fixed chunk-aligned tiles with per-row key ranges, as the B200 CuTe SCA does).
-- 7.1B SCA (V = 2048) stays on swift: FLOP-bound (~12 ms/layer even for an ideal kernel vs swift 10.1 at L8192),
-  low ROI on H100. swift's softmax kernels (~39 ms/step) and an output-buffer variant of attention_fwd remain.
-- AWM: the backward recurrence is still torch (~100-150 us per call), the out GEMM's 7.1B forward epilogue runs at
-  57% of copy bandwidth (needs a persistent kernel overlapping epilogue and loads).
+- 7.1B SCA (V = 2048) stays on swift (cuBLAS GEMMs + softmax kernels, now ~3.8 ms/layer fwd+bwd). Left: the
+  softmax backward is at copy bandwidth; skipping keys before a segment's start needs host-side segment bounds.
+  The rest of the 7.1B step is cuBLAS (76-80% of peak) and FSDP2 copies (chunk_cat + split ~44 ms/step).
+- xattn hdim-256 backward still carries ~580 us/layer of pre / post kernels (dO.O, dQ cast, GQA dK / dV cast, dQ
+  accumulator fill) at 0.9B; xattn-internal.
+- AWM: the out GEMM's 7.1B forward epilogue runs at 57% of copy bandwidth (needs a persistent kernel overlapping
+  epilogue and loads).
 - Remaining small items (0.9B, per step): block elementwise ~34 ms, conv (triton) 26 ms (~1.4x its floor),
   TSDN step_counts recompute 3 ms, FSDP2 split/chunk_cat copies (4B ~19 ms, 7.1B ~21 ms).
