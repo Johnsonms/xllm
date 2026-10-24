@@ -2226,19 +2226,23 @@ class ScaBwdDvT:
     is freed by the completion of dV_j). For V > 256 the CTAs of the V / 256 slabs each recompute S^T.
     TMEM: K, S^T|P^T x 2, dV."""
 
-    def __init__(self, H: int, K: int, S: int, V: int, C: int, QB: int = 32, q_stages: int = 4, do_stages: int = 3):
-        self.H, self.K, self.S, self.V, self.C, self.QB = H, K, S, V, C, QB
+    def __init__(self, H: int, K: int, S: int, V: int, C: int, QB: int = 0, q_stages: int = 4, do_stages: int = 3):
+        self.H, self.K, self.S, self.V, self.C = H, K, S, V, C
         self.n_rep = H // K
         self.TM = 128
         self.VT = min(V, 256)
+        # 64-query blocks (half the MMA instructions) when they fit the 512 TMEM columns, else 32
+        self.QB = QB if QB else (64 if S // 2 + 128 + self.VT <= 512 else 32)
+        QB = self.QB
         self.n_vt = V // self.VT
-        self.q_stages = q_stages
-        self.do_stages = do_stages
+        # shared memory: QB x S q stages + QB x VT dO stages (<= ~200 KB): 4 + 3 at QB = 32, 3 + 2 at QB = 64
+        self.q_stages = q_stages if QB == 32 else 3
+        self.do_stages = do_stages if QB == 32 else 2
         self.num_cw = 8  # two groups of 4
         self.mma_warp = 8
         self.tma_warp = 9
         self.threads = 32 * 10
-        assert H % K == 0 and S % 64 == 0 and V % 64 == 0 and V % self.VT == 0 and C % 128 == 0 and C % QB == 0 and QB == 32
+        assert H % K == 0 and S % 64 == 0 and V % 64 == 0 and V % self.VT == 0 and C % 128 == 0 and C % QB == 0 and QB in (32, 64)
         self.tmem_k = 0
         self.tmem_s = S // 2
         self.tmem_dv = self.tmem_s + 2 * QB
@@ -2497,19 +2501,22 @@ class ScaBwdDvT:
             slot = warp * QB
             r = g // n_qb
             qb = qb_lo + g - r * n_qb
-            nxt_lse = Float32(0.0)
-            nxt_km = Int32(0)
+            NL = QB // 32  # column values per lane
+            nxt_lse = cute.make_rmem_tensor(cute.make_layout(NL), Float32)
+            nxt_km = cute.make_rmem_tensor(cute.make_layout(NL), Int32)
             nxt_kml = Int32(0)
             if n_own > 0:
                 h = kh * self.n_rep + r
-                nxt_lse = cute.make_tensor(pLse + ((b * H + h) * L + qb * QB + lane), cute.make_layout(1))[0]
-                nxt_km = cute.make_tensor(pKmin + (b * L + qb * QB + lane), cute.make_layout(1))[0]
+                for u in cutlass.range_constexpr(NL):
+                    nxt_lse[u] = cute.make_tensor(pLse + ((b * H + h) * L + qb * QB + u * 32 + lane), cute.make_layout(1))[0]
+                    nxt_km[u] = cute.make_tensor(pKmin + (b * L + qb * QB + u * 32 + lane), cute.make_layout(1))[0]
                 nxt_kml = cute.make_tensor(pKmin + (b * L + qb * QB + QB - 1), cute.make_layout(1))[0]
             for t in cutlass.range(n_own):
                 q0 = qb * QB
                 kmin_last = nxt_kml
-                sLse[slot + lane] = nxt_lse
-                sKm[slot + lane] = nxt_km
+                for u in cutlass.range_constexpr(NL):
+                    sLse[slot + u * 32 + lane] = nxt_lse[u]
+                    sKm[slot + u * 32 + lane] = nxt_km[u]
                 cute.arch.sync_warp()
                 qb_n = qb + 2
                 r_n = r
@@ -2521,8 +2528,9 @@ class ScaBwdDvT:
                     r_n = r_n + 1
                 if t + 1 < n_own:
                     h_n = kh * self.n_rep + r_n
-                    nxt_lse = cute.make_tensor(pLse + ((b * H + h_n) * L + qb_n * QB + lane), cute.make_layout(1))[0]
-                    nxt_km = cute.make_tensor(pKmin + (b * L + qb_n * QB + lane), cute.make_layout(1))[0]
+                    for u in cutlass.range_constexpr(NL):
+                        nxt_lse[u] = cute.make_tensor(pLse + ((b * H + h_n) * L + qb_n * QB + u * 32 + lane), cute.make_layout(1))[0]
+                        nxt_km[u] = cute.make_tensor(pKmin + (b * L + qb_n * QB + u * 32 + lane), cute.make_layout(1))[0]
                     nxt_kml = cute.make_tensor(pKmin + (b * L + qb_n * QB + QB - 1), cute.make_layout(1))[0]
                 masked = cute.arch.make_warp_uniform(Int32((q0 < k0 + self.TM - 1) | (kmin_last > k0)))
                 if masked != 0:
