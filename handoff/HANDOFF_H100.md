@@ -58,6 +58,7 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | AWM backward: dv reduce-added (TMA) into the SCA's v gradient (`awm_bwd_finish(dv_acc=)`) | 2f4cc66 | step 540.7 -> 538.9 ms |
 | AWM: lse2 combine in one kernel (was 7 torch ops per use), chunk row bounds cached per step | 9c3ff5b | AWM per call 0.9B fwd 272 -> 244 us, bwd 372 -> 344; step 538.9 -> 537.1 ms |
 | packed FFN recompute on the quack path (`swiglu_recompute`, for `recompute_fc1_out` / `fc3_out`) | 8a4842a | 7.1B L16384 unchanged |
+| opt-in `XLLM_GEKKO_SAVE_QK_PREP=1`: keep the conv / q-k prep outputs and the gate projection rmx for the backward (no recompute of 3 convs, 2 q-k preps, 1 GEMM per layer) | 171d701, 1f9e2be | 8 GPUs 0.9B 604 -> 581 ms (+20 GB), 4B 542 -> 524 (+11 GB), 7.1B 827 -> 794 (+11 GB) |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
 
@@ -138,6 +139,9 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
   help (8 / 16 / 24 SMs: 554 -> 560-575 ms).
 - `reshard_after_forward=False` (keep the unsharded params until the backward) fits on 80 GB and skips the backward
   all-gathers: 4B 554 -> 536 ms (+7 GB), 7.1B ~846 -> ~819 (+12 GB), 0.9B 640 -> 635. Config, not code.
+- Everything opt-in on (`XLLM_GEKKO_SAVE_QK_PREP=1 FSDP_RESHARD=0 NCCL_PROTO=Simple FSDP_FP32_RS=0`), 8 GPUs,
+  per-rank batches: 0.9B ~572 ms (60.4 GB), 4B ~493 (46.6 GB), 7.1B ~750 (71.7 GB); losses equal to 4 decimals.
+  Against the start of the day (xattn + torch AWM + CUB TSDN; 7.1B swift): 865 -> 572, 667 -> 493, 1003 -> 750 ms.
 - All three config knobs together (`FSDP_RESHARD=0 NCCL_PROTO=Simple FSDP_FP32_RS=0` in the harness) on the current
   head: 0.9B ~606 -> ~598 ms, 4B ~547 -> ~515 (35.6 GB), 7.1B ~837 -> ~791 (61.1 GB); losses equal to 3-4 decimals
   over 10 steps. Recommended for H100 training runs if bf16 gradient reduction is acceptable.
