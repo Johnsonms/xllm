@@ -628,6 +628,16 @@ def sliding_chunk_attention_bwd(
     )
 
 
+def _cute_swiglu(h1: Tensor, dropout: float) -> bool:
+    """Whether the fused CuTe DSL SwiGLU elementwise kernels (Blackwell, bf16, no hidden dropout; env
+    XLLM_CUTE_SWIGLU=0 disables them) handle this input."""
+    try:
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_supported
+    except ImportError:
+        return False
+    return swiglu_supported(h1, dropout)
+
+
 def swiglu_forward(
     x: Tensor,
     w1: Tensor,
@@ -640,8 +650,12 @@ def swiglu_forward(
     if swiglu:
         h1 = F.linear(x, w1)
         h3 = F.linear(x, w3)
-        hidden = F.silu(h1)
-        hidden = torch.mul(hidden, h3, out=hidden)
+        if _cute_swiglu(h1, dropout):
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd
+            hidden = swiglu_fwd(h1, h3)
+        else:
+            hidden = F.silu(h1)
+            hidden = torch.mul(hidden, h3, out=hidden)
     else:
         h1 = F.linear(x, w1)
         h3 = None
@@ -674,21 +688,26 @@ def swiglu_backward(
     assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
     bsz, seq_len, _ = x.shape
 
-    # B*L x E
-    h1s = F.silu(h1)
-    h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
     # B*L x D, D x E -> B*L x E
     h_grad = torch.mm(y_grad, w2)
-    h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
-
-    if h3 is not None:
-        h1s_grad = h_grad * h3
-        h3_grad = h_grad * h1s
+    if h3 is not None and _cute_swiglu(h1, dropout):
+        # the recompute of hidden and both gradients in one pass
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_bwd
+        h, h1_grad, h3_grad = swiglu_bwd(h1, h3, h_grad)
     else:
-        h1s_grad = h_grad
-        h3_grad = None
+        # B*L x E
+        h1s = F.silu(h1)
+        h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
+        h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
 
-    h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
+        if h3 is not None:
+            h1s_grad = h_grad * h3
+            h3_grad = h_grad * h1s
+        else:
+            h1s_grad = h_grad
+            h3_grad = None
+
+        h1_grad = torch.ops.aten.silu_backward(h1s_grad, h1)
     xf_grad = h1_grad.matmul(w1)
     if h3_grad is not None:
         xf_grad = torch.addmm(xf_grad, h3_grad, w3, out=xf_grad)
