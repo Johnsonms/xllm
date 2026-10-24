@@ -1,5 +1,6 @@
 from typing import Tuple, Optional
 import math
+import os
 
 import torch
 from torch import Tensor
@@ -106,7 +107,6 @@ def _fused_linear_cross_entropy(
     if compute_grad:
         grad_input = torch.empty(bsz * seq_len, input_.shape[-1], dtype=input_.dtype, device=input_.device)
         grad_weight = torch.zeros_like(weight)
-        weight_fp32 = weight.float()
     else:
         grad_input = None
         grad_weight = None
@@ -118,6 +118,10 @@ def _fused_linear_cross_entropy(
 
     x_2d = x.view(-1, mdim)
     use_cute = model_parallel_size == 1 and _cute_ce_supported(x_2d, partial_voc_size)
+    # cute path: grad_input from the bf16 scores (fp32 accumulation; grad_input is bf16, so the result matches the
+    # fp32-scores GEMM to its rounding) and the kernel skips the fp32 scores. XLLM_CE_DGRAD_FP32=1 keeps them.
+    dgrad_lowp = use_cute and os.environ.get("XLLM_CE_DGRAD_FP32", "0") != "1"
+    weight_fp32 = weight.float() if compute_grad and not dgrad_lowp else None
     prev_handle = None
     prev_grad = None
     prev_start_index = None
@@ -136,7 +140,8 @@ def _fused_linear_cross_entropy(
         if use_cute:
             # loss and softmax scores (fp32 and bf16) from the bf16 logits in one kernel
             from xllm.modules.fused_ops.cute.cross_entropy import ce_logits
-            loss_chunk, scores, scores_lowp = ce_logits(logits, target_1d_chunk, ignore_index_mask_chunk, compute_loss, compute_grad)
+            loss_chunk, scores, scores_lowp = ce_logits(logits, target_1d_chunk, ignore_index_mask_chunk, compute_loss,
+                                                        compute_grad, want_fp32=not dgrad_lowp)
             if compute_loss:
                 loss_flat[start_idx:end_idx] = loss_chunk
         else:
@@ -183,7 +188,7 @@ def _fused_linear_cross_entropy(
 
         if compute_grad:
             # (C x V) x (V x D) -> C x D
-            curr_grad = torch.mm(scores, weight_fp32)
+            curr_grad = torch.mm(scores_lowp, weight) if dgrad_lowp else torch.mm(scores, weight_fp32)
 
             if prev_grad is not None:
                 if prev_handle is not None:

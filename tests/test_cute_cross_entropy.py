@@ -49,6 +49,8 @@ def test_ce_logits(C, V):
     assert s is None and t is None and torch.equal(l3, l2)
     l4, s, t = ce.ce_logits(x, tgt, ign, False, True)
     assert l4 is None and torch.equal(s, s32)
+    l5, s, t = ce.ce_logits(x, tgt, ign, True, True, want_fp32=False)
+    assert s is None and torch.equal(l5, l2) and torch.equal(t, s16)
 
 
 def test_ce_logits_supported():
