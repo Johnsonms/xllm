@@ -30,6 +30,7 @@ bf16, L = 16384, chunk 4096, with segment_idx, B200 (GPU time per call vs the Py
 """
 
 import math
+import os
 from functools import lru_cache
 from typing import Tuple
 
@@ -1277,6 +1278,23 @@ def _sm_count_of(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+_AWM_SM90_CUBLAS = os.environ.get("AWM_SM90_CUBLAS", "0") == "1"  # Hopper: cuBLAS reference paths instead of the wgmma kernels
+
+
+@lru_cache(maxsize=None)
+def _sm90():
+    """The Hopper kernel module (adaptive_working_memory_sm90.py), also when this file is loaded by path (tests)."""
+    try:
+        from . import adaptive_working_memory_sm90 as mod
+    except ImportError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "cute_adaptive_working_memory_sm90", os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive_working_memory_sm90.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def _is_hopper(device) -> bool:
     """No tcgen05 below sm_100: the GEMM phases run on cuBLAS instead (bf16 operands, fp32 accumulation)."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -1305,6 +1323,40 @@ def _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, ha
     rhs = torch.cat([qk[:, :nu * C].view(B, nu, C, K, S), v[:, :nu * C].view(B, nu, C, K, V)], -1)
     rhs = rhs.permute(0, 3, 1, 2, 4).reshape(B * K * nu, C, S + V)
     AB[:, :, j_off:j_off + nu] = torch.bmm(pt, rhs, out_dtype=torch.float32).view(B, K, nu, S, S + V)
+
+
+def _lse2_of(part, j_off, nu):
+    """Combined base-2 lse [B, K, nu, S] of the R partials (m, l) of update chunks j_off .. j_off + nu - 1."""
+    p = part[:, :, j_off:j_off + nu]
+    m, l = p[..., 0], p[..., 1]
+    mm = m.amax(3, keepdim=True)
+    return (mm.squeeze(3) + torch.log2((l * torch.exp2(m - mm)).sum(3))).contiguous()
+
+
+def _splitk_splits(base_ctas, n_t, device):
+    """Splits of the time range so that about two waves of CTAs run."""
+    return max(1, min(n_t, -(-2 * _sm_count(device) // base_ctas)))
+
+
+def _chunk_ab_sm90(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg):
+    """AwmChunkGemm on Hopper (AwmChunkGemmSm90 'ab'): rows of each update chunk in the segment of its last row."""
+    B, L = k.shape[0], k.shape[1]
+    dev = k.device
+    lse2 = _lse2_of(part, j_off, nu)
+    hi = torch.full((B, nu), C, dtype=torch.int32, device=dev)
+    if has_seg:
+        sg = seg[:, seg_off:seg_off + nu * C].view(B, nu, C)
+        lo = (C - (sg == sg[:, :, -1:]).sum(-1)).to(torch.int32)
+    else:
+        lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
+    sm90 = _sm90()
+    m_blocks, n_blocks = S // 128, (S + V) // min(256, S)
+    splits = _splitk_splits(B * K * nu * m_blocks * n_blocks, C // 64, dev)
+    f = _compiled(("ab90", K, S, V, C, splits), lambda: sm90.AwmChunkGemmSm90("ab", K, S, V, C, 1, splits), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int32, 4), _fake(Int32, 4), _fake(Float32),
+        _fake(Float32), *([Int32(0)] * 6)))
+    f(k.reshape(-1), qk.reshape(-1), v.reshape(-1), lo.reshape(-1), hi.reshape(-1), lse2.reshape(-1), AB.reshape(-1),
+      B, L, nu, 0, j_off, AB.shape[2])
 
 
 def _out_gemm_cublas(q, MT, seg, prev_cnt, dead, seg_off, H, K, S, V, C, has_prev, has_seg, out_mask):
@@ -1368,7 +1420,10 @@ def _chunk_ab(k, qk, v, seg, part, AB, K, S, V, C, R, nu, j_off, seg_off, has_se
         _fake(BFloat16), _fake(Int64, 8), _fake(Float32), *([Int32(0)] * 7)))
     f_lse(k.reshape(-1), seg.reshape(-1), part.reshape(-1), B, L, nu, j_off, nu_tot, seg_off, seg_stride)
     if _is_hopper(k.device):
-        _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg)
+        if _AWM_SM90_CUBLAS:
+            _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg)
+        else:
+            _chunk_ab_sm90(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg)
         return
     _, _, n_blocks = chunk_gemm_tiling(S, V)
     base = B * K * nu * (S // 128) * n_blocks
@@ -1458,9 +1513,17 @@ def _out_gemm(q, MT, seg, prev_cnt, dead, seg_off, seg_stride, H, K, S, V, C, ha
     nc = L // C
     if out_mask is None:
         out_mask = torch.empty(B, L, dtype=torch.bool, device=dev)
-    if _is_hopper(dev):
+    if _is_hopper(dev) and _AWM_SM90_CUBLAS:
         return _out_gemm_cublas(q, MT, seg, prev_cnt, dead, seg_off, H, K, S, V, C, has_prev, has_seg, out_mask)
     out = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
+    if _is_hopper(dev):
+        sm90 = _sm90()
+        f = _compiled(("out90", H, K, S, V, C, has_prev, has_seg), lambda: sm90.AwmOutGemmSm90(H, K, S, V, C, has_prev, has_seg),
+                      lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int64, 8), _fake(Int64, 8),
+                               _fake(_U8, 1), _fake(_U8, 1), *([Int32(0)] * 4)))
+        f(q.reshape(-1), MT.reshape(-1), out.reshape(-1), seg.reshape(-1), prev_cnt.reshape(-1), dead.reshape(-1),
+          out_mask.view(torch.uint8).reshape(-1), B, L, seg_off, seg_stride)
+        return out, out_mask
     out_vt, out_stages, resident = _out_tiling(S, V)
     out_key = ("out", H, K, S, V, C, has_prev, has_seg, out_vt, out_stages, resident)
     f_out = _compiled(out_key, lambda: AwmOutGemm(H, K, S, V, C, has_prev, has_seg, out_vt, out_stages, resident), lambda: (

@@ -47,6 +47,7 @@ try:
         LOG2E, _U8, _blhs, _combine_lse2, _compiled, _dummy, _fake, _is_hopper, _out_gemm, _phases12, _seg_anchor,
         _sm_count, _u32_as_f32, chunk_gemm_tiling, WORKSPACE_KEYS,
     )
+    from . import adaptive_working_memory as _FWD
 except ImportError:  # loaded from its file (tests): load the forward module from its file as well
     import importlib.util as _ilu
     import os as _os
@@ -59,6 +60,7 @@ except ImportError:  # loaded from its file (tests): load the forward module fro
         _fwd._phases12, _fwd._seg_anchor, _fwd._sm_count)
     _u32_as_f32, chunk_gemm_tiling, WORKSPACE_KEYS = _fwd._u32_as_f32, _fwd.chunk_gemm_tiling, _fwd.WORKSPACE_KEYS
     _is_hopper = _fwd._is_hopper
+    _FWD = _fwd
 
 import torch  # noqa: E402
 
@@ -1111,6 +1113,31 @@ def _dmo_cublas(q, dout, out_mask, K, S, V, C):
                      out_dtype=torch.float32).view(B, K, nc, S, V)
 
 
+def _fwd_mod():
+    """The forward module (package import, or the copy loaded by path for the tests)."""
+    return _FWD
+
+
+def _dmo_sm90(q, dout, out_mask, H, K, S, V, C):
+    """AwmDmoGemm on Hopper (AwmChunkGemmSm90 'dmo'): the rows kept by the output mask are a prefix of each chunk."""
+    B, L = q.shape[0], q.shape[1]
+    nc = L // C
+    dev = q.device
+    fwd = _fwd_mod()
+    hi = (~out_mask).view(B, nc, C).sum(-1).to(torch.int32)
+    lo = torch.zeros_like(hi)
+    dMo = torch.zeros(B, K, nc, S, V, dtype=torch.float32, device=dev)
+    n_rep = H // K
+    splits = fwd._splitk_splits(B * K * nc * (S // 128) * (V // min(256, V)), n_rep * (C // 64), dev)
+    sm90 = fwd._sm90()
+    f = _compiled(("dmo90", K, S, V, C, n_rep, splits), lambda: sm90.AwmChunkGemmSm90("dmo", K, S, V, C, n_rep, splits),
+                  lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Int32, 4), _fake(Int32, 4),
+                           _fake(Float32), _fake(Float32), *([Int32(0)] * 6)))
+    f(q.reshape(-1), dout.reshape(-1), dout.reshape(-1), lo.reshape(-1), hi.reshape(-1), dMo.reshape(-1)[:1],
+      dMo.reshape(-1), B, L, nc, 0, 0, nc)
+    return dMo
+
+
 def _recurrence_bwd_torch(w, dMo, dmem, K, S, V, C, has_seg):
     """AwmRecurrenceBwd (training case: no previous chunk): dB16 = r G per update, dr (full sums over V, as one
     v tile [B, K, nu, 1, S]) and the final G (the input memory's gradient), backwards over the updates."""
@@ -1174,7 +1201,9 @@ def _phase3_bwd(dout, q, w, H, K, S, V, C, has_prev, has_seg):
     dq, out_mask = _out_gemm(dout, w["Mseq"], w["seg"], w["prev_cnt"], w["dead"], w["seg_off"], w["seg_stride"],
                              H, K, V, S, C, has_prev, has_seg)
     if _is_hopper(dev):
-        return dq, out_mask, _dmo_cublas(q, dout, out_mask, K, S, V, C)
+        if _fwd_mod()._AWM_SM90_CUBLAS:
+            return dq, out_mask, _dmo_cublas(q, dout, out_mask, K, S, V, C)
+        return dq, out_mask, _dmo_sm90(q, dout, out_mask, H, K, S, V, C)
     dMo = torch.zeros(B, K, nc, S, V, dtype=torch.float32, device=dev)
     base = B * K * nc * (S // 128) * chunk_gemm_tiling(0, V)[2]
     k_tiles = (H // K) * (C // DMO_KB)
