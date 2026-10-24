@@ -3039,6 +3039,10 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
                kmin.reshape(-1), qmax.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L, float(scale * LOG2E), float(scale))
         dp_cur = dp_prev = torch.zeros(1, dtype=torch.float32, device=dev)
         return _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev), dk, dv
+    if V > 256:
+        # both backward paths are compiled at the first call: the choice below is per batch, and a rank compiling the
+        # other path mid-run (seconds) would stall every rank of a data-parallel step
+        _compile_bwd_paths(H, K, S, V, C)
     if V > 256 and _use_pmat_dv(qmax, B, L, C):
         # dV, dK and dQ from the materialized bf16 P and dS (chunk-major [C queries x 2C keys]) with cuBLAS: the v-slab dV
         # kernel recomputes S^T V / 256 times (as many flops as its own MMAs) and the dK / dQ kernels recompute it again.
@@ -3203,9 +3207,49 @@ def _bmm_triu_nt(x, y, out, C, n):
             out[:, :, :, i * c:(i + 1) * c, :i * c].zero_()
 
 
+_BWD_PATHS_COMPILED = set()
+
+
+def _compile_bwd_paths(H, K, S, V, C):
+    """Compile the kernels of both V > 256 backward paths (GEMM path: ScaPmat, ScaDsMat, chunk-major copies; kernel
+    path: ScaBwdDv / DvT, ScaBwdDk, dQ) once per shape."""
+    key = (H, K, S, V, C)
+    if key in _BWD_PATHS_COMPILED:
+        return
+    _BWD_PATHS_COMPILED.add(key)
+    _compiled(("sca_pmat", H, K, S, C), lambda: ScaPmat(H, K, S, C), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+    _compiled(("sca_dsmat", H, C), lambda: ScaDsMat(H, C), lambda: (
+        _fake2(BFloat16), _fake2(Float32), _fake2(Float32), _fake(Float32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+    for (h, k, d) in ((H, K, V), (H, H, V), (H, H, S), (H, K, S)):
+        _compiled(("sca_cmcopy", h, k, d, C), lambda: ChunkMajorCopy(h, k, d, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+    for (k, d) in ((K, V), (H, S), (K, S)):
+        _compiled(("sca_cmuncopy", k, d, C), lambda: ChunkMajorUncopy(k, d, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+    if S in (64, 128, 256) and S // 2 + 64 + min(V, 256) <= 512 and os.environ.get("SCA_DV_TMEM", "1") == "1":
+        _compiled(("sca_bwd_dvt", H, K, S, V, C), lambda: ScaBwdDvT(H, K, S, V, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
+            _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+    else:
+        _compiled(("sca_bwd_dv", H, K, S, V, C), lambda: ScaBwdDv(H, K, S, V, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
+            _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+    _compiled(("sca_bwd_dk", H, K, S, V, C), lambda: ScaBwdDk(H, K, S, V, C), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4),
+        _fake(Int32, 4), _fake(Int32, 4), _fake(BFloat16), _fake2(Float32), _fake2(Float32), Int32(0), Int32(0),
+        Float32(0.0), Float32(0.0)))
+    _compiled(("sca_bwd_dq", H, K, S, V, C), lambda: ScaBwdDq(H, K, S, V, C), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Float32, 4),
+        _fake(Int32, 4), _fake(BFloat16), _fake2(Float32), _fake2(Float32), Int32(0), Int32(0), Float32(0.0), Float32(0.0)))
+
+
 def _use_pmat_dv(qmax, B, L, C):
-    """Attended fraction of the (key tile, query) pairs (1 without segment boundaries) from qmax, with one device
-    sync; the dense-GEMM dV path wins above ~0.5. SCA_DV_PMAT=0/1 forces the kernel / the GEMM path."""
+    """Whether the V > 256 backward should materialize P / dS and use cuBLAS (fixed cost) rather than the kernels
+    (cost ~ attended fraction of the [C x 2C] windows): GEMMs when the fraction exceeds a threshold, 0.5 on one GPU
+    (per layer the paths cross there) and 0.35 under data parallelism, where the slowest rank's batch sets the step
+    time and the fixed-cost path avoids the straggling (8 x B200 7.1B: 893 -> 870 ms/step). Env SCA_DV_PMAT=0/1
+    forces the kernel / GEMM path, SCA_PMAT_FRAC overrides the threshold."""
     env = os.environ.get("SCA_DV_PMAT", "auto")
     if env in ("0", "1"):
         return env == "1"
@@ -3213,7 +3257,11 @@ def _use_pmat_dv(qmax, B, L, C):
     cap = torch.minimum((k0 // C + 2) * C - 1, torch.full_like(k0, L - 1))
     attended = (torch.minimum(qmax[:, k0 + 127].long(), cap) - k0 + 1).clamp_(min=0).sum()
     full = (cap - k0 + 1).sum() * B
-    return attended.item() > 0.5 * full.item()
+    frac = os.environ.get("SCA_PMAT_FRAC")
+    if frac is None:
+        dp = torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        frac = 0.35 if dp else 0.5
+    return attended.item() > float(frac) * full.item()
 
 
 def _chunk_major(x, H, K, V, C, B, L, nc, dev):
