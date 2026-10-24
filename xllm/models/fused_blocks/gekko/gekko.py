@@ -67,6 +67,19 @@ from xllm.models.fused_blocks.distributed import (
 )
 
 
+def _cute_qk(x: torch.Tensor, groups: int, rope_head_dim: int, freqs_cis: Optional[torch.Tensor]) -> bool:
+    """Whether the fused CuTe DSL q / k preparation (rmsnorm + rope + softmax and its backward; Blackwell, bf16;
+    env XLLM_CUTE_QK=0 disables it) handles this input."""
+    try:
+        from xllm.modules.fused_ops.cute.qk_prep import qk_prep_supported
+    except ImportError:
+        return False
+    r = rope_head_dim if freqs_cis is not None else 0
+    if r > 0 and (freqs_cis.dtype != torch.complex64 or tuple(freqs_cis.shape) != (x.shape[1], r // 2)):
+        return False
+    return qk_prep_supported(x, groups, r)
+
+
 class GekkoBlockFunction(torch.autograd.Function):
     """
 
@@ -241,15 +254,19 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
-        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-        # apply rotary embeddings
-        sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
-
         # B x L x K x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        # apply softmax to aqk
-        aqk = F.softmax(akk, dim=-1, dtype=torch.float32).to(akk)
+        if _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis):
+            # rmsnorm, rope and softmax from one read of xk_
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
+            sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
+        else:
+            sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+            sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
+            # apply rotary embeddings
+            sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
+            # apply softmax to aqk
+            aqk = F.softmax(akk, dim=-1, dtype=torch.float32).to(akk)
 
         if send_to_next:
             psk = sk[:, (seq_len - attention_chunk_size):]
@@ -273,15 +290,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle7 = None
 
-        sq, _ = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
-        sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-        # apply rotary embeddings
-        sq = apply_rope(sq, freqs_cis, head_dim, rope_head_dim, False)
-
-        # B x L x H x S
-        aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-        # apply softmax to aq
-        aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
+        if _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis):
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
+            sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
+        else:
+            sq, _ = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+            sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+            # apply rotary embeddings
+            sq = apply_rope(sq, freqs_cis, head_dim, rope_head_dim, False)
+            # B x L x H x S
+            aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+            # apply softmax to aq
+            aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
 
         if handle_prev_v is not None:
             handle_prev_v.wait()
@@ -684,22 +704,30 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
-        sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
-        # B x L x H x S
-        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-        # apply rotary embeddings
-        sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
-
         # B x L x K|H x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-        # softmax for aq and aqk
-        aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
-        aqk = aqk_fp32.to(akk)
-        aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
-        aq = aq_fp32.to(aq)
+        cute_qk = _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)
+        if cute_qk:
+            # rmsnorm, rope and softmax from one read each of xk_ and xq_; the gradients below are fused the same way
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
+            fc = freqs_cis if rope_head_dim > 0 else None
+            sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
+            sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+            sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
+        else:
+            sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+            sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+            # B x L x H x S
+            sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+            sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+            # apply rotary embeddings
+            sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
+            aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+            # softmax for aq and aqk
+            aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
+            aqk = aqk_fp32.to(akk)
+            aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
+            aq = aq_fp32.to(aq)
 
         if send_to_next:
             memory_grad, handle_memory = recv_memory_grad_from_next(x, local_kv_heads, head_dim, v_head_dim)
@@ -873,19 +901,21 @@ class GekkoBlockFunction(torch.autograd.Function):
         rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
         mx_grad = torch.mm(rmx_grad, wr)
 
-        # apply rotary embeddings
-        sq_grad = apply_rope(sq_grad, freqs_cis, head_dim, rope_head_dim, True)
-        # q norm grad
-        xq_grad, qnorm_w_grad = rmsnorm_bwd(rearrange(sq_grad, 'b l h s -> b l (h s)'), xq_, sq_rstd, qnorm_w, local_heads)
-
         # B x H x L x S -> B x L x H x S
         aq_grad = aq_grad.transpose(1, 2)
-        aq_grad = torch.ops.aten._softmax_backward_data(
-            aq_grad.float(), aq_fp32, -1, torch.float32
-        ).to(aq)
-
-        aq_grad = rearrange(aq_grad, 'b l h s -> b l (h s)')
-        xq_grad = torch.add(xq_grad, aq_grad, out=xq_grad)
+        if cute_qk:
+            # rope backward, q norm backward, softmax backward and their sum in one pass
+            xq_grad, qnorm_w_grad = qk_prep_bwd(sq_grad, aq_grad, None, xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+        else:
+            # apply rotary embeddings
+            sq_grad = apply_rope(sq_grad, freqs_cis, head_dim, rope_head_dim, True)
+            # q norm grad
+            xq_grad, qnorm_w_grad = rmsnorm_bwd(rearrange(sq_grad, 'b l h s -> b l (h s)'), xq_, sq_rstd, qnorm_w, local_heads)
+            aq_grad = torch.ops.aten._softmax_backward_data(
+                aq_grad.float(), aq_fp32, -1, torch.float32
+            ).to(aq)
+            aq_grad = rearrange(aq_grad, 'b l h s -> b l (h s)')
+            xq_grad = torch.add(xq_grad, aq_grad, out=xq_grad)
 
         # B x K x L x S -> B x L x K x S
         aqk_grad = aqk_grad.transpose(1, 2)
@@ -899,18 +929,19 @@ class GekkoBlockFunction(torch.autograd.Function):
             aqk_grad[:, (seq_len - attention_chunk_size):] += aqk_grad_from_next
             akk_grad[:, (seq_len - attention_chunk_size):] += akk_grad_from_next
 
-        # apply rotary embeddings
-        sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
-        # k norm grad
-        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
-
-        aqk_grad = torch.ops.aten._softmax_backward_data(
-            aqk_grad.float(), aqk_fp32, -1, torch.float32
-        ).to(aqk)
-        ak_grad = rearrange(torch.add(akk_grad, aqk_grad, out=aqk_grad), 'b l k s -> b l (k s)')
-
-        # grads of xk & xv
-        xk_grad = torch.add(xk_grad, ak_grad, out=xk_grad)
+        if cute_qk:
+            xk_grad, _ = qk_prep_bwd(sk_grad, aqk_grad, akk_grad, xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
+        else:
+            # apply rotary embeddings
+            sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
+            # k norm grad
+            xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
+            aqk_grad = torch.ops.aten._softmax_backward_data(
+                aqk_grad.float(), aqk_fp32, -1, torch.float32
+            ).to(aqk)
+            ak_grad = rearrange(torch.add(akk_grad, aqk_grad, out=aqk_grad), 'b l k s -> b l (k s)')
+            # grads of xk & xv
+            xk_grad = torch.add(xk_grad, ak_grad, out=xk_grad)
         xv_grad = torch.add(xv_grad, av_grad.transpose(1, 2), out=xv_grad)
         if handle_prev_v is not None:
             handle_prev_v.wait()
