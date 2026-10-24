@@ -343,6 +343,20 @@ recompute S, which is as many flops as their PV; a materialized bf16 P^T + cuBLA
 Floors (4B): MMA-only 358 us, no-math 393 us; the full kernel is exp2 bound (1.07 G exp2 per layer = 238 us
 of MUFU). Step times move by <= 1% (the forward is ~5% of the step). `SCA_FWD_TMEM=0` selects the old kernel.
 
+### 7.1B dV from a materialized P (2026-10-24, commit b3e435f)
+
+`ScaPmat` (q tile in TMEM, 64-key blocks, two CTAs per SM) writes P = exp2(S scale2 - lse2) bf16 chunk-major
+as [C queries x 2C keys] per (chunk, batch, head), including the zeros of the unattended prefix and the causal
+suffix of each row (no memset), and dV of the keys of chunk c is `bmm(P_c[:, C:]^T, dO_c)` plus
+`baddbmm_(P_{c+1}[:, :C]^T, dO_{c+1})` on the chunk-major dO copy, written back by `ChunkMajorUncopy`.
+Per layer (7.1B, no segment boundaries): dV 2.86 -> 1.47 ms, backward 6.13 -> 4.92 ms. The GEMM path's
+cost is fixed (dense [C x C] blocks) while the v-slab kernel's shrinks with the segment structure
+(1.1 ms at 7 segments per 16K tokens, 0.58 at 19), crossover at an attended fraction of ~0.5, so
+`_use_pmat_dv` computes that fraction from qmax (one `.item()` per layer backward) and picks the path;
+`SCA_DV_PMAT=0/1` forces one. Training batches with a few eos per sequence take the kernel path, so the 7.1B
+step is unchanged (939 ms); batches without boundaries (the stragglers of §6c) get the GEMM path. Next on this
+line: materialize dS = P (dP - delta) bf16 and do dK / dQ as GEMMs too (estimated 0.8 ms vs 1.8).
+
 ### Open items
 
 - The S = 128 shape (4B) is MUFU bound (exp2); FA4-style exp2 emulation on the FMA units for part of the

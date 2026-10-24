@@ -10,6 +10,28 @@ its own measurement, parity check and commit.** Push finished commits to `origin
 `Co-Authored-By: Claude <noreply@anthropic.com>` as the last line. Keep a `handoff/HANDOFF_H100.md` the same
 way `HANDOFF.md` was kept here.
 
+## Kernel inventory: everything that was (re)written on B200
+
+All CuTe Python DSL unless noted; all in `xllm/modules/fused_ops/cute/` on branch `cute-adaptive-working-memory`.
+"B" marks code that uses Blackwell-only features (tcgen05 MMA, TMEM, packed f32x2 math) and needs a Hopper
+rewrite; "P" marks code that should port with small changes.
+
+| Kernel / class | File | Replaces | Role, structure | B200 effect | Port |
+|---|---|---|---|---|---|
+| `TimestepDecayNormFwd` / `Bwd` | `timestep_decay_norm.py` | CUB `timenorm_backend='cub'` | single-pass decoupled look-back scan over time, TMA tiles, aggregate / resolve warps | fwd 102 vs 1488 us, bwd 156 vs 3104 (B8 L8192 H2048 G32), ~85% HBM SOL | P (packed f32x2 -> scalar; retune T, warps) |
+| `AwmKeyLsePart`, `AwmChunkGemm`, `AwmAToBf16`, `AwmRecurrence` / `AwmRecurrenceUmma`, `AwmOutGemm` | `adaptive_working_memory.py` | torch AWM forward | phase decomposition (A|B chunk GEMMs in parallel, S x V recurrence, out GEMM); masks from segment_idx in kernel | fwd 1376 -> 125 us (0.9B), 729 -> 91 (4B), 1259 -> 207 (7.1B) | B for the tcgen05 GEMMs (ChunkGemm, OutGemm, RecurrenceUmma); P for KeyLsePart, AToBf16, the warp-mma AwmRecurrence |
+| `AwmDmoGemm`, `AwmRecurrenceBwd`, `AwmBwdDelta`, `AwmLseChain`, `AwmChunkBwd`, `AwmZeroTail` (+ dq via `AwmOutGemm`) | `adaptive_working_memory_bwd.py` | torch AWM backward | the backward phases of `adaptive_working_memory_reference.py` (executable spec), workspaces saved by the forward | bwd per step 0.9B 99 -> 6 ms, 7.1B 98 -> 11 ms | B (DmoGemm, ChunkBwd are tcgen05); P for the rest |
+| `ScaFwd` | `sliding_chunk_attention.py` | swift SCA (cuBLAS + materialized attention matrix) | flash-style forward, q in smem, P in TMEM as the PV A operand, lazy rescale | 0.9B 0.83 ms/layer vs ~12 | B (FA3 structure on Hopper) |
+| `ScaFwdT` (default) | same | `ScaFwd` | q tile in TMEM as the A operand; 4B: 256 TMEM cols, two CTAs per SM | 4B 668 -> 550 us per call, 0.9B 558 -> 540 | B (no TMEM on Hopper: nothing to port, FA3 keeps Q in smem / registers) |
+| `ScaBwdDv`, `ScaBwdDk`, `ScaBwdDq` | same | swift backward | generic backward (3 kernels, v slabs for V > 256, fp32 dP from cuBLAS for V > 256) | 0.9B bwd 3.0 ms/layer vs ~11 | B |
+| `ScaBwdDkDv`, `ScaBwdDqT` (default for S + V <= 256) | same | `ScaBwdDv` + `ScaBwdDk`, `ScaBwdDq` | fused dK+dV, K/V/Q/dO in TMEM as A operands, 2 compute groups, raw mbarriers | 4B bwd 3.6 -> 1.8 ms/layer | B (the FA3 backward is the Hopper equivalent; pipeline order and the predication pitfall transfer) |
+| `ScaPmat` + cuBLAS bmm (default for V > 256 when > 50% of the window is attended) | same | `ScaBwdDv` v-slab path | materialized bf16 P (chunk-major [C x 2C]) then two bmm per chunk for dV; chosen per call from qmax | 7.1B dV 2.86 -> 1.47 ms/layer (no boundaries) | B for the kernel (q in TMEM); the cuBLAS path itself is portable as is |
+| `ChunkMajorCopy`, `ChunkMajorUncopy`, `RowDot` | same | torch permute copies / fp32 casts | layout copies (~1.7 TB/s in torch) and delta = rowsum(dO * y) | ~2.4 ms/layer saved on 7.1B | P (plain memory kernels) |
+| host: `segment_starts` / `query_limits` (cached), `_use_pmat_dv` | same | - | per-row key ranges from segment_idx; path choice with one sync | - | P |
+
+Not kernels, but part of the B200 result (section 2): the `create_on_gpu` default-device fix, `fsdp_layers_per_group`,
+the profiling scripts.
+
 ## 0. What H100 changes, in one paragraph
 
 B200 (sm_100a) has 5th-gen tensor cores driven by `tcgen05` with accumulators in **tensor memory (TMEM)**, ~2.25
@@ -152,12 +174,15 @@ baseline profile if it disagrees.
 
 ### 3.6 gekko-7.1B specifics (V = 2048)
 
-- **B200:** the SCA dV kernel recomputes S^T per 256-wide v slab (8x), 2.8 ms/layer; dP via cuBLAS fp32 GEMM
-  1.2 ms; dense GEMMs are ~55% of the step at ~1.3 PFLOPS achieved (cuBLAS standalone 1.6).
-- **H100 plan:** same structure applies if a CuTe SCA is written; a materialized bf16 P^T + cuBLAS dV would
-  save ~1.5 ms/layer on B200 and the same idea holds on H100. Check cuBLAS GEMM efficiency on H100 for the
-  7.1B shapes (dim 4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak; nothing kernel-side to do if
-  >= 75%.
+- **B200:** the SCA dV kernel recomputed S^T per 256-wide v slab (8x), 2.8 ms/layer. Now: `ScaPmat`
+  materializes P (bf16, chunk-major [C x 2C] per (chunk, batch, head), zeros included) and dV is two cuBLAS
+  bmm per chunk (1.47 ms/layer); since the GEMM path costs the same whatever the segment structure while the
+  kernel path shrinks with it, `_use_pmat_dv` picks per call from the attended fraction (> 0.5). dP is a
+  cuBLAS fp32 GEMM (1.2 ms); dK / dQ kernels read it (1.1 + 0.7 ms); dense model GEMMs are ~55% of the step.
+- **H100 plan:** the materialize-P + cuBLAS idea is portable (any kernel that writes P, even a torch one, plus
+  bmm) and on H100 the same crossover logic applies; the next step on both archs is to materialize dS =
+  P (dP - delta) bf16 too and do dK / dQ as GEMMs (estimated 0.8 ms vs 1.8 on B200). Check cuBLAS GEMM
+  efficiency on H100 for the 7.1B shapes (dim 4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak.
 
 ## 4. How to work (what worked on B200)
 
