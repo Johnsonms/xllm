@@ -54,6 +54,8 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | FFN residual gradient added in the layer norm backward's epilogue | d8c8404 | step 562.2 -> 560.9 ms |
 | SwiGLU FFN through quack's gated GEMMs (`gemm_gated` fwd over [w1; w3], `gemm_dgated` for the fc2 input gradient; optional, used when `quack-kernels` is installed, `XLLM_QUACK_FFN=0` off) | 8e93fb7 | FFN fwd+bwd/layer 0.9B 5613 -> 5148 us, 4B 5209 -> 4889, 7.1B equal; step 561 -> 542 ms; 8 GPUs 4B 536 -> 529 |
 | fused linear cross entropy through quack's scaled-exp path on sm_90 (scores never written, dw in fp32; `XLLM_QUACK_CE=0` off) | c59b2cc | unchanged at the harness vocab (32000); with the llama3 vocab (128256) step 606 -> 585 ms |
+| TSDN backward: residual gradient accumulated by TMA reduce-add stores (`residual=`) | 0bba4da | TSDN bwd + add 211 -> 161 us/layer (0.9B), 146 -> 121 (7.1B) |
+| AWM backward: dv reduce-added (TMA) into the SCA's v gradient (`awm_bwd_finish(dv_acc=)`) | 2f4cc66 | step 540.7 -> 538.9 ms |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
 
@@ -174,5 +176,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
   accumulator fill) at 0.9B; xattn-internal.
 - AWM: the out GEMM's 7.1B forward epilogue runs at 57% of copy bandwidth (needs a persistent kernel overlapping
   epilogue and loads).
-- Remaining small items (0.9B, per step): block elementwise ~34 ms, conv (triton) 26 ms (~1.4x its floor),
+- After these, the 0.9B step's elementwise / reduce / copy kernels total ~17 ms (FSDP casts, xattn's dK / dV
+  accumulator fill, bias-gradient sums); the step is xattn (~25%), GEMMs (~45%) and memory-bound fused kernels near
+  copy bandwidth. TMA reduce-add stores (`CopyReduceBulkTensorTileS2GOp`) are the cheap way to fold a residual /
+  second gradient into a kernel whose output already leaves through TMA.
+- Remaining small items (0.9B, per step, before the items of this section): block elementwise ~34 ms, conv (triton) 26 ms (~1.4x its floor),
   TSDN step_counts recompute 3 ms, FSDP2 split/chunk_cat copies (4B ~19 ms, 7.1B ~21 ms).
