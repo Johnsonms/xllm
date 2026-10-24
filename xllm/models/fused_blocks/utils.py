@@ -347,6 +347,51 @@ def rmsnorm_add_fwd(
     return rmsnorm_fwd(x + x2, weight, num_groups, eps)
 
 
+def rmsnorm_rope_fwd(
+    x: Tensor,
+    weight: Optional[Tensor],
+    num_groups: int,
+    eps: float,
+    freqs_cis: Tensor,
+    head_dim: int,
+    rope_head_dim: int,
+) -> Tuple[Tensor, Tensor]:
+    """apply_rope(rmsnorm_fwd(x, ...)) for x [B, L, num_groups * head_dim] (a group per head): one kernel when the
+    CuTe norm supports it, else the two passes. Returns ([B, L, num_groups * head_dim], rstd)."""
+    if (rope_head_dim > 0 and x.dim() == 3 and x.shape[-1] == num_groups * head_dim and _fused_norm_ok(x, num_groups)
+            and not _ROPE_TORCH and rope_head_dim % 8 == 0 and freqs_cis.shape[0] == x.shape[1]):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
+        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None,
+                              freqs_cis=freqs_cis, rope_head_dim=rope_head_dim)
+    y, rstd = rmsnorm_fwd(x, weight, num_groups, eps)
+    B, L = y.shape[0], y.shape[1]
+    y = apply_rope(y.view(B, L, num_groups, head_dim), freqs_cis, head_dim, rope_head_dim, False)
+    return y.reshape(B, L, num_groups * head_dim), rstd
+
+
+def rmsnorm_rope_bwd(
+    y_grad: Tensor,
+    x: Tensor,
+    rstd: Tensor,
+    weight: Optional[Tensor],
+    num_groups: int,
+    freqs_cis: Tensor,
+    head_dim: int,
+    rope_head_dim: int,
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Backward of rmsnorm_rope_fwd from the gradient of its output (any [B, L, ...] view) and its input x."""
+    B, L = x.shape[0], x.shape[1]
+    dy = y_grad.reshape(B, L, num_groups * head_dim)
+    if (rope_head_dim > 0 and x.dim() == 3 and _fused_norm_bwd_ok(dy, x, num_groups) and not _ROPE_TORCH
+            and rope_head_dim % 8 == 0 and freqs_cis.shape[0] == L):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
+        res = group_norm_bwd(dy, x, num_groups, rstd, None, weight + 1.0 if weight is not None else None,
+                             freqs_cis=freqs_cis, rope_head_dim=rope_head_dim)
+        return res if weight is not None else (res[0], None)
+    dy = apply_rope(y_grad.reshape(B, L, num_groups, head_dim), freqs_cis, head_dim, rope_head_dim, True)
+    return rmsnorm_bwd(dy.reshape(B, L, num_groups * head_dim), x, rstd, weight, num_groups)
+
+
 def rmsnorm_bwd(
     y_grad: Tensor,
     x: Tensor,

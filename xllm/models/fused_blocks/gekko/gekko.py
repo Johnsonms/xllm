@@ -24,6 +24,8 @@ from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     rmsnorm_fwd,
     rmsnorm_add_fwd,
+    rmsnorm_rope_fwd,
+    rmsnorm_rope_bwd,
     rmsnorm_bwd,
     mem_effn_rmsnorm_bwd,
     timenorm_fwd,
@@ -279,10 +281,9 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+        # k norm + rotary embeddings (one kernel)
+        sk, _ = rmsnorm_rope_fwd(xk_, None, local_kv_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
         sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-        # apply rotary embeddings
-        sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
 
         # B x L x K x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
@@ -311,10 +312,9 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle7 = None
 
-        sq, _ = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+        # q norm + rotary embeddings (one kernel)
+        sq, _ = rmsnorm_rope_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-        # apply rotary embeddings
-        sq = apply_rope(sq, freqs_cis, head_dim, rope_head_dim, False)
 
         # B x L x H x S
         aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
@@ -736,13 +736,12 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
-        sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+        # q / k norms + rotary embeddings (one kernel each)
+        sk, sk_rstd = rmsnorm_rope_fwd(xk_, None, local_kv_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
+        sq, sq_rstd = rmsnorm_rope_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
         # B x L x H x S
-        sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
         sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-        # apply rotary embeddings
-        sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
 
         # B x L x K|H x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
@@ -942,10 +941,8 @@ class GekkoBlockFunction(torch.autograd.Function):
             rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
         mx_grad = torch.mm(rmx_grad, wr)
 
-        # apply rotary embeddings
-        sq_grad = apply_rope(sq_grad, freqs_cis, head_dim, rope_head_dim, True)
-        # q norm grad
-        xq_grad, qnorm_w_grad = rmsnorm_bwd(rearrange(sq_grad, 'b l h s -> b l (h s)'), xq_, sq_rstd, qnorm_w, local_heads)
+        # rotary embeddings + q norm grad (one kernel)
+        xq_grad, qnorm_w_grad = rmsnorm_rope_bwd(sq_grad, xq_, sq_rstd, qnorm_w, local_heads, freqs_cis, head_dim, rope_head_dim)
 
         # B x H x L x S -> B x L x H x S
         aq_grad = aq_grad.transpose(1, 2)
@@ -971,10 +968,8 @@ class GekkoBlockFunction(torch.autograd.Function):
             aqk_grad[:, (seq_len - attention_chunk_size):] += aqk_grad_from_next
             akk_grad[:, (seq_len - attention_chunk_size):] += akk_grad_from_next
 
-        # apply rotary embeddings
-        sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
-        # k norm grad
-        xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
+        # rotary embeddings + k norm grad (one kernel; from the norm input xk_)
+        xk_grad, _ = rmsnorm_rope_bwd(sk_grad, xk_, sk_rstd, None, local_kv_heads, freqs_cis, head_dim, rope_head_dim)
 
         if fused_softmax_bwd:
             # grads of xk: xk_grad += akk_grad + softmax backward of aqk_grad

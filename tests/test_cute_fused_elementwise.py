@@ -163,3 +163,29 @@ def test_group_norm_bwd(kind, D, G):
     assert len(out) == len(ref)
     for a, c in zip(out, ref):
         torch.testing.assert_close(a.float(), c.float(), atol=4e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("H,S,R,affine", [(8, 256, 128, True), (4, 256, 128, False), (32, 128, 128, True), (4, 256, 64, False)])
+def test_group_norm_rope_fused(H, S, R, affine):
+    """rms norm + rotary embedding in one kernel (forward and backward) vs norm then apply_rope."""
+    from xllm.models.fused_blocks import utils
+    from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd, group_norm_fwd
+    torch.manual_seed(0)
+    B, L, D = 2, 256, H * S
+    x = torch.randn(B, L, D, device="cuda").bfloat16()
+    w = (torch.randn(D, device="cuda") * 0.5).bfloat16() if affine else None
+    phase = torch.randn(L, R // 2, device="cuda")
+    f = torch.polar(torch.ones_like(phase), phase)
+    y_ref, r_ref = utils.rmsnorm_fwd(x, w, H, 1e-6)
+    y_ref = utils.apply_rope(y_ref.view(B, L, H, S), f, S, R, False).reshape(B, L, D)
+    y, r = group_norm_fwd(x, H, 1e-6, w + 1.0 if affine else None, freqs_cis=f, rope_head_dim=R)
+    # absolute tolerance: the unfused reference rounds the normalized values to bf16 before the rotation mixes them
+    torch.testing.assert_close(y.float(), y_ref.float(), atol=4e-2, rtol=1e-2)
+    torch.testing.assert_close(r, r_ref, atol=0, rtol=1e-6)
+    dy = torch.randn_like(x)
+    dyr = utils.apply_rope(dy.view(B, L, H, S), f, S, R, True).reshape(B, L, D)
+    ref = utils.rmsnorm_bwd(dyr, x, r_ref, w, H)
+    out = group_norm_bwd(dy, x, H, r, None, w + 1.0 if affine else None, freqs_cis=f, rope_head_dim=R)
+    torch.testing.assert_close(out[0].float(), ref[0].float(), atol=7e-2, rtol=2e-2)
+    if affine:
+        torch.testing.assert_close(out[1].float(), ref[1].float(), atol=0.5, rtol=1e-2)
