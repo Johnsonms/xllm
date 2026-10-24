@@ -57,21 +57,23 @@ class QkPrepFwd:
 
     @cute.jit
     def __call__(self, tX: cute.Tensor, tF: cute.Tensor, tW: cute.Tensor, tY: cute.Tensor, tPre: cute.Tensor, tSm: cute.Tensor,
-                 tRstd: cute.Tensor, rows: Int32, L: Int32, eps: Float32, stream: cuda.CUstream):
-        self.kernel(tX.iterator, tF.iterator, tW.iterator, tY.iterator, tPre.iterator, tSm.iterator, tRstd.iterator, rows, L, eps).launch(
-            grid=[(rows + WARPS - 1) // WARPS, 1, 1], block=[32 * WARPS, 1, 1], stream=stream)
+                 tRstd: cute.Tensor, B: Int32, L: Int32, eps: Float32, stream: cuda.CUstream):
+        rows_b = L * self.G  # rows (l, g) of one batch: the grid's y axis is the batch (no runtime modulo per row)
+        self.kernel(tX.iterator, tF.iterator, tW.iterator, tY.iterator, tPre.iterator, tSm.iterator, tRstd.iterator, rows_b, L, eps).launch(
+            grid=[(rows_b + WARPS - 1) // WARPS, B, 1], block=[32 * WARPS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, pX: cute.Pointer, pF: cute.Pointer, pW: cute.Pointer, pY: cute.Pointer, pPre: cute.Pointer, pSm: cute.Pointer,
-               pRstd: cute.Pointer, rows: Int32, L: Int32, eps: Float32):
+               pRstd: cute.Pointer, rows_b: Int32, L: Int32, eps: Float32):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, b, _ = cute.arch.block_idx()
         G, S, R, E = self.G, self.S, self.R, self.E
         lane = tidx % 32
-        row = bidx * WARPS + tidx // 32
-        if row < rows:
-            g = row % G
-            l = (row // G) % L
+        idx = bidx * WARPS + tidx // 32  # (l, g) of this batch
+        if idx < rows_b:
+            g = idx % G
+            l = idx // G
+            row = b * rows_b + idx
             off = Int64(row) * S + lane * E
             xv = cute.make_rmem_tensor(cute.make_layout(E), Float32)
             xv.store(cute.make_tensor((pX + off).align(2 * E), cute.make_layout(E)).load().to(Float32))
@@ -262,7 +264,7 @@ def qk_prep_fwd(x: torch.Tensor, G: int, weight: Optional[torch.Tensor], freqs_c
                    lambda: (_fake(BFloat16), _fake(Float32), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16),
                             _fake(Float32, 4), Int32(0), Int32(0), Float32(0.0)))
     fn(x.reshape(-1), f, w, y.reshape(-1), (pre if want_pre else y).reshape(-1), (sm if want_sm else y).reshape(-1), rstd.reshape(-1),
-       rows, L, float(eps))
+       B, L, float(eps))
     return y, pre, sm, rstd
 
 
