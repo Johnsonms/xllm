@@ -328,6 +328,7 @@ def sliding_chunk_attention_bwd(
     high_precision_level: int = 0,
     deterministic: bool = False,
     backend: str = 'xattn',
+    delta: Optional[Tensor] = None,  # cute: rowsum(y_grad * y) [B, H, L] fp32 if already available
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     backend = _resolve_backend(backend, q, v, chunk_size, prev_k, 0.0)
     if backend in ['xattn', 'flash']:
@@ -348,7 +349,7 @@ def sliding_chunk_attention_bwd(
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         kmin = cute_segment_starts(segment_idx, q.shape[0], q.shape[1], q.device)
         qmax = cute_query_limits(kmin)
-        dq, dk, dv = cute_sca_bwd(q, k, v, y, aux, y_grad, chunk_size, scale, kmin, qmax)
+        dq, dk, dv = cute_sca_bwd(q, k, v, y, aux, y_grad, chunk_size, scale, kmin, qmax, delta=delta)
         return dq, dk, dv, None, None
     elif backend == 'swift':
         return _sequential_sliding_chunk_attention_bwd(

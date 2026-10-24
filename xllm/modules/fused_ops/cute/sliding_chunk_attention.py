@@ -3065,8 +3065,9 @@ class ScaBwdDkT:
             tmem.free(tmem_ptr)
 
 
-def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
-    """Gradients of sca_fwd: dq [B, L, H, S], dk [B, L, K, S], dv [B, L, K, V] (bf16)."""
+def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax, delta=None):
+    """Gradients of sca_fwd: dq [B, L, H, S], dk [B, L, K, S], dv [B, L, K, V] (bf16). delta [B, H, L] fp32 =
+    rowsum(dout * y) may be passed in (the fused attention gate backward produces it), else it is computed here."""
     B, L, H, S = q.shape
     K, V = v.shape[2], v.shape[3]
     C = chunk_size
@@ -3075,10 +3076,14 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     dev = q.device
     dout = dout.contiguous()
     # delta[b, h, q] = sum_v dO O
-    delta = torch.empty(B, H, L, dtype=torch.float32, device=dev)
-    f_delta = _compiled(("sca_rowdot", H, V), lambda: RowDot(H, V), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
-    f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
+    if delta is None:
+        delta = torch.empty(B, H, L, dtype=torch.float32, device=dev)
+        f_delta = _compiled(("sca_rowdot", H, V), lambda: RowDot(H, V), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
+        f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
+    else:
+        assert delta.shape == (B, H, L) and delta.dtype == torch.float32
+        delta = delta.contiguous()
     dv = torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
     if 3 * (S + V) // 2 + 4 * 32 <= 512 and os.environ.get("SCA_FUSED_DKDV", "1") == "1":
         # dK and dV in one pass (S^T / P^T computed once)
@@ -3317,10 +3322,10 @@ def _compile_bwd_paths(H, K, S, V, C):
 
 def _use_pmat_dv(qmax, B, L, C):
     """Whether the V > 256 backward should materialize P / dS and use cuBLAS (fixed cost) rather than the kernels
-    (cost ~ attended fraction of the [C x 2C] windows): GEMMs when the fraction exceeds a threshold, 0.5 on one GPU
-    (per layer the paths cross there) and 0.35 under data parallelism, where the slowest rank's batch sets the step
-    time and the fixed-cost path avoids the straggling (8 x B200 7.1B: 893 -> 870 ms/step). Env SCA_DV_PMAT=0/1
-    forces the kernel / GEMM path, SCA_PMAT_FRAC overrides the threshold."""
+    (cost ~ attended fraction of the [C x 2C] windows): GEMMs when the fraction exceeds a threshold, 0.75 on one
+    GPU (7.1B per layer: kernels 2.7 ms at 0.47 / 4.5 at 1.0, GEMMs 3.6-3.8) and 0.5 under data parallelism, where
+    the slowest rank's batch sets the step time and the fixed-cost path limits the straggling (8 x B200 7.1B: both
+    ~875 ms/step). Env SCA_DV_PMAT=0/1 forces the kernel / GEMM path, SCA_PMAT_FRAC overrides the threshold."""
     env = os.environ.get("SCA_DV_PMAT", "auto")
     if env in ("0", "1"):
         return env == "1"
@@ -3331,7 +3336,7 @@ def _use_pmat_dv(qmax, B, L, C):
     frac = os.environ.get("SCA_PMAT_FRAC")
     if frac is None:
         dp = torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        frac = 0.35 if dp else 0.5
+        frac = 0.5 if dp else 0.75
     return attended.item() > float(frac) * full.item()
 
 
