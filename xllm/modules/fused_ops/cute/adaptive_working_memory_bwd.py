@@ -1227,11 +1227,7 @@ def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, 
     dev = k.device
     fwd = _fwd_mod()
     lse2 = fwd._lse2_of(w["part"], 0, nu)
-    if has_seg:
-        sg = w["seg"][:, :nu * C].view(B, nu, C)
-        lo = (C - (sg == sg[:, :, -1:]).sum(-1)).to(torch.int32)
-    else:
-        lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
+    lo, _ = fwd._chunk_row_bounds(w["seg"], 0, B, nu, C, has_seg, dev)
     sm90 = fwd._sm90()
     c2 = (dlse - delta).contiguous()
     f = _compiled(("chunkb90", K, S, V, C, dv_accumulate), lambda: sm90.AwmChunkBwdSm90(K, S, V, C, dv_accumulate), lambda: (
