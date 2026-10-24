@@ -2190,7 +2190,6 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
     f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
     dv = torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
-    doc = None  # chunk-major dO [nc, B, H, C, V], made once when the large-V path needs it
     if 3 * (S + V) // 2 + 4 * 32 <= 512 and os.environ.get("SCA_FUSED_DKDV", "1") == "1":
         # dK and dV in one pass (S^T / P^T computed once)
         dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
@@ -2202,36 +2201,71 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
         dp_cur = dp_prev = torch.zeros(1, dtype=torch.float32, device=dev)
         return _sca_bwd_dq(q, k, v, dout, lse2, delta, kmin, dp_prev, dp_cur, B, L, H, K, S, V, C, scale, dev), dk, dv
     if V > 256 and _use_pmat_dv(qmax, B, L, C):
-        # dV from the materialized bf16 P (chunk-major [C queries x 2C keys]) with cuBLAS: the v-slab kernel recomputes S^T
-        # V / 256 times, which costs as much as its own MMAs. Its cost is that of dense [C x C] GEMMs, so it only wins
-        # when most of the window is attended (few segment boundaries): 7.1B, B200: 1.5 ms vs 2.9 ms per layer without
-        # boundaries, 1.5 vs 1.1 with 7 segments per 16K tokens
+        # dV, dK and dQ from the materialized bf16 P and dS (chunk-major [C queries x 2C keys]) with cuBLAS: the v-slab dV
+        # kernel recomputes S^T V / 256 times (as many flops as its own MMAs) and the dK / dQ kernels recompute it again.
+        # The cost is that of dense [C x C] GEMMs, so this path only wins when most of the window is attended (few
+        # segment boundaries): 7.1B, B200, per layer without boundaries dV 2.9 -> 1.5 ms, dK + dQ 1.8 -> 1.0 ms;
+        # with 7 segments per 16K tokens the kernels take 1.1 / 0.9 ms.
         n_rep = H // K
         pm = torch.empty(nc, B, H, C, 2 * C, dtype=torch.bfloat16, device=dev)  # the kernel also writes the zeros
         f_pm = _compiled(("sca_pmat", H, K, S, C), lambda: ScaPmat(H, K, S, C), lambda: (
             _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
         f_pm(q.reshape(-1), k.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), _col2d(pm), B, L, float(scale * LOG2E))
         doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
-        # keys of chunk c: own queries (columns [C, 2C) of chunk c) and the queries of chunk c + 1 (columns [0, C))
-        outc = torch.bmm(pm[:, :, :, :, C:].reshape(-1, C, C).transpose(1, 2), doc.view(-1, C, V))
-        if nc > 1:
-            outc.view(nc, B, H, C, V)[:-1].view(-1, C, V).baddbmm_(pm[1:, :, :, :, :C].reshape(-1, C, C).transpose(1, 2), doc[1:].view(-1, C, V))
-        outc = outc.view(nc, B, K, n_rep, C, V)
-        dvc = outc[:, :, :, 0] if n_rep == 1 else outc.float().sum(3).to(torch.bfloat16)
+        vc = _chunk_major(v, H, K, V, C, B, L, nc, dev)  # heads repeated
+        qc = _chunk_major(q, H, H, S, C, B, L, nc, dev)
+        kc = _chunk_major(k, H, K, S, C, B, L, nc, dev)
         f_un = _compiled(("sca_cmuncopy", K, V, C), lambda: ChunkMajorUncopy(K, V, C), lambda: (
             _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+        f_unq = _compiled(("sca_cmuncopy", H, S, C), lambda: ChunkMajorUncopy(H, S, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+        f_unk = _compiled(("sca_cmuncopy", K, S, C), lambda: ChunkMajorUncopy(K, S, C), lambda: (
+            _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
+        cur = (slice(None),) * 4 + (slice(C, None),)   # columns [C, 2C): the keys of the row's own chunk
+        prv = (slice(None),) * 4 + (slice(None, C),)   # columns [0, C): the keys of the previous chunk
+        # dV_c = P_c[:, C:]^T dO_c + P_{c+1}[:, :C]^T dO_{c+1}
+        outc = torch.bmm(pm[cur].reshape(-1, C, C).transpose(1, 2), doc.view(-1, C, V))
+        if nc > 1:
+            outc.view(nc, B, H, C, V)[:-1].view(-1, C, V).baddbmm_(pm[1:][prv].reshape(-1, C, C).transpose(1, 2), doc[1:].view(-1, C, V))
+        outc = outc.view(nc, B, K, n_rep, C, V)
+        dvc = outc[:, :, :, 0] if n_rep == 1 else outc.float().sum(3).to(torch.bfloat16)
         f_un(dvc.contiguous().reshape(-1), dv.reshape(-1), B, L)
-    else:
-        f_dv = _compiled(("sca_bwd_dv", H, K, S, V, C), lambda: ScaBwdDv(H, K, S, V, C), lambda: (
-            _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
-            _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
-        f_dv(q.reshape(-1), k.reshape(-1), dout.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), qmax.reshape(-1), dv.reshape(-1),
-             B, L, float(scale * LOG2E))
+        del outc, dvc
+        # dS = P (dP - delta) scale with dP = dO V^T (fp32 GEMMs, [queries x keys])
+        dpq_cur = torch.bmm(doc.view(-1, C, V), vc.view(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
+        if nc > 1:
+            dpq_prev = torch.bmm(doc[1:].reshape(-1, C, V), vc[:-1].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
+        else:
+            dpq_prev = dpq_cur
+        ds = torch.empty_like(pm)
+        f_ds = _compiled(("sca_dsmat", H, C), lambda: ScaDsMat(H, C), lambda: (
+            _fake2(BFloat16), _fake2(Float32), _fake2(Float32), _fake(Float32, 4), _fake2(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+        f_ds(_col2d(pm), _col2d(dpq_cur), _col2d(dpq_prev), delta.reshape(-1), _col2d(ds), B, L, float(scale))
+        del pm, dpq_cur, dpq_prev
+        # dQ_c = dS_c[:, C:] K_c + dS_c[:, :C] K_{c-1}
+        dqc = torch.bmm(ds[cur].reshape(-1, C, C), kc.view(-1, C, S))
+        if nc > 1:
+            dqc.view(nc, B, H, C, S)[1:].view(-1, C, S).baddbmm_(ds[1:][prv].reshape(-1, C, C), kc[:-1].view(-1, C, S))
+        dq = torch.empty(B, L, H, S, dtype=torch.bfloat16, device=dev)
+        f_unq(dqc.reshape(-1), dq.reshape(-1), B, L)
+        # dK_c = dS_c[:, C:]^T Q_c + dS_{c+1}[:, :C]^T Q_{c+1}
+        dkc = torch.bmm(ds[cur].reshape(-1, C, C).transpose(1, 2), qc.view(-1, C, S))
+        if nc > 1:
+            dkc.view(nc, B, H, C, S)[:-1].view(-1, C, S).baddbmm_(ds[1:][prv].reshape(-1, C, C).transpose(1, 2), qc[1:].view(-1, C, S))
+        dkc = dkc.view(nc, B, K, n_rep, C, S)
+        dkc = dkc[:, :, :, 0] if n_rep == 1 else dkc.float().sum(3).to(torch.bfloat16)
+        dk = torch.empty(B, L, K, S, dtype=torch.bfloat16, device=dev)
+        f_unk(dkc.contiguous().reshape(-1), dk.reshape(-1), B, L)
+        return dq, dk, dv
+    f_dv = _compiled(("sca_bwd_dv", H, K, S, V, C), lambda: ScaBwdDv(H, K, S, V, C), lambda: (
+        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), _fake(Int32, 4), _fake(Int32, 4),
+        _fake(BFloat16), Int32(0), Int32(0), Float32(0.0)))
+    f_dv(q.reshape(-1), k.reshape(-1), dout.reshape(-1), lse2.reshape(-1), kmin.reshape(-1), qmax.reshape(-1), dv.reshape(-1),
+         B, L, float(scale * LOG2E))
     if V > 256:
         # dP for the dK / dQ kernels (fp32 GEMMs): dPcur[(c, b, h)] = V_c dO_c^T, dPprev[(c - 1, b, h)] = V_{c-1} dO_c^T
         vc = _chunk_major(v, H, K, V, C, B, L, nc, dev)  # heads repeated
-        if doc is None:
-            doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
+        doc = _chunk_major(dout, H, H, V, C, B, L, nc, dev)
         dp_cur = torch.bmm(vc.view(-1, C, V), doc.view(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
         if nc > 1:
             dp_prev = torch.bmm(vc[:-1].reshape(-1, C, V), doc[1:].reshape(-1, C, V).transpose(1, 2), out_dtype=torch.float32)
@@ -3023,6 +3057,60 @@ class ScaBwdDqT:
             tmem.relinquish_alloc_permit()
             cute.arch.barrier(barrier_id=2, number_of_threads=32 * self.num_cw)
             tmem.free(tmem_ptr)
+
+
+class ScaDsMat:
+    """dS = P (dP - delta) scale (bf16) in the chunk-major layout of ScaPmat ([C queries x 2C keys] per (c, b, h)),
+    from P (bf16, same layout), the fp32 dP GEMMs dPq_cur[(c, b, h)] = dO_c V_c^T (keys of chunk c = columns
+    [C, 2C)) and dPq_prev[(c - 1, b, h)] = dO_c V_{c-1}^T (columns [0, C); unused for chunk 0) and delta [b, h, l].
+    One CTA of 128 threads per row, 8 elements per thread and iteration (fusing this into ScaPmat was slower:
+    the strided per-thread dP reads are latency bound there)."""
+
+    def __init__(self, H: int, C: int):
+        self.H, self.C = H, C
+        assert C % 8 == 0
+
+    @cute.jit
+    def __call__(self, tP: cute.Tensor, tDPc: cute.Tensor, tDPp: cute.Tensor, tDelta: cute.Tensor, tDS: cute.Tensor,
+                 B: Int32, L: Int32, scale: Float32, stream: cuda.CUstream):
+        rows = B * L * self.H
+        self.kernel(tP.iterator, tDPc.iterator, tDPp.iterator, tDelta.iterator, tDS.iterator, B, L, scale).launch(
+            grid=[rows, 1, 1], block=[128, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, pP: cute.Pointer, pDPc: cute.Pointer, pDPp: cute.Pointer, pDelta: cute.Pointer, pDS: cute.Pointer,
+               B: Int32, L: Int32, scale: Float32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        H, C = self.H, self.C
+        # row (c, b, h, t) in order
+        t = bidx % C
+        r1 = bidx // C
+        h = r1 % H
+        r2 = r1 // H
+        b = r2 % B
+        c = r2 // B
+        delta = cute.make_tensor(pDelta + ((b * H + h) * L + c * C + t), cute.make_layout(1))[0]
+        d_s = -delta * scale
+        prow = pP + Int64(bidx) * (2 * C)
+        dsrow = pDS + Int64(bidx) * (2 * C)
+        cur = pDPc + Int64(bidx) * C
+        prv = pDPp + Int64(((c - 1) * B + b) * H + h) * C * C + Int64(t) * C
+        n_it = (C + 8 * 128 - 1) // (8 * 128)
+        for i in cutlass.range_constexpr(n_it):
+            e = (i * 128 + tidx) * 8
+            if e < C:
+                # columns [C, 2C): the keys of the row's own chunk
+                p8 = cute.make_tensor((prow + (C + e)).align(16), cute.make_layout(8)).load().to(Float32)
+                d8 = cute.make_tensor((cur + e).align(16), cute.make_layout(8)).load()
+                cute.make_tensor((dsrow + (C + e)).align(16), cute.make_layout(8)).store((p8 * (d8 * scale + d_s)).to(BFloat16))
+        if c > 0:
+            for i in cutlass.range_constexpr(n_it):
+                e = (i * 128 + tidx) * 8
+                if e < C:
+                    p8 = cute.make_tensor((prow + e).align(16), cute.make_layout(8)).load().to(Float32)
+                    d8 = cute.make_tensor((prv + e).align(16), cute.make_layout(8)).load()
+                    cute.make_tensor((dsrow + e).align(16), cute.make_layout(8)).store((p8 * (d8 * scale + d_s)).to(BFloat16))
 
 
 class ChunkMajorUncopy:
