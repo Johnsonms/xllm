@@ -354,6 +354,7 @@ class GekkoBlockFunction(torch.autograd.Function):
                     prev_aqk, prev_akk, prev_av, segment_idx, prev_segment_count,
                     awm_orthogonal_update, rmsnorm_eps, awm_backend
                 )
+                awm_workspace = ()
 
             handle8 = None
             handle9 = None
