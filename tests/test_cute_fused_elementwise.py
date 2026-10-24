@@ -93,3 +93,22 @@ def test_group_layer_norm_fwd():
     torch.testing.assert_close(m, rm, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(r, rr, atol=0, rtol=1e-6)
     _ulp_close(y, ry)
+
+
+@pytest.mark.parametrize("gate", ["silu", "softplus2"])
+def test_gate_kernels(gate):
+    import math
+    from xllm.modules.fused_ops.cute.swiglu import gate_bwd, gate_mul
+    torch.manual_seed(0)
+    x = (torch.randn(512, 1024, device="cuda") * 8).bfloat16()
+    x[0, :4] = torch.tensor([30.0, 40.0, -30.0, 28.5])  # around softplus's linear threshold
+    m, g = torch.randn_like(x), torch.randn_like(x)
+    xd = x.double().requires_grad_()
+    md = m.double().requires_grad_()
+    fn = F.silu if gate == "silu" else (lambda t: F.softplus(t, beta=math.log(2), threshold=20))
+    ref = fn(xd) * md
+    ref.backward(g.double())
+    torch.testing.assert_close(gate_mul(x, m, gate).double(), ref.detach(), atol=0.1, rtol=1e-2)
+    dx, dm = gate_bwd(g, x, m, gate)
+    torch.testing.assert_close(dx.double(), xd.grad, atol=0.1, rtol=1e-2)
+    torch.testing.assert_close(dm.double(), md.grad, atol=0.1, rtol=1e-2)

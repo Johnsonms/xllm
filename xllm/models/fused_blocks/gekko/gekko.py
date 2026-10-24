@@ -69,6 +69,27 @@ from xllm.models.fused_blocks.distributed import (
 
 
 
+_GATE_KINDS = {"silu": "silu", "softplus": "softplus2"}
+
+
+def gate_fusable(x: torch.Tensor) -> bool:
+    """gate(rmx) * attn and its backward as cute/swiglu.py gate kernels (contiguous bf16 / fp16)."""
+    if os.environ.get("XLLM_GATE_TORCH", "0") == "1" or not x.is_cuda or not x.is_contiguous():
+        return False
+    from xllm.modules.fused_ops.cute.swiglu import TORCH2CUTE
+    return x.dtype in TORCH2CUTE and x.numel() % 8 == 0 and x.data_ptr() % 16 == 0
+
+
+def fused_gate_mul(x: torch.Tensor, m: torch.Tensor, gate_func: str) -> torch.Tensor:
+    from xllm.modules.fused_ops.cute.swiglu import gate_mul
+    return gate_mul(x.contiguous(), m.contiguous(), _GATE_KINDS[gate_func])
+
+
+def fused_gate_bwd(g: torch.Tensor, x: torch.Tensor, m: torch.Tensor, gate_func: str):
+    from xllm.modules.fused_ops.cute.swiglu import gate_bwd
+    return gate_bwd(g.contiguous(), x.contiguous(), m.contiguous(), _GATE_KINDS[gate_func])
+
+
 def softmax_bwd_fusable(x: torch.Tensor) -> bool:
     """The fused softmax backward (cute/softmax_bwd.py) takes contiguous bf16 / fp16 rows of 64 .. 256 elements."""
     if os.environ.get("XLLM_SOFTMAX_BWD_TORCH", "0") == "1" or not x.is_contiguous():
@@ -158,6 +179,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         assert timenorm_local_groups is not None
         attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
         assert attn_gate_fn is not None
+        fused_gate = gate_fusable(x)  # gate(rmx) * attn in one kernel (r holds the raw rmx then)
 
         bsz, seq_len, _ = x.size()
         width = q_conv_w.shape[1]
@@ -336,14 +358,14 @@ class GekkoBlockFunction(torch.autograd.Function):
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = attn_gate_fn(F.linear(mx, wr, br))
+            r = F.linear(mx, wr, br) if fused_gate else attn_gate_fn(F.linear(mx, wr, br))
         else:
             sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = attn_gate_fn(F.linear(mx, wr, br))
+            r = F.linear(mx, wr, br) if fused_gate else attn_gate_fn(F.linear(mx, wr, br))
 
             if handle_memory is not None:
                 handle_memory.wait()
@@ -380,7 +402,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
         attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
-        attn = torch.mul(attn, r, out=attn)
+        attn = fused_gate_mul(r, attn, attn_gate_func) if fused_gate else torch.mul(attn, r, out=attn)
         attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
         # B x L x E -> B x L x D
@@ -784,9 +806,13 @@ class GekkoBlockFunction(torch.autograd.Function):
         # recompute attn out
         # B x L x E
         rmx = F.linear(mx, wr, br)
-        r = attn_gate_fn(rmx)
+        fused_gate = gate_fusable(rmx)
         attn_norm, attn_rstd = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
-        attn = torch.mul(attn_norm, r, out=awk_out)
+        if fused_gate:
+            attn = fused_gate_mul(rmx, attn_norm, attn_gate_func)
+        else:
+            r = attn_gate_fn(rmx)
+            attn = torch.mul(attn_norm, r, out=awk_out)
         attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
@@ -796,7 +822,12 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         attn_grad = xh_grad.matmul(wo)
         attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
-        attn_norm_grad = torch.mul(attn_grad, r, out=r)
+        if fused_gate:
+            # gradients of gate(rmx) * attn_norm in one pass: rmx_grad is ready long before it is used
+            rmx_grad, attn_norm_grad = fused_gate_bwd(attn_grad, rmx, attn_norm, attn_gate_func)
+            rmx_grad = rearrange(rmx_grad, 'b l d -> (b l) d')
+        else:
+            attn_norm_grad = torch.mul(attn_grad, r, out=r)
         sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
@@ -890,9 +921,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_conv_v = None
 
         # B x L x E
-        r_grad = torch.mul(attn_grad, attn_norm, out=attn_grad)
-        # B*L x D
-        rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
+        if not fused_gate:
+            r_grad = torch.mul(attn_grad, attn_norm, out=attn_grad)
+            # B*L x D
+            rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
         mx_grad = torch.mm(rmx_grad, wr)
 
         # apply rotary embeddings
