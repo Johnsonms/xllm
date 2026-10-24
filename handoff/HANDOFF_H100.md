@@ -15,8 +15,9 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
   quack fused SwiGLU FFN and fused linear CE (optional dependency), TMA reduce-add residual folds, CE bf16 dgrad,
   AWM small-kernel cleanup, opt-in activation keep; FSDP / NCCL config knobs measured (section 4).
 - Parity: 60-step 1-GPU 0.9B, 30-step 8-GPU 4B and 7.1B, 150-step 8-GPU 7.1B soak (within run-to-run noise).
-- Opt-in knobs: `XLLM_GEKKO_SAVE_QK_PREP=1` (+11-20 GB), `FSDP_RESHARD=0`, `NCCL_PROTO=Simple`, bf16 reduce-scatter.
-  Switches back to reference paths: `XLLM_QUACK_FFN=0`, `XLLM_QUACK_CE=0`, `XLLM_CE_DGRAD_FP32=1`,
+- Opt-in knobs: `XLLM_GEKKO_SAVE_QK_PREP=1` (+11-20 GB), `XLLM_GEKKO_SAVE_RMX=1` (+3-4 GB), `FSDP_RESHARD=0`,
+  `NCCL_PROTO=Simple`, bf16 reduce-scatter.
+  Switches back to reference paths: `XLLM_CONV_QK=0`, `XLLM_CONV_SM90=0`, `XLLM_QUACK_FFN=0`, `XLLM_QUACK_CE=0`, `XLLM_CE_DGRAD_FP32=1`,
   `XLLM_SWIFT_QSPLIT=1`, `XLLM_SWIFT_SEG_SKIP=0`, `XLLM_SWIFT_BWD_COPY=1`, `XLLM_AWM_LSE2_TORCH=1`, `AWM_SM90_CUBLAS=1`.
 
 ## 1. Node and environment (gpu-dp-mlsf6-dvtr5)
@@ -76,6 +77,10 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | opt-in `XLLM_GEKKO_SAVE_QK_PREP=1`: keep the conv / q-k prep outputs and the gate projection rmx for the backward (no recompute of 3 convs, 2 q-k preps, 1 GEMM per layer) | 171d701, 1f9e2be | 8 GPUs 0.9B 604 -> 581 ms (+20 GB), 4B 542 -> 524 (+11 GB), 7.1B 827 -> 794 (+11 GB) |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
+| causal conv fused with the q / k prep (`cute/conv_qk_prep.py`: conv + rmsnorm + rope + softmax forward / recompute, q-k prep backward + conv backward + weight gradients in one kernel; warp per head tile, interleaved warp reductions, cp.async ring, mask-free path; `XLLM_CONV_QK=0` off) | eab15f2 | 0.9B q per layer fwd / bwd 264 / 643 -> 153 / 262 us; 1 GPU 0.9B 544 -> 531 ms; 8 GPUs 0.9B 625 -> 611 |
+| conv_qk_prep: heads of 128 channels packed two per warp | 9415c1d | 4B q bwd 167 -> 124 us; 8 GPUs 4B (same batches) 516 -> 503 ms |
+| opt-in `XLLM_GEKKO_SAVE_RMX=1`: keep only the gate projection | 961bfe6 | 8 GPUs 0.9B (same batches) 568 -> 561 ms, +3.4 GB (SAVE_QK_PREP: 551, +17 GB) |
+| Hopper CuTe conv for the v conv (`cute/causal_conv_sm90.py`, silu, `XLLM_CONV_SM90=0` off) | 3f1acc9 | per call fwd / bwd 0.9B 60 / 108 -> 54 / 91 us, 4B 19 / 89 -> 11 / 36, 7.1B 120 / 166 -> 104 / 163; 4B 502 -> 500 ms |
 
 `quack-kernels` 0.6.5 (Dao-AILab, Apache-2.0, CuTe DSL) is already in this venv from PyPI; the two quack paths are
 imported lazily and fall back to the previous code when it is missing. The harness takes `VOCAB=<n>` (default 32000,
@@ -221,8 +226,20 @@ with identical batches), GEMM slowdown under the overlapping reduce-scatter (~10
 - swift (7.1B SCA): segment-aware sub-chunks leave cuBLAS GEMMs at reasonable sizes plus the softmax kernels at
   bandwidth. Next would be dS = P (dP - delta) in the dP GEMM's epilogue with delta from the attention-gate backward
   (removes the softmax-backward pass; ~0.5% est.).
-- conv + q / k prep fusion (~1-2% est. on 0.9B / 4B): the q conv output round trip and its gradient's; B200's
-  hand-off lists conv fusion next, so coordinate before starting.
+- conv + q / k prep fusion: done (eab15f2, 9415c1d); the B200 session had listed conv fusion next.
+- xattn EOS backward, measured further (0.9B shape, useful TFLOPS fwd / bwd): no boundaries 793 / 450, random
+  1/3000 696 / 392, 1/1000 537 / 256, every 1024 tokens 460 / 199. The bwd main kernel (BM 64 x BN 80 for D = 256) is
+  memory-bound at ~80% (fp32 dQ / GQA dK-dV accumulation) with one CTA per SM, so each CTA's K / V load and dK / dV
+  store are serialized with its short query loop. Tried: a dynamic persistent varlen scheduler for the
+  non-deterministic backward (FA3's `VarlenDynamicPersistentTileScheduler` plus the TransformBarrier handshake: K / V
+  are single-buffered) -> correct, but 4431 -> 4856 us; deterministic mode 6.3 ms; segment route 4.6 ms. Real fixes
+  are inside xattn (double-buffered K / V does not fit at D = 256; a separate dQ pass costs +40% FLOPs).
+- FSDP2 explicit forward prefetch (`set_modules_to_forward_prefetch`): no gain. The large forward gaps seen in
+  `WITH_STACK=1` traces are profiler CPU overhead (4B: 71 ms of gaps with stacks, 8-9 ms without).
+- quack vs cuBLAS for the FFN backward GEMMs: quack is faster in isolation at all three shapes (7.1B dgrad 1470 vs
+  1526 us); the ~1.7 ms seen in 8-GPU traces is the GEMM slowed by the concurrent reduce-scatter.
+- AWM out GEMM (7.1B forward epilogue at 57% of copy bandwidth): register-bound at one CTA per SM; 2 stages or
+  VT 128 / 64 tiles are slower (q re-read). Needs a persistent ping-pong kernel; ~2 ms/step at most on 7.1B.
 - AWM: ~20 ms/step on 7.1B; the forward recurrence runs at ~23 TFLOPS (latency-bound over 2-3 updates) and the out
   GEMM forward epilogue at 57% of copy bandwidth; ~5 ms/step at most.
 - quack FFN path at 7.1B is neutral because of the per-call [w1; w3] concatenation (~6 ms/step); a fused
