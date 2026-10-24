@@ -865,7 +865,20 @@ def grouped_experts_bwd(
     return x_grad, w1_grad, w2_grad, w3_grad
 
 
+def _cute_rope(x: Tensor, freqs_cis: Tensor, rope_head_dim: int, backward: bool) -> Optional[Tensor]:
+    """The single-pass CuTe DSL rotary embedding (Blackwell, bf16; env XLLM_CUTE_ROPE=0 disables), else None."""
+    try:
+        from xllm.modules.fused_ops.cute.rope import rope, rope_supported
+    except ImportError:
+        return None
+    if not rope_supported(x, rope_head_dim) or freqs_cis.dtype != torch.complex64 or freqs_cis.shape != (x.shape[1], rope_head_dim // 2):
+        return None
+    return rope(x, freqs_cis, rope_head_dim, backward)
+
+
 def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and (y := _cute_rope(x, freqs_cis, rope_head_dim, backward)) is not None:
+        return y
     if rope_head_dim == head_dim:
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
@@ -876,6 +889,8 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
 
 
 def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and (yq := _cute_rope(xq, freqs_cis, rope_head_dim, backward)) is not None:
+        return yq, _cute_rope(xk, freqs_cis, rope_head_dim, backward)
     if rope_head_dim == head_dim:
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
