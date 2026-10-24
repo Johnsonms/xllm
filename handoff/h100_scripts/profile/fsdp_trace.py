@@ -5,7 +5,7 @@ usage: torchrun --nproc_per_node N fsdp_step.py <preset> <batch_per_gpu> <seq_le
 import os, sys, time, re, json
 from collections import defaultdict
 S = "/tmp/claude-243000396/-data-home-johnson-xllm/d3839bfb-7816-4668-9945-7c337f0c3f9e/scratchpad/handoff/scripts/awm"
-sys.path.insert(0, os.path.join(S, "xext")); sys.path.insert(0, "/home/johnson/xllm")
+sys.path.insert(0, os.path.join(S, "xext")); sys.path.insert(0, os.environ.get("XLLM_ROOT", "/home/johnson/xllm"))
 import torch, torch.distributed as dist, types
 sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
 preset, bsz, seq_len = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])

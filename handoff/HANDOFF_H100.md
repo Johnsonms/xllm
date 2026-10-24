@@ -58,13 +58,26 @@ All fused kernels have torch / extension fallbacks behind env switches (`XLLM_RO
 Evaluated and not adopted: FA4 SM90 (CuTe) SCA via `mask_mod` + block sparsity (correct, 10-25% slower than xattn);
 xattn `segment_idx` route (slower than its BOS route); fewer out-GEMM stages (slower).
 
+### Merge with the B200 fused kernels (bd125c4)
+
+The B200 session added, on `cute-adaptive-working-memory`, fused CuTe kernels overlapping several of the items above:
+`cute/rope.py`, `cute/qk_prep.py` (q / k rmsnorm + rope + softmax and their backward), `cute/attn_gate.py` (add +
+per-head rmsnorm + gate + multiply), `cute/swiglu.py`, `cute/cross_entropy.py`, `cute/layer_norm.py` and row-split
+weight-gradient kernels in the CUDA group norms. `hopper-kernels` merged that branch taking the B200 versions for
+these features; their capability gates (`>= 10`) were lowered to sm_90 (no Blackwell-only instructions; all 42 of
+their tests pass on H100), which is worth doing upstream too. Kept from this branch on top: AWM Hopper kernels, TSDN
+fallback, xattn bos guard, awm_workspace fix, residual adds in the wo / fc2 GEMM epilogues, TSDN step counts handed
+to the backward, fused AdamW, swift chunk-major attention matrices; `cute/group_norm.py` / `cute/softmax_bwd.py`
+remain with tests but the gekko block now uses the B200 kernels. 0.9B steady step ~596 -> ~570 ms.
+Lesson: fetch the B200 branch before starting new fused kernels to avoid duplicate work.
+
 ## 4. 8 GPUs (FSDP2, everything above, xattn SCA except 7.1B)
 
 | preset | shape | start of session | now | same batches on all ranks |
 |---|---|---|---|---|
-| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 732 ms | 644 ms |
-| gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | 577 ms | 552 ms |
-| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | 926 ms | - |
+| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 686 ms (after the B200 merge) | 598 ms |
+| gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | 554 ms | 526 ms |
+| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~915-945 ms | - |
 
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
@@ -82,6 +95,12 @@ xattn `segment_idx` route (slower than its BOS route); fewer out-GEMM stages (sl
   `tests/test_cute_sliding_chunk_attention.py` skips (Blackwell kernels).
 - 60-step training, gekko-0.9B B1 L8192 1 GPU, every optimized path vs every reference path (torch / CUB / extension
   / foreach Adam via the env switches): loss |diff| <= 0.0004, grad norms within 0.3%; median step 324 -> 216 ms.
+  Repeated on the merged head (B200 kernels off via `XLLM_CUTE_{CE,GATE,LN,QK,ROPE,SWIGLU}=0`): loss |diff| <= 0.0006,
+  grad norms within 0.25%; median step 322 -> 202 ms.
+- 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
+  ~570 ms steady now.
+- Also tried, no gain: `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
+  more forward work); FLA conv backend (conv 26 -> 44 ms).
 
 ## 6. Open items / next
 
