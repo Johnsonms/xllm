@@ -50,6 +50,7 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | fused AdamW by default (`OptimConf.fused`) | 702d594 | optimizer 29 -> 16 ms (1 GPU), 17 -> 13 (8 GPU) |
 | CE row kernels (`cute/cross_entropy.py`, MP 1) | 2b4e274 | CE 43 -> 25 ms; step 660 -> 644 |
 | group norm backward in CuTe, fused gamma/beta | 652077e | norm 42 -> 32 ms; steady ~630 -> ~620 |
+| CE grad_input GEMM from the bf16 scores (was tf32 on fp32 scores + fp32 weight copy; same error after the bf16 rounding of grad_input) | 474ec48 | 581 -> 246 us per chunk; step 570 -> 562 ms |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
 
@@ -68,8 +69,13 @@ xattn `segment_idx` route (slower than its BOS route); fewer out-GEMM stages (sl
 | interval-mask softmax kernel (binary search for the segment's key range, 16 B vectors, 256-thread rows) + in-place attention matrix | 1afb985 | fwd 2128 -> 1577 us |
 | backward writes q / k / v gradients in place, window overlap accumulated in the GEMMs (`attention_bwd_out`, beta = 1) | 03c6156 | bwd 2929 -> 2765 us, bitwise equal |
 | query sub-chunks (`XLLM_SWIFT_QSPLIT`, default 2) skip the masked causal half; output written in place | a94bda8 | fwd+bwd 4261 -> 3827 us; dk / dv rel err vs fp32 4.5e-3 -> 4.7e-3 |
+| key ranges start at the sub-chunk's segment start (host copy of the segment ids once per step, cached for all layers and the backward; split 2 or 4 by cost) | 5ab2ae4 | EOS 1/3000: 3796 -> 2279 us, 1/1000: 3775 -> 1648; no EOS unchanged |
+| strided batch over heads instead of pointer arrays (B = 1) | 40d6ef9 | 2279 -> 2174 us (EOS 1/3000), 3930 -> 3870 (no EOS) |
 
-8 GPUs, gekko-7.1B B1 L8192: ~940 -> ~866 ms over these items, peak 51.8 -> 49.4 GiB, losses within 2e-4.
+8 GPUs, gekko-7.1B B1 L8192: ~940 -> ~847 ms over these items (same batches on all ranks: ~823), peak 51.8 -> 49.4
+GiB, losses within 2e-4. Per-rank batches gain less than rank-0 compute (832 -> 786 ms for the segment item): the step
+waits for the rank with the fewest EOS, whose attention skips the least. `tests/attn/test_swift_blocks.py` checks the
+call layouts against a dense fp32 reference.
 
 ### xattn patch (local, `h100_scripts/patches/xattn-1.1.1-varlen-hdim256-bwd-stage2.patch`)
 
@@ -100,9 +106,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 
 | preset | shape | start of session | now | same batches on all ranks |
 |---|---|---|---|---|
-| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 686 ms (after the B200 merge) | 598 ms |
+| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 640 ms (xattn patch, CE) | 598 ms (before them) |
 | gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | 554 ms | 526 ms |
-| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~866 ms (swift items above) | - |
+| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~847 ms (swift items above) | ~823 ms |
 
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
@@ -111,6 +117,12 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
   `NCCL_PROTO=Simple` 577 -> 568 ms; bf16 reduce-scatter (`fp32_reduce_scatter=False`) 568; both 558 (losses equal
   to 4 decimals). NVLS is not available on this node (no algorithm for fp32 reduce-scatter).
   Same on 7.1B: ~883 -> ~878 (Simple) -> ~862 ms (Simple + bf16 reduce-scatter), losses equal to 4 decimals.
+- The FFN weight-gradient GEMMs (4B: 9216 x 2560, K 8192) run at ~800 TFLOPS alone but ~440 under the overlapping
+  reduce-scatter (memory-bandwidth contention; NCCL already uses RING / SIMPLE for these sizes, the `_RING_LL` in the
+  kernel name is NCCL's generic entry point). A cuBLAS SM carve-out (`torch._C._set_sm_carveout_experimental`) does not
+  help (8 / 16 / 24 SMs: 554 -> 560-575 ms).
+- `reshard_after_forward=False` (keep the unsharded params until the backward) fits on 80 GB and skips the backward
+  all-gathers: 4B 554 -> 536 ms (+7 GB), 7.1B ~846 -> ~819 (+12 GB), 0.9B 640 -> 635. Config, not code.
 - cuBLAS efficiency (plan §3.6): 7.1B shapes 755-790 TFLOPS (76-80% of dense peak), 4B ~770, 0.9B (K = 1536)
   ~680. Nothing to do kernel-side.
 
