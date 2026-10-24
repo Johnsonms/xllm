@@ -1,7 +1,5 @@
 from typing import Optional, Tuple, List, Any
 import math
-import os
-
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -281,6 +279,18 @@ def causal_conv1d_bwd(
     return x_grad, initial_state_grad, w_grad, b_grad
 
 
+def _cute_ln(x: Tensor, weight: Optional[Tensor], bias: Optional[Tensor], num_groups: int) -> bool:
+    """Whether the CuTe DSL group layer norm (Blackwell, bf16, affine, >= 2048 tokens; env XLLM_CUTE_LN=0 disables it)
+    handles this input."""
+    if weight is None or bias is None or x.dim() != 3 or x.shape[0] * x.shape[1] < 2048:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.layer_norm import ln_supported
+    except ImportError:
+        return False
+    return ln_supported(x, num_groups)
+
+
 def layernorm_fwd(
     x: Tensor,
     weight: Optional[Tensor],
@@ -289,9 +299,9 @@ def layernorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     xdim = x.shape[-1]
-    if weight is not None and _fused_norm_ok(x, num_groups):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
-        return group_norm_fwd(x, num_groups, eps, weight + 1.0, bias, layer=True)
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_fwd
+        return ln_fwd(x, weight, bias, num_groups, eps)
     if weight is not None:
         return xllm_ops.group_layer_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, bias, eps)
     else:
@@ -308,9 +318,9 @@ def layernorm_bwd(
     num_groups: int,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     xdim = x.shape[-1]
-    if weight is not None and _fused_norm_bwd_ok(y_grad, x, num_groups):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
-        return group_norm_bwd(y_grad, x, num_groups, rstd, mean, weight + 1.0, layer=True)
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_bwd
+        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups)
     if weight is not None:
         return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
@@ -324,72 +334,10 @@ def rmsnorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor]:
     xdim = x.shape[-1]
-    if _fused_norm_ok(x, num_groups):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
-        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None)
     if weight is not None:
         return xllm_ops.group_rms_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, eps)
     else:
         return xllm_ops.group_rms_norm_fwd(x, xdim, num_groups, eps)
-
-
-def rmsnorm_add_fwd(
-    x: Tensor,
-    x2: Tensor,
-    weight: Optional[Tensor],
-    num_groups: int,
-    eps: float,
-) -> Tuple[Tensor, Tensor]:
-    """rmsnorm_fwd(x + x2, ...) without writing the sum (fused into the CuTe norm kernel when supported)."""
-    if _fused_norm_ok(x, num_groups) and x2.shape == x.shape and x2.dtype == x.dtype and x2.is_contiguous():
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
-        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None, x2=x2)
-    return rmsnorm_fwd(x + x2, weight, num_groups, eps)
-
-
-def rmsnorm_rope_fwd(
-    x: Tensor,
-    weight: Optional[Tensor],
-    num_groups: int,
-    eps: float,
-    freqs_cis: Tensor,
-    head_dim: int,
-    rope_head_dim: int,
-) -> Tuple[Tensor, Tensor]:
-    """apply_rope(rmsnorm_fwd(x, ...)) for x [B, L, num_groups * head_dim] (a group per head): one kernel when the
-    CuTe norm supports it, else the two passes. Returns ([B, L, num_groups * head_dim], rstd)."""
-    if (rope_head_dim > 0 and x.dim() == 3 and x.shape[-1] == num_groups * head_dim and _fused_norm_ok(x, num_groups)
-            and not _ROPE_TORCH and rope_head_dim % 8 == 0 and freqs_cis.shape[0] == x.shape[1]):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_fwd
-        return group_norm_fwd(x, num_groups, eps, weight + 1.0 if weight is not None else None,
-                              freqs_cis=freqs_cis, rope_head_dim=rope_head_dim)
-    y, rstd = rmsnorm_fwd(x, weight, num_groups, eps)
-    B, L = y.shape[0], y.shape[1]
-    y = apply_rope(y.view(B, L, num_groups, head_dim), freqs_cis, head_dim, rope_head_dim, False)
-    return y.reshape(B, L, num_groups * head_dim), rstd
-
-
-def rmsnorm_rope_bwd(
-    y_grad: Tensor,
-    x: Tensor,
-    rstd: Tensor,
-    weight: Optional[Tensor],
-    num_groups: int,
-    freqs_cis: Tensor,
-    head_dim: int,
-    rope_head_dim: int,
-) -> Tuple[Tensor, Optional[Tensor]]:
-    """Backward of rmsnorm_rope_fwd from the gradient of its output (any [B, L, ...] view) and its input x."""
-    B, L = x.shape[0], x.shape[1]
-    dy = y_grad.reshape(B, L, num_groups * head_dim)
-    if (rope_head_dim > 0 and x.dim() == 3 and _fused_norm_bwd_ok(dy, x, num_groups) and not _ROPE_TORCH
-            and rope_head_dim % 8 == 0 and freqs_cis.shape[0] == L):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
-        res = group_norm_bwd(dy, x, num_groups, rstd, None, weight + 1.0 if weight is not None else None,
-                             freqs_cis=freqs_cis, rope_head_dim=rope_head_dim)
-        return res if weight is not None else (res[0], None)
-    dy = apply_rope(y_grad.reshape(B, L, num_groups, head_dim), freqs_cis, head_dim, rope_head_dim, True)
-    return rmsnorm_bwd(dy.reshape(B, L, num_groups * head_dim), x, rstd, weight, num_groups)
 
 
 def rmsnorm_bwd(
@@ -400,10 +348,6 @@ def rmsnorm_bwd(
     num_groups: int,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     xdim = x.shape[-1]
-    if _fused_norm_bwd_ok(y_grad, x, num_groups):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
-        res = group_norm_bwd(y_grad, x, num_groups, rstd, None, weight + 1.0 if weight is not None else None)
-        return res if weight is not None else (res[0], None)
     if weight is not None:
         return xllm_ops.group_rms_norm_bwd_affine(y_grad, x, xdim, num_groups, rstd, weight + 1.0, False)
     else:
@@ -417,9 +361,6 @@ def mem_effn_rmsnorm_bwd(
     num_groups: int,
 ) -> Tensor:
     ydim = y.shape[-1]
-    if _fused_norm_bwd_ok(y_grad, y, num_groups):
-        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
-        return group_norm_bwd(y_grad, y, num_groups, rstd, mem_eff=True)[0]
     return xllm_ops.group_rms_norm_bwd(y_grad, y, ydim, num_groups, rstd, True)
 
 
@@ -708,6 +649,16 @@ def sliding_chunk_attention_bwd(
     )
 
 
+def _cute_swiglu(h1: Tensor, dropout: float) -> bool:
+    """Whether the fused CuTe DSL SwiGLU elementwise kernels (Blackwell, bf16, no hidden dropout; env
+    XLLM_CUTE_SWIGLU=0 disables them) handle this input."""
+    try:
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_supported
+    except ImportError:
+        return False
+    return swiglu_supported(h1, dropout)
+
+
 def swiglu_forward(
     x: Tensor,
     w1: Tensor,
@@ -722,9 +673,9 @@ def swiglu_forward(
     if swiglu:
         h1 = F.linear(x, w1)
         h3 = F.linear(x, w3)
-        if _fused_swiglu_ok(h1, h3):
-            from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd as fused_swiglu_fwd
-            hidden = fused_swiglu_fwd(h1, h3)
+        if _cute_swiglu(h1, dropout):
+            from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd
+            hidden = swiglu_fwd(h1, h3)
         else:
             hidden = F.silu(h1)
             hidden = torch.mul(hidden, h3, out=hidden)
@@ -760,18 +711,16 @@ def swiglu_backward(
     assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
     bsz, seq_len, _ = x.shape
 
-    if h3 is not None and dropout == 0.0 and _fused_swiglu_ok(h1, h3):
-        # fused elementwise around the h_grad GEMM (no dropout): h for the fc2 weight gradient, then both grads
-        from xllm.modules.fused_ops.cute.swiglu import swiglu_fwd as fused_swiglu_fwd, swiglu_bwd as fused_swiglu_bwd
-        h = fused_swiglu_fwd(h1, h3)
-        h_grad = torch.mm(y_grad, w2)
-        h1_grad, h3_grad = fused_swiglu_bwd(h_grad, h1, h3)
+    # B*L x D, D x E -> B*L x E
+    h_grad = torch.mm(y_grad, w2)
+    if h3 is not None and _cute_swiglu(h1, dropout):
+        # the recompute of hidden and both gradients in one pass
+        from xllm.modules.fused_ops.cute.swiglu import swiglu_bwd
+        h, h1_grad, h3_grad = swiglu_bwd(h1, h3, h_grad)
     else:
         # B*L x E
         h1s = F.silu(h1)
         h, h_noise = memory_efficient_dropout_fwd(h1s if h3 is None else h1s * h3, dropout, True, rng_state)
-        # B*L x D, D x E -> B*L x E
-        h_grad = torch.mm(y_grad, w2)
         h_grad = memory_efficient_dropout_bwd(h_grad, dropout, rng_state, h_noise)
 
         if h3 is not None:
@@ -958,49 +907,20 @@ def grouped_experts_bwd(
     return x_grad, w1_grad, w2_grad, w3_grad
 
 
-_NORM_EXT = os.environ.get("XLLM_NORM_EXT", "0") == "1"  # xllm_extension group norm forward instead of the CuTe one
-
-
-def _fused_norm_ok(x: Tensor, num_groups: int) -> bool:
-    if _NORM_EXT:
-        return False
-    from xllm.modules.fused_ops.cute import group_norm as cute_group_norm
-    return cute_group_norm.supported(x, num_groups)
-
-
-def _fused_norm_bwd_ok(y_grad: Tensor, x: Tensor, num_groups: int) -> bool:
-    if _NORM_EXT:
-        return False
-    from xllm.modules.fused_ops.cute import group_norm as cute_group_norm
-    return cute_group_norm.supported_bwd(y_grad, x, num_groups)
-
-
-_SWIGLU_TORCH = os.environ.get("XLLM_SWIGLU_TORCH", "0") == "1"  # torch reference path instead of the fused kernels
-
-
-def _fused_swiglu_ok(h1: Tensor, h3: Tensor) -> bool:
-    if _SWIGLU_TORCH:
-        return False
-    from xllm.modules.fused_ops.cute import swiglu as cute_swiglu
-    return cute_swiglu.supported(h1, h3)
-
-
-_ROPE_TORCH = os.environ.get("XLLM_ROPE_TORCH", "0") == "1"  # torch reference path instead of the fused kernel
-
-
-def _fused_rope_ok(x: Tensor, rope_head_dim: int) -> bool:
-    if _ROPE_TORCH or not x.is_cuda or x.dim() != 4 or x.stride(3) != 1 or x.data_ptr() % 16:
-        return False
-    if any(s % 8 for s in x.stride()[:3]):
-        return False
-    from xllm.modules.fused_ops.cute import rope as cute_rope
-    return cute_rope.supported(x.dtype, x.shape[3], rope_head_dim)
+def _cute_rope(x: Tensor, freqs_cis: Tensor, rope_head_dim: int, backward: bool) -> Optional[Tensor]:
+    """The single-pass CuTe DSL rotary embedding (Blackwell, bf16; env XLLM_CUTE_ROPE=0 disables), else None."""
+    try:
+        from xllm.modules.fused_ops.cute.rope import rope, rope_supported
+    except ImportError:
+        return None
+    if not rope_supported(x, rope_head_dim) or freqs_cis.dtype != torch.complex64 or freqs_cis.shape != (x.shape[1], rope_head_dim // 2):
+        return None
+    return rope(x, freqs_cis, rope_head_dim, backward)
 
 
 def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
-    if rope_head_dim > 0 and _fused_rope_ok(x, rope_head_dim):
-        from xllm.modules.fused_ops.cute import rope as cute_rope
-        return cute_rope.rope(x, freqs_cis, rope_head_dim, backward)  # new tensor: x stays intact
+    if rope_head_dim > 0 and (y := _cute_rope(x, freqs_cis, rope_head_dim, backward)) is not None:
+        return y
     if rope_head_dim == head_dim:
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
@@ -1011,9 +931,8 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
 
 
 def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
-    if rope_head_dim > 0 and _fused_rope_ok(xq, rope_head_dim) and _fused_rope_ok(xk, rope_head_dim):
-        from xllm.modules.fused_ops.cute import rope as cute_rope
-        return cute_rope.rope(xq, freqs_cis, rope_head_dim, backward), cute_rope.rope(xk, freqs_cis, rope_head_dim, backward)
+    if rope_head_dim > 0 and (yq := _cute_rope(xq, freqs_cis, rope_head_dim, backward)) is not None:
+        return yq, _cute_rope(xk, freqs_cis, rope_head_dim, backward)
     if rope_head_dim == head_dim:
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:

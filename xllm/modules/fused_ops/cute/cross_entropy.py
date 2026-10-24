@@ -1,139 +1,130 @@
-"""Cross-entropy rows of the fused linear cross entropy (CuTe DSL, any arch), model-parallel size 1:
+"""Fused softmax cross-entropy over a chunk of logits (CuTe DSL, Blackwell) for the chunked fused-linear cross
+entropy: from the bf16 logits [C, V] (the output of the vocabulary GEMM) and the targets, one kernel writes
 
-  ce_stats:   per row of bf16 logits l [C, V]: m = max l, s = sum exp(l - m), loss = log s - (l[t] - m)
-              (loss = 0 on ignored rows)
-  ce_scores:  scores = exp(l - m) / s - onehot(t), 0 on ignored rows, written as fp32 (A of the TF32 grad_input
-              GEMM) and bf16 (A of the grad_weight GEMM)
+    loss[c]       = log(sum_v exp(x[c, v] - max)) - (x[c, t_c] - max)          (fp32, 0 for ignored rows)
+    scores[c, v]  = softmax(x[c])[v] - [v == t_c]                              (fp32 and bf16, 0 for ignored rows)
 
-Replace .float() / max / sub / exp / sum / div / index / masked_fill and the scores.to(bf16) copy of
-fused_blocks.cross_entropy (~11 passes over [C, V] fp32) by one read for the statistics and one read + two writes
-for the scores. One CTA of 256 threads per row, 16-byte vectors.
-"""
-import torch
+replacing .float(), max, sub, index, exp, sum, log, div, index-sub, masked_fill_ and .to(bf16): ~12 passes over the
+fp32 chunk become 1 bf16 read (+ 2 L2 re-reads) and the two score writes. A CTA of 256 threads handles one row."""
+import os
+from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8
 
-LOG2E = 1.4426950408889634
-LN2 = 0.6931471805599453
-VEC = 8
+try:
+    from .adaptive_working_memory import _compiled, _fake
+except ImportError:  # loaded from its file (tests)
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("cute_adaptive_working_memory_fwd",
+                                         os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaptive_working_memory.py"))
+    _awm = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_awm)
+    _compiled, _fake = _awm._compiled, _awm._fake
+
 THREADS = 256
-NEG_BIG = -3.0e38
+VEC = 8
 
 
 @cute.jit
-def _block_reduce(v: Float32, sbuf: cute.Tensor, tidx: Int32, is_max: cutlass.Constexpr):
-    """All-reduce over the CTA (8 warps): warp shuffles, then the 8 warp results through shared memory."""
+def _block_reduce(v: Float32, red: cute.Tensor, tidx: Int32, is_max: cutlass.Constexpr) -> Float32:
     for o in cutlass.range_constexpr(5):
         w = cute.arch.shuffle_sync_bfly(v, offset=1 << o)
-        v = cute.arch.fmax(v, w) if cutlass.const_expr(is_max) else v + w
+        v = cute.arch.fmax(v, w) if is_max else v + w
     if tidx % 32 == 0:
-        sbuf[tidx // 32] = v
+        red[tidx // 32] = v
     cute.arch.sync_threads()
-    r = sbuf[0]
+    v = red[0]
     for i in cutlass.range_constexpr(1, THREADS // 32):
-        r = cute.arch.fmax(r, sbuf[i]) if cutlass.const_expr(is_max) else r + sbuf[i]
+        v = cute.arch.fmax(v, red[i]) if is_max else v + red[i]
     cute.arch.sync_threads()
-    return r
+    return v
 
 
-class CeRows:
-    def __init__(self, V: int, scores: bool):
+class CeLogits:
+    def __init__(self, V: int, want_loss: bool, want_grad: bool):
+        self.V, self.want_loss, self.want_grad = V, want_loss, want_grad
         assert V % VEC == 0
-        self.V, self.scores = V, scores
-        self.nvec = V // VEC
 
     @cute.jit
-    def __call__(self, tL: cute.Tensor, tT: cute.Tensor, tIgn: cute.Tensor, tStats: cute.Tensor, tLoss: cute.Tensor,
-                 tS32: cute.Tensor, tS16: cute.Tensor, rows: Int32, stream: cuda.CUstream):
-        self.kernel(tL.iterator, tT.iterator, tIgn.iterator, tStats.iterator, tLoss.iterator, tS32.iterator,
-                    tS16.iterator).launch(grid=[rows, 1, 1], block=[THREADS, 1, 1], stream=stream)
+    def __call__(self, tX: cute.Tensor, tT: cute.Tensor, tIgn: cute.Tensor, tLoss: cute.Tensor, tS32: cute.Tensor, tS16: cute.Tensor,
+                 rows: Int32, stream: cuda.CUstream):
+        self.kernel(tX.iterator, tT.iterator, tIgn.iterator, tLoss.iterator, tS32.iterator, tS16.iterator).launch(
+            grid=[rows, 1, 1], block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
-    def kernel(self, pL: cute.Pointer, pT: cute.Pointer, pIgn: cute.Pointer, pStats: cute.Pointer, pLoss: cute.Pointer,
-               pS32: cute.Pointer, pS16: cute.Pointer):
+    def kernel(self, pX: cute.Pointer, pT: cute.Pointer, pIgn: cute.Pointer, pLoss: cute.Pointer, pS32: cute.Pointer, pS16: cute.Pointer):
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
+        V = self.V
+        n_vec = V // VEC
         smem = cutlass.utils.SmemAllocator()
-        sbuf = smem.allocate_tensor(Float32, cute.make_layout(THREADS // 32), byte_alignment=16)
-        base = Int64(row) * self.V
-        ign = cute.make_tensor(pIgn + row, cute.make_layout(1))[0] != 0
-        t = Int32(cute.make_tensor(pT + row, cute.make_layout(1))[0])
-        if cutlass.const_expr(not self.scores):
-            # pass 1: online max / sum of exp over the row
-            m = Float32(NEG_BIG)
-            s = Float32(0.0)
-            for i in cutlass.range(tidx, self.nvec, THREADS):
-                v = cute.make_tensor((pL + (base + i * VEC)).align(16), cute.make_layout(VEC)).load().to(Float32)
-                vm = v[0]
-                for j in cutlass.range_constexpr(1, VEC):
-                    vm = cute.arch.fmax(vm, v[j])
-                mn = cute.arch.fmax(m, vm)
-                acc = s * cute.math.exp2((m - mn) * LOG2E, fastmath=True)
-                for j in cutlass.range_constexpr(VEC):
-                    acc = acc + cute.math.exp2((v[j] - mn) * LOG2E, fastmath=True)
-                m, s = mn, acc
-            mrow = _block_reduce(m, sbuf, tidx, True)
-            s = s * cute.math.exp2((m - mrow) * LOG2E, fastmath=True)
-            srow = _block_reduce(s, sbuf, tidx, False)
+        red = smem.allocate_tensor(Float32, cute.make_layout(THREADS // 32), 16)
+        base = pX + Int64(row) * V
+        # pass 1: row max
+        m = Float32(-3.0e38)
+        for i in cutlass.range(tidx, n_vec, THREADS):
+            x8 = cute.make_tensor((base + i * VEC).align(16), cute.make_layout(VEC)).load().to(Float32)
+            for k in cutlass.range_constexpr(VEC):
+                m = cute.arch.fmax(m, x8[k])
+        m = _block_reduce(m, red, tidx, True)
+        # pass 2: sum of exp(x - max)
+        s = Float32(0.0)
+        for i in cutlass.range(tidx, n_vec, THREADS):
+            x8 = cute.make_tensor((base + i * VEC).align(16), cute.make_layout(VEC)).load().to(Float32)
+            for k in cutlass.range_constexpr(VEC):
+                s = s + cute.math.exp(x8[k] - m, fastmath=True)
+        s = _block_reduce(s, red, tidx, False)
+        tgt = cute.make_tensor(pT + row, cute.make_layout(1))[0]
+        ign = cute.make_tensor(pIgn + row, cute.make_layout(1))[0]
+        ignored = ign != 0
+        if cutlass.const_expr(self.want_loss):
             if tidx == 0:
-                cute.make_tensor(pStats + 2 * row, cute.make_layout(1))[0] = mrow
-                cute.make_tensor(pStats + 2 * row + 1, cute.make_layout(1))[0] = srow
-                lt = cute.make_tensor(pL + (base + t), cute.make_layout(1))[0].to(Float32)
-                loss = cute.math.log2(srow, fastmath=True) * LN2 - (lt - mrow)
-                cute.make_tensor(pLoss + row, cute.make_layout(1))[0] = cutlass.select_(ign, Float32(0.0), loss)
-        else:
-            # pass 2: scores from the row statistics
-            mrow = cute.make_tensor(pStats + 2 * row, cute.make_layout(1))[0]
-            inv = cute.arch.rcp_approx(cute.make_tensor(pStats + 2 * row + 1, cute.make_layout(1))[0])
-            keep = cutlass.select_(ign, Float32(0.0), Float32(1.0))
-            for i in cutlass.range(tidx, self.nvec, THREADS):
-                v = cute.make_tensor((pL + (base + i * VEC)).align(16), cute.make_layout(VEC)).load().to(Float32)
-                o = cute.make_rmem_tensor(cute.make_layout(VEC), Float32)
-                for j in cutlass.range_constexpr(VEC):
-                    p = cute.math.exp2((v[j] - mrow) * LOG2E, fastmath=True) * inv
-                    o[j] = (p - cutlass.select_(i * VEC + j == t, Float32(1.0), Float32(0.0))) * keep
-                cute.make_tensor((pS32 + (base + i * VEC)).align(32), cute.make_layout(VEC)).store(o.load())
-                cute.make_tensor((pS16 + (base + i * VEC)).align(16), cute.make_layout(VEC)).store(o.load().to(BFloat16))
+                xt = cute.make_tensor(base + tgt, cute.make_layout(1))[0].to(Float32)
+                loss = cute.math.log(s, fastmath=False) - (xt - m)
+                cute.make_tensor(pLoss + row, cute.make_layout(1))[0] = 0.0 if ignored else loss
+        if cutlass.const_expr(self.want_grad):
+            inv = 1.0 / s
+            o32 = pS32 + Int64(row) * V
+            o16 = pS16 + Int64(row) * V
+            for i in cutlass.range(tidx, n_vec, THREADS):
+                x8 = cute.make_tensor((base + i * VEC).align(16), cute.make_layout(VEC)).load().to(Float32)
+                sc = cute.make_rmem_tensor(cute.make_layout(VEC), Float32)
+                for k in cutlass.range_constexpr(VEC):
+                    p = cute.math.exp(x8[k] - m, fastmath=True) * inv
+                    p = p - 1.0 if i * VEC + k == tgt else p
+                    sc[k] = 0.0 if ignored else p
+                cute.make_tensor((o32 + i * VEC).align(16), cute.make_layout(VEC)).store(sc.load())
+                cute.make_tensor((o16 + i * VEC).align(16), cute.make_layout(VEC)).store(sc.load().to(BFloat16))
 
 
-_COMPILED = {}
-
-
-def _fake(dtype, align):
-    return cute.runtime.make_fake_compact_tensor(dtype, (cute.sym_int(),), assumed_align=align)
-
-
-def _compiled(V, scores):
-    key = (V, scores)
-    if key not in _COMPILED:
-        _COMPILED[key] = cute.compile(
-            CeRows(V, scores), _fake(BFloat16, 16), _fake(Int64, 8), _fake(Uint8, 1), _fake(Float32, 8),
-            _fake(Float32, 4), _fake(Float32, 32), _fake(BFloat16, 16), Int32(0),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
-    return _COMPILED[key]
-
-
-def supported(logits: torch.Tensor) -> bool:
-    return (logits.is_cuda and logits.dtype == torch.bfloat16 and logits.is_contiguous() and logits.dim() == 2
-            and logits.shape[1] % VEC == 0 and logits.data_ptr() % 16 == 0)
-
-
-def ce_rows(logits: torch.Tensor, target: torch.Tensor, ignore: torch.Tensor, loss_out=None, compute_scores=False):
-    """logits [C, V] bf16, target [C] int64 (any value on ignored rows), ignore [C] bool. Writes loss_out [C] fp32
-    when given; returns (scores fp32, scores bf16) when compute_scores, else None."""
+def ce_logits(logits: torch.Tensor, targets: torch.Tensor, ignore_mask: torch.Tensor, want_loss: bool, want_grad: bool
+              ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """(loss fp32 [C] or None, scores fp32 [C, V] or None, scores bf16 [C, V] or None) for bf16 logits [C, V], int64
+    targets [C] (in [0, V)) and a bool ignore mask [C] (rows with loss and scores 0)."""
     C, V = logits.shape
-    stats = torch.empty(C, 2, dtype=torch.float32, device=logits.device)
-    loss = loss_out if loss_out is not None else torch.empty(C, dtype=torch.float32, device=logits.device)
-    t = target.contiguous()
-    ig = ignore.contiguous().view(torch.uint8)
-    flat = logits.reshape(-1)
-    _compiled(V, False)(flat, t, ig, stats.reshape(-1), loss, stats.reshape(-1), flat, C)
-    if not compute_scores:
-        return None
-    s32 = torch.empty(C, V, dtype=torch.float32, device=logits.device)
-    s16 = torch.empty(C, V, dtype=torch.bfloat16, device=logits.device)
-    _compiled(V, True)(flat, t, ig, stats.reshape(-1), loss, s32.reshape(-1), s16.reshape(-1), C)
-    return s32, s16
+    assert logits.dtype == torch.bfloat16 and targets.shape == (C,) and ignore_mask.shape == (C,)
+    logits = logits.contiguous()
+    dev = logits.device
+    t = targets.to(torch.int32).contiguous()
+    ign = ignore_mask.to(torch.uint8).contiguous()
+    loss = torch.empty(C, dtype=torch.float32, device=dev) if want_loss else None
+    s32 = torch.empty(C, V, dtype=torch.float32, device=dev) if want_grad else None
+    s16 = torch.empty(C, V, dtype=torch.bfloat16, device=dev) if want_grad else None
+    dummy32 = loss if loss is not None else torch.empty(16, dtype=torch.float32, device=dev)
+    fn = _compiled(("ce_logits", V, want_loss, want_grad), lambda: CeLogits(V, want_loss, want_grad), lambda: (
+        _fake(BFloat16), _fake(Int32, 4), _fake(Uint8, 1), _fake(Float32, 4), _fake(Float32), _fake(BFloat16), Int32(0)))
+    fn(logits.reshape(-1), t, ign, (loss if want_loss else dummy32), (s32 if want_grad else dummy32).reshape(-1),
+       (s16 if want_grad else logits).reshape(-1), C)
+    return loss, s32, s16
+
+
+def ce_logits_supported(logits: torch.Tensor) -> bool:
+    if os.environ.get("XLLM_CUTE_CE", "1") == "0" or logits.dtype != torch.bfloat16 or not logits.is_cuda or logits.dim() != 2:
+        return False
+    if logits.shape[1] % VEC or logits.numel() >= 2 ** 31:
+        return False
+    return torch.cuda.get_device_capability(logits.device)[0] >= 9

@@ -1,4 +1,3 @@
-import os
 from typing import Optional, Tuple, Any
 import math
 from functools import partial
@@ -23,9 +22,6 @@ from xllm.modules.fused_ops import (
 from xllm.models.fused_blocks.utils import (
     layer_or_rmsnorm_fwd,
     rmsnorm_fwd,
-    rmsnorm_add_fwd,
-    rmsnorm_rope_fwd,
-    rmsnorm_rope_bwd,
     rmsnorm_bwd,
     mem_effn_rmsnorm_bwd,
     timenorm_fwd,
@@ -72,39 +68,28 @@ from xllm.models.fused_blocks.distributed import (
 )
 
 
-
-_GATE_KINDS = {"silu": "silu", "softplus": "softplus2"}
-
-
-def gate_fusable(x: torch.Tensor) -> bool:
-    """gate(rmx) * attn and its backward as cute/swiglu.py gate kernels (contiguous bf16 / fp16)."""
-    if os.environ.get("XLLM_GATE_TORCH", "0") == "1" or not x.is_cuda or not x.is_contiguous():
+def _cute_qk(x: torch.Tensor, groups: int, rope_head_dim: int, freqs_cis: Optional[torch.Tensor]) -> bool:
+    """Whether the fused CuTe DSL q / k preparation (rmsnorm + rope + softmax and its backward; Blackwell, bf16;
+    env XLLM_CUTE_QK=0 disables it) handles this input."""
+    try:
+        from xllm.modules.fused_ops.cute.qk_prep import qk_prep_supported
+    except ImportError:
         return False
-    from xllm.modules.fused_ops.cute.swiglu import TORCH2CUTE
-    return x.dtype in TORCH2CUTE and x.numel() % 8 == 0 and x.data_ptr() % 16 == 0
-
-
-def fused_gate_mul(x: torch.Tensor, m: torch.Tensor, gate_func: str) -> torch.Tensor:
-    from xllm.modules.fused_ops.cute.swiglu import gate_mul
-    return gate_mul(x.contiguous(), m.contiguous(), _GATE_KINDS[gate_func])
-
-
-def fused_gate_bwd(g: torch.Tensor, x: torch.Tensor, m: torch.Tensor, gate_func: str):
-    from xllm.modules.fused_ops.cute.swiglu import gate_bwd
-    return gate_bwd(g.contiguous(), x.contiguous(), m.contiguous(), _GATE_KINDS[gate_func])
-
-
-def softmax_bwd_fusable(x: torch.Tensor) -> bool:
-    """The fused softmax backward (cute/softmax_bwd.py) takes contiguous bf16 / fp16 rows of 64 .. 256 elements."""
-    if os.environ.get("XLLM_SOFTMAX_BWD_TORCH", "0") == "1" or not x.is_contiguous():
+    r = rope_head_dim if freqs_cis is not None else 0
+    if r > 0 and (freqs_cis.dtype != torch.complex64 or tuple(freqs_cis.shape) != (x.shape[1], r // 2)):
         return False
-    from xllm.modules.fused_ops.cute.softmax_bwd import supported
-    return supported(x)
+    return qk_prep_supported(x, groups, r)
 
 
-def softmax_bwd_acc_(out: torch.Tensor, x: torch.Tensor, g: torch.Tensor, add: Optional[torch.Tensor] = None) -> torch.Tensor:
-    from xllm.modules.fused_ops.cute.softmax_bwd import softmax_bwd_acc_ as fused
-    return fused(out, x, g, add)
+def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
+    """Whether the fused CuTe DSL attention output gate (rmsnorm(sca + awk) * gate(rmx) and its backward; Blackwell,
+    bf16, no hidden dropout; env XLLM_CUTE_GATE=0 disables it) handles this input."""
+    try:
+        from xllm.modules.fused_ops.cute.attn_gate import attn_gate_supported
+    except ImportError:
+        return False
+    return attn_gate_supported(x, heads, gate, dropout)
+
 
 class GekkoBlockFunction(torch.autograd.Function):
     """
@@ -183,7 +168,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         assert timenorm_local_groups is not None
         attn_gate_fn = {"silu": F.silu, "softplus": partial(F.softplus, beta=math.log(2))}[attn_gate_func]
         assert attn_gate_fn is not None
-        fused_gate = gate_fusable(x)  # gate(rmx) * attn in one kernel (r holds the raw rmx then)
 
         bsz, seq_len, _ = x.size()
         width = q_conv_w.shape[1]
@@ -281,14 +265,19 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle4 = None
             handle5 = None
 
-        # k norm + rotary embeddings (one kernel)
-        sk, _ = rmsnorm_rope_fwd(xk_, None, local_kv_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
-        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-
         # B x L x K x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        # apply softmax to aqk
-        aqk = torch.softmax(akk, dim=-1)  # bf16 in / out, fp32 inside: same bits as softmax(fp32).to(bf16), one pass less
+        if _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis):
+            # rmsnorm, rope and softmax from one read of xk_
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
+            sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
+        else:
+            sk, _ = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+            sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
+            # apply rotary embeddings
+            sk = apply_rope(sk, freqs_cis, head_dim, rope_head_dim, False)
+            # apply softmax to aqk
+            aqk = F.softmax(akk, dim=-1, dtype=torch.float32).to(akk)
 
         if send_to_next:
             psk = sk[:, (seq_len - attention_chunk_size):]
@@ -312,14 +301,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle7 = None
 
-        # q norm + rotary embeddings (one kernel)
-        sq, _ = rmsnorm_rope_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
-        sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-
-        # B x L x H x S
-        aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-        # apply softmax to aq
-        aq = torch.softmax(aq, dim=-1)
+        if _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis):
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
+            sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
+        else:
+            sq, _ = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+            sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+            # apply rotary embeddings
+            sq = apply_rope(sq, freqs_cis, head_dim, rope_head_dim, False)
+            # B x L x H x S
+            aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+            # apply softmax to aq
+            aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
 
         if handle_prev_v is not None:
             handle_prev_v.wait()
@@ -360,14 +353,14 @@ class GekkoBlockFunction(torch.autograd.Function):
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = F.linear(mx, wr, br) if fused_gate else attn_gate_fn(F.linear(mx, wr, br))
+            rmx = F.linear(mx, wr, br)
         else:
             sca_out, sca_for_save, sca_aux, attn_w_rng_state = sliding_chunk_attention_fwd(
                 sq, sk, xv_, attention_chunk_size, sca_scale, prev_sk, prev_sv,
                 bos_mask, segment_idx, attention_dropout, attn_stability_control, sca_backend, not recompute_sca
             )
             # B x L x E
-            r = F.linear(mx, wr, br) if fused_gate else attn_gate_fn(F.linear(mx, wr, br))
+            rmx = F.linear(mx, wr, br)
 
             if handle_memory is not None:
                 handle_memory.wait()
@@ -403,9 +396,16 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x E
         sca_out = rearrange(sca_out, 'b l h v -> b l (h v)')
         awk_out = rearrange(awk_out, 'b h l v -> b l (h v)')
-        attn, _ = rmsnorm_add_fwd(sca_out, awk_out, None, local_heads, rmsnorm_eps)
-        attn = fused_gate_mul(r, attn, attn_gate_func) if fused_gate else torch.mul(attn, r, out=attn)
-        attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
+        if _cute_gate(sca_out, local_heads, attn_gate_func, hidden_dropout):
+            # add, per-head rmsnorm, gate activation and multiply in one pass
+            from xllm.modules.fused_ops.cute.attn_gate import attn_gate_fwd
+            attn = attn_gate_fwd(sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps)
+            attn_out_rng_state = None
+        else:
+            r = attn_gate_fn(rmx)
+            attn, _ = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
+            attn = torch.mul(attn, r, out=attn)
+            attn, attn_out_rng_state = memory_efficient_dropout_fwd(attn, hidden_dropout, True)
 
         # B x L x E -> B x L x D
         fuse_residual = dropout == 0.0 and get_model_parallel_world_size() == 1
@@ -736,24 +736,26 @@ class GekkoBlockFunction(torch.autograd.Function):
             causal_conv_weight_normalization, causal_conv_backend, deterministic
         )
 
-        # q / k norms + rotary embeddings (one kernel each)
-        sk, sk_rstd = rmsnorm_rope_fwd(xk_, None, local_kv_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
-        sq, sq_rstd = rmsnorm_rope_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps, freqs_cis, head_dim, rope_head_dim)
-        # B x L x H x S
-        sk = rearrange(sk, 'b l (k s) -> b l k s', k=local_kv_heads)
-        sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-
         # B x L x K|H x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-        # softmax for aq and aqk; the fused softmax backward recomputes the fp32 probabilities from the logits
-        aq_logits, akk_logits = aq, akk
-        fused_softmax_bwd = softmax_bwd_fusable(akk) and softmax_bwd_fusable(aq)
-        if fused_softmax_bwd:
-            aqk_fp32 = aq_fp32 = None
-            aqk = torch.softmax(akk, dim=-1)
-            aq = torch.softmax(aq, dim=-1)
+        cute_qk = _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)
+        if cute_qk:
+            # rmsnorm, rope and softmax from one read each of xk_ and xq_; the gradients below are fused the same way
+            from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
+            fc = freqs_cis if rope_head_dim > 0 else None
+            sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
+            sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+            sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
         else:
+            sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+            sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+            # B x L x H x S
+            sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+            sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+            # apply rotary embeddings
+            sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
+            aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+            # softmax for aq and aqk
             aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
             aqk = aqk_fp32.to(akk)
             aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
@@ -820,14 +822,12 @@ class GekkoBlockFunction(torch.autograd.Function):
         # recompute attn out
         # B x L x E
         rmx = F.linear(mx, wr, br)
-        fused_gate = gate_fusable(rmx)
-        attn_norm, attn_rstd = rmsnorm_add_fwd(sca_out, awk_out, None, local_heads, rmsnorm_eps)
-        if fused_gate:
-            attn = fused_gate_mul(rmx, attn_norm, attn_gate_func)
-        else:
+        cute_gate = _cute_gate(sca_out, local_heads, attn_gate_func, hidden_dropout)
+        if not cute_gate:
             r = attn_gate_fn(rmx)
+            attn_norm, attn_rstd = rmsnorm_fwd(sca_out + awk_out, None, local_heads, rmsnorm_eps)
             attn = torch.mul(attn_norm, r, out=awk_out)
-        attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
+            attn, attn_noise = memory_efficient_dropout_fwd(attn, hidden_dropout, True, attn_out_rng_state)
 
         if handle_xh is not None:
             handle_xh.wait()
@@ -835,14 +835,14 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # B x L x E
         attn_grad = xh_grad.matmul(wo)
-        attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
-        if fused_gate:
-            # gradients of gate(rmx) * attn_norm in one pass: rmx_grad is ready long before it is used
-            rmx_grad, attn_norm_grad = fused_gate_bwd(attn_grad, rmx, attn_norm, attn_gate_func)
-            rmx_grad = rearrange(rmx_grad, 'b l d -> (b l) d')
+        if cute_gate:
+            # the recompute of the gate, its backward and the memory-efficient rmsnorm backward in one pass
+            from xllm.modules.fused_ops.cute.attn_gate import attn_gate_bwd
+            sca_out_grad, rmx_grad, attn = attn_gate_bwd(attn_grad, sca_out, awk_out, rmx, local_heads, attn_gate_func, rmsnorm_eps, want_attn=True)
         else:
+            attn_grad = memory_efficient_dropout_bwd(attn_grad, hidden_dropout, attn_out_rng_state, attn_noise)
             attn_norm_grad = torch.mul(attn_grad, r, out=r)
-        sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
+            sca_out_grad = mem_effn_rmsnorm_bwd(attn_norm_grad, attn_norm, attn_rstd, local_heads)
         # B x L x E -> B x L x H x E
         sca_out_grad = rearrange(sca_out_grad, 'b l (h v) -> b l h v', h=local_heads)
         # B x L x H x E -> B x H x L x E
@@ -935,24 +935,27 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_conv_v = None
 
         # B x L x E
-        if not fused_gate:
+        if cute_gate:
+            rmx_grad = rearrange(rmx_grad, 'b l d -> (b l) d')
+        else:
             r_grad = torch.mul(attn_grad, attn_norm, out=attn_grad)
             # B*L x D
             rmx_grad = rearrange(attn_gate_fn_bwd(r_grad, rmx), 'b l d -> (b l) d')
         mx_grad = torch.mm(rmx_grad, wr)
 
-        # rotary embeddings + q norm grad (one kernel)
-        xq_grad, qnorm_w_grad = rmsnorm_rope_bwd(sq_grad, xq_, sq_rstd, qnorm_w, local_heads, freqs_cis, head_dim, rope_head_dim)
-
         # B x H x L x S -> B x L x H x S
         aq_grad = aq_grad.transpose(1, 2)
-        if fused_softmax_bwd:
-            softmax_bwd_acc_(xq_grad.view(aq_logits.shape), aq_logits, aq_grad.contiguous())
+        if cute_qk:
+            # rope backward, q norm backward, softmax backward and their sum in one pass
+            xq_grad, qnorm_w_grad = qk_prep_bwd(sq_grad, aq_grad, None, xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
         else:
+            # apply rotary embeddings
+            sq_grad = apply_rope(sq_grad, freqs_cis, head_dim, rope_head_dim, True)
+            # q norm grad
+            xq_grad, qnorm_w_grad = rmsnorm_bwd(rearrange(sq_grad, 'b l h s -> b l (h s)'), xq_, sq_rstd, qnorm_w, local_heads)
             aq_grad = torch.ops.aten._softmax_backward_data(
                 aq_grad.float(), aq_fp32, -1, torch.float32
             ).to(aq)
-
             aq_grad = rearrange(aq_grad, 'b l h s -> b l (h s)')
             xq_grad = torch.add(xq_grad, aq_grad, out=xq_grad)
 
@@ -968,18 +971,17 @@ class GekkoBlockFunction(torch.autograd.Function):
             aqk_grad[:, (seq_len - attention_chunk_size):] += aqk_grad_from_next
             akk_grad[:, (seq_len - attention_chunk_size):] += akk_grad_from_next
 
-        # rotary embeddings + k norm grad (one kernel; from the norm input xk_)
-        xk_grad, _ = rmsnorm_rope_bwd(sk_grad, xk_, sk_rstd, None, local_kv_heads, freqs_cis, head_dim, rope_head_dim)
-
-        if fused_softmax_bwd:
-            # grads of xk: xk_grad += akk_grad + softmax backward of aqk_grad
-            softmax_bwd_acc_(xk_grad.view(akk_logits.shape), akk_logits, aqk_grad.contiguous(), akk_grad.contiguous())
+        if cute_qk:
+            xk_grad, _ = qk_prep_bwd(sk_grad, aqk_grad, akk_grad, xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
         else:
+            # apply rotary embeddings
+            sk_grad = apply_rope(sk_grad, freqs_cis, head_dim, rope_head_dim, True)
+            # k norm grad
+            xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
             aqk_grad = torch.ops.aten._softmax_backward_data(
                 aqk_grad.float(), aqk_fp32, -1, torch.float32
             ).to(aqk)
             ak_grad = rearrange(torch.add(akk_grad, aqk_grad, out=aqk_grad), 'b l k s -> b l (k s)')
-
             # grads of xk & xv
             xk_grad = torch.add(xk_grad, ak_grad, out=xk_grad)
         xv_grad = torch.add(xv_grad, av_grad.transpose(1, 2), out=xv_grad)
