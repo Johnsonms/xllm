@@ -179,21 +179,25 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - Also tried, no gain (earlier): the B200 CuTe causal conv on H100 (forward ties Triton at ~2.4 TB/s, backward slower); `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
   more forward work); FLA conv backend (conv 26 -> 44 ms).
 
-## 6. Open items / next
+## 6. Open items / next (state at the end of 2026-10-24)
 
-- SCA on 0.9B / 4B is xattn (19-26% of the step). Its BOS route packs segments as varlen sequences: with EOS
-  segments the backward launches ~4x the CTAs (13,056 vs 3,280 at 0.9B) and drops from 51% to 38.5% SM throughput.
-  A fix belongs in xattn (fixed chunk-aligned tiles with per-row key ranges, as the B200 CuTe SCA does).
-- 7.1B SCA (V = 2048) stays on swift (cuBLAS GEMMs + softmax kernels, now ~3.8 ms/layer fwd+bwd). Left: the
-  softmax backward is at copy bandwidth; skipping keys before a segment's start needs host-side segment bounds.
-  The rest of the 7.1B step is cuBLAS (76-80% of peak) and FSDP2 copies (chunk_cat + split ~44 ms/step).
-- xattn hdim-256 backward still carries ~580 us/layer of pre / post kernels (dO.O, dQ cast, GQA dK / dV cast, dQ
-  accumulator fill) at 0.9B; xattn-internal.
-- AWM: the out GEMM's 7.1B forward epilogue runs at 57% of copy bandwidth (needs a persistent kernel overlapping
-  epilogue and loads).
-- After these, the 0.9B step's elementwise / reduce / copy kernels total ~17 ms (FSDP casts, xattn's dK / dV
-  accumulator fill, bias-gradient sums); the step is xattn (~25%), GEMMs (~45%) and memory-bound fused kernels near
-  copy bandwidth. TMA reduce-add stores (`CopyReduceBulkTensorTileS2GOp`) are the cheap way to fold a residual /
-  second gradient into a kernel whose output already leaves through TMA.
-- Remaining small items (0.9B, per step, before the items of this section): block elementwise ~34 ms, conv (triton) 26 ms (~1.4x its floor),
-  TSDN step_counts recompute 3 ms, FSDP2 split/chunk_cat copies (4B ~19 ms, 7.1B ~21 ms).
+Where the time goes now (8 GPUs, default config): GEMMs (cuBLAS / quack) are ~65% of compute on 0.9B / 4B and ~80%
+on 7.1B; SCA is xattn on 0.9B / 4B (~20%) and swift on 7.1B (~9%); nearly every other kernel is a fused memory-bound
+kernel near copy bandwidth. Step-level losses that are not kernels: per-rank data imbalance (0.9B: ~608 vs ~572 ms
+with identical batches), GEMM slowdown under the overlapping reduce-scatter (~10% of GEMM time on 4B), FSDP2 copy-in
+/ copy-out (chunk_cat + split, 4B ~12 ms, 7.1B ~20 ms with the config knobs), ~3 us launch gaps (~4% of a step).
+
+- xattn (0.9B / 4B SCA): with the local stage-2 patch the D = 256 EOS backward is ~449 TFLOPS (dense 482); SMs are
+  ~98% active, so the remaining EOS gap is per-CTA overhead of the shorter varlen CTAs. Pre / post kernels (dO.O,
+  dQ cast, GQA dK / dV accumulator fill + cast) are ~580 us/layer at 0.9B, each at copy bandwidth; removing them
+  needs a different GQA reduction inside xattn. Upstreaming the stage-2 patch is the one cheap win.
+- swift (7.1B SCA): segment-aware sub-chunks leave cuBLAS GEMMs at reasonable sizes plus the softmax kernels at
+  bandwidth. Next would be dS = P (dP - delta) in the dP GEMM's epilogue with delta from the attention-gate backward
+  (removes the softmax-backward pass; ~0.5% est.).
+- conv + q / k prep fusion (~1-2% est. on 0.9B / 4B): the q conv output round trip and its gradient's; B200's
+  hand-off lists conv fusion next, so coordinate before starting.
+- AWM: ~20 ms/step on 7.1B; the forward recurrence runs at ~23 TFLOPS (latency-bound over 2-3 updates) and the out
+  GEMM forward epilogue at 57% of copy bandwidth; ~5 ms/step at most.
+- quack FFN path at 7.1B is neutral because of the per-call [w1; w3] concatenation (~6 ms/step); a fused
+  [w1; w3] parameter (checkpoint format change) or a weight cache with `reshard_after_forward=False` would recover it.
+- Config (no code): `XLLM_GEKKO_SAVE_QK_PREP=1`, `FSDP_RESHARD=0`, `NCCL_PROTO=Simple`, bf16 reduce-scatter; see 4.
