@@ -83,6 +83,19 @@ def _cute_qk(x: torch.Tensor, groups: int, rope_head_dim: int, freqs_cis: Option
     return qk_prep_supported(x, groups, r)
 
 
+def _fused_conv_qk(x: torch.Tensor, conv_w: torch.Tensor, groups: int, rope_head_dim: int, freqs_cis: Optional[torch.Tensor],
+                   backend: str) -> bool:
+    """Whether the causal conv and the q / k preparation run as one CuTe DSL kernel (forward and backward; triton conv
+    backend semantics, no conv state; env XLLM_CONV_QK=0 disables it). The callers also require no conv state."""
+    if backend != 'triton' or not _cute_qk(x, groups, rope_head_dim, freqs_cis):
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.conv_qk_prep import conv_qk_prep_supported
+    except ImportError:
+        return False
+    return conv_qk_prep_supported(x, conv_w, groups, rope_head_dim if freqs_cis is not None else 0)
+
+
 def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
     """Whether the fused CuTe DSL attention output gate (rmsnorm(sca + awk) * gate(rmx) and its backward; Blackwell,
     bf16, no hidden dropout; env XLLM_CUTE_GATE=0 disables it) handles this input."""
@@ -94,6 +107,9 @@ def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
 
 
 _SAVE_QK_PREP = os.environ.get("XLLM_GEKKO_SAVE_QK_PREP", "0") == "1"
+# opt-in (XLLM_GEKKO_SAVE_RMX=1, implied by XLLM_GEKKO_SAVE_QK_PREP): keep only the gate projection rmx for the backward
+# (one [B, L, E] bf16 tensor per layer instead of a GEMM recompute)
+_SAVE_RMX = _SAVE_QK_PREP or os.environ.get("XLLM_GEKKO_SAVE_RMX", "0") == "1"
 
 
 class GekkoBlockFunction(torch.autograd.Function):
@@ -258,10 +274,19 @@ class GekkoBlockFunction(torch.autograd.Function):
         xk = F.linear(mx, wk, None)
         if handle_conv_k is not None:
             handle_conv_k.wait()
-        xk_, final_conv_state_k, _ = causal_conv1d_fwd(
-            xk, k_conv_w, None, conv_state_k, bos_mask_curr, send_to_next, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
+        fc = freqs_cis if rope_head_dim > 0 else None
+        fused_k = conv_state_k is None and not send_to_next and _fused_conv_qk(
+            xk, k_conv_w, local_kv_heads, rope_head_dim, freqs_cis, causal_conv_backend)
+        if fused_k:
+            # conv, rmsnorm, rope and softmax in one kernel (the conv output is kept: the memory's key input)
+            from xllm.modules.fused_ops.cute.conv_qk_prep import conv_qk_prep_fwd
+            xk_, sk, aqk = conv_qk_prep_fwd(xk, k_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_kv_heads, None,
+                                            fc, rope_head_dim, rmsnorm_eps, want_c=True)
+        else:
+            xk_, final_conv_state_k, _ = causal_conv1d_fwd(
+                xk, k_conv_w, None, conv_state_k, bos_mask_curr, send_to_next, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
 
         if send_to_next:
             _, handle4 = send_prev_conv_state_to_next(final_conv_state_k.contiguous())
@@ -272,7 +297,9 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # B x L x K x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        if _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis):
+        if fused_k:
+            pass
+        elif _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis):
             # rmsnorm, rope and softmax from one read of xk_
             from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
             sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
@@ -296,17 +323,27 @@ class GekkoBlockFunction(torch.autograd.Function):
         xq = F.linear(mx, wq, None)
         if handle_conv_q is not None:
             handle_conv_q.wait()
-        xq_, final_conv_state_q, _ = causal_conv1d_fwd(
-            xq, q_conv_w, None, conv_state_q, bos_mask_curr, send_to_next, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
+        fused_q = conv_state_q is None and not send_to_next and _fused_conv_qk(
+            xq, q_conv_w, local_heads, rope_head_dim, freqs_cis, causal_conv_backend)
+        if fused_q:
+            # conv, q norm, rope and softmax in one kernel; the conv output is not needed (recomputed in the backward)
+            from xllm.modules.fused_ops.cute.conv_qk_prep import conv_qk_prep_fwd
+            xq_, sq, aq = conv_qk_prep_fwd(xq, q_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_heads, qnorm_w,
+                                           fc, rope_head_dim, rmsnorm_eps)
+        else:
+            xq_, final_conv_state_q, _ = causal_conv1d_fwd(
+                xq, q_conv_w, None, conv_state_q, bos_mask_curr, send_to_next, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
 
         if send_to_next:
             _, handle7 = send_prev_conv_state_to_next(final_conv_state_q.contiguous())
         else:
             handle7 = None
 
-        if _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis):
+        if fused_q:
+            pass
+        elif _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis):
             from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd
             sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, freqs_cis if rope_head_dim > 0 else None, rope_head_dim, rmsnorm_eps)
         else:
@@ -324,7 +361,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # gekko-0.9B B2 L16384); cute q / k path, no conv state or pipeline neighbours
         qk_prep_cache = (None,) * 7
         if (_SAVE_QK_PREP and not send_to_next and not recv_from_prev and conv_state_q is None and conv_state_k is None
-                and conv_state_v is None and _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis)
+                and conv_state_v is None and _cute_qk(xq, local_heads, rope_head_dim, freqs_cis)
                 and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)):
             qk_prep_cache = (xv_, xk_, xq_, sk, aqk, sq, aq)
 
@@ -514,7 +551,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
             *qk_prep_cache,  # xv_, xk_, xq_, sk, aqk, sq, aq (XLLM_GEKKO_SAVE_QK_PREP), else None
-            rmx if qk_prep_cache[0] is not None else None,  # the gate projection, kept with them
+            rmx if _SAVE_RMX else None,  # the gate projection (XLLM_GEKKO_SAVE_RMX / XLLM_GEKKO_SAVE_QK_PREP)
             *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
@@ -527,6 +564,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         ctx.awm_orthogonal_update = awm_orthogonal_update
         ctx.awm_backend = awm_backend
         ctx.causal_conv_backend = causal_conv_backend
+        ctx.fused_q, ctx.fused_k = fused_q, fused_k
         ctx.causal_conv_weight_normalization = causal_conv_weight_normalization
         ctx.dropout = dropout
         ctx.attention_dropout = attention_dropout
@@ -726,6 +764,10 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_mx.wait()
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
+        fused_q, fused_k = ctx.fused_q, ctx.fused_k
+        fc = freqs_cis if rope_head_dim > 0 else None
+        if fused_q or fused_k:
+            from xllm.modules.fused_ops.cute.conv_qk_prep import conv_qk_prep_fwd, conv_qk_prep_bwd
         if c_xv_ is not None:
             # the forward kept the conv and q / k prep outputs (XLLM_GEKKO_SAVE_QK_PREP): no recompute
             if xv is None:
@@ -738,7 +780,6 @@ class GekkoBlockFunction(torch.autograd.Function):
             akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
             cute_qk = True
             from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
-            fc = freqs_cis if rope_head_dim > 0 else None
             sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
         else:
             # recompute kv
@@ -750,30 +791,43 @@ class GekkoBlockFunction(torch.autograd.Function):
                 xv, v_conv_w, None, conv_state_v, bos_mask_curr, False, 'silu',
                 causal_conv_weight_normalization, causal_conv_backend, deterministic
             )
-            xk_, _, _ = causal_conv1d_fwd(
-                xk, k_conv_w, None, conv_state_k, bos_mask_curr, False, None,
-                causal_conv_weight_normalization, causal_conv_backend, deterministic
-            )
+            if fused_k:
+                xk_, sk_f, aqk_f = conv_qk_prep_fwd(xk, k_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_kv_heads,
+                                                    None, fc, rope_head_dim, rmsnorm_eps, want_c=True)
+            else:
+                xk_, _, _ = causal_conv1d_fwd(
+                    xk, k_conv_w, None, conv_state_k, bos_mask_curr, False, None,
+                    causal_conv_weight_normalization, causal_conv_backend, deterministic
+                )
             # B x L x K x V
             xv_ = rearrange(xv_, 'b l (k v) -> b l k v', k=local_kv_heads)
 
             # recompute q
             if xq is None:
                 xq = F.linear(mx, wq, None)
-            xq_, _, _ = causal_conv1d_fwd(
-                xq, q_conv_w, None, conv_state_q, bos_mask_curr, False, None,
-                causal_conv_weight_normalization, causal_conv_backend, deterministic
-            )
+            if fused_q:
+                xq_, sq_f, aq_f = conv_qk_prep_fwd(xq, q_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_heads,
+                                                   qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+            else:
+                xq_, _, _ = causal_conv1d_fwd(
+                    xq, q_conv_w, None, conv_state_q, bos_mask_curr, False, None,
+                    causal_conv_weight_normalization, causal_conv_backend, deterministic
+                )
 
             # B x L x K|H x S
             akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-            cute_qk = _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)
+            cute_qk = _cute_qk(xq, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk, local_kv_heads, rope_head_dim, freqs_cis)
             if cute_qk:
                 # rmsnorm, rope and softmax from one read each of xk_ and xq_; the gradients below are fused the same way
                 from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
-                fc = freqs_cis if rope_head_dim > 0 else None
-                sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
-                sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+                if fused_k:
+                    sk, aqk = sk_f, aqk_f
+                else:
+                    sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
+                if fused_q:
+                    sq, aq = sq_f, aq_f
+                else:
+                    sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
                 sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
             else:
                 sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
@@ -980,7 +1034,12 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # B x H x L x S -> B x L x H x S
         aq_grad = aq_grad.transpose(1, 2)
-        if cute_qk:
+        if fused_q:
+            # rope backward, q norm backward, softmax backward, their sum and the conv backward in one pass
+            xq_grad, q_conv_w_grad, qnorm_w_grad = conv_qk_prep_bwd(
+                sq_grad, aq_grad, None, xq, q_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_heads, qnorm_w, fc,
+                rope_head_dim, rmsnorm_eps)
+        elif cute_qk:
             # rope backward, q norm backward, softmax backward and their sum in one pass
             xq_grad, qnorm_w_grad = qk_prep_bwd(sq_grad, aq_grad, None, xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
         else:
@@ -1006,7 +1065,11 @@ class GekkoBlockFunction(torch.autograd.Function):
             aqk_grad[:, (seq_len - attention_chunk_size):] += aqk_grad_from_next
             akk_grad[:, (seq_len - attention_chunk_size):] += akk_grad_from_next
 
-        if cute_qk:
+        if fused_k:
+            xk_grad, k_conv_w_grad, _ = conv_qk_prep_bwd(
+                sk_grad, aqk_grad, akk_grad, xk, k_conv_w, causal_conv_weight_normalization, bos_mask_curr, local_kv_heads, None,
+                fc, rope_head_dim, rmsnorm_eps)
+        elif cute_qk:
             xk_grad, _ = qk_prep_bwd(sk_grad, aqk_grad, akk_grad, xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
         else:
             # apply rotary embeddings
@@ -1029,10 +1092,11 @@ class GekkoBlockFunction(torch.autograd.Function):
         # xq grad from causal conv
         if handle_conv_q is not None:
             handle_conv_q.wait()
-        xq_grad, conv_state_q_grad, q_conv_w_grad, _ = causal_conv1d_bwd(
-            xq_grad, conv_state_q_grad, xq, q_conv_w, None, conv_state_q, bos_mask_curr, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
+        if not fused_q:
+            xq_grad, conv_state_q_grad, q_conv_w_grad, _ = causal_conv1d_bwd(
+                xq_grad, conv_state_q_grad, xq, q_conv_w, None, conv_state_q, bos_mask_curr, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
 
         if recv_from_prev:
             _, handle4 = send_prev_conv_state_grad_to_prev(conv_state_q_grad)
@@ -1042,10 +1106,11 @@ class GekkoBlockFunction(torch.autograd.Function):
         # xk grad from causal conv
         if handle_conv_k is not None:
             handle_conv_k.wait()
-        xk_grad, conv_state_k_grad, k_conv_w_grad, _ = causal_conv1d_bwd(
-            xk_grad, conv_state_k_grad, xk, k_conv_w, None, conv_state_k, bos_mask_curr, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
+        if not fused_k:
+            xk_grad, conv_state_k_grad, k_conv_w_grad, _ = causal_conv1d_bwd(
+                xk_grad, conv_state_k_grad, xk, k_conv_w, None, conv_state_k, bos_mask_curr, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
 
         if recv_from_prev:
             _, handle3 = send_prev_conv_state_grad_to_prev(conv_state_k_grad)
