@@ -1,5 +1,7 @@
 from typing import Optional, Tuple, List, Any
 import math
+import os
+
 import torch
 from torch import Tensor
 from torch.nn import functional as F
@@ -865,7 +867,22 @@ def grouped_experts_bwd(
     return x_grad, w1_grad, w2_grad, w3_grad
 
 
+_ROPE_TORCH = os.environ.get("XLLM_ROPE_TORCH", "0") == "1"  # torch reference path instead of the fused kernel
+
+
+def _fused_rope_ok(x: Tensor, rope_head_dim: int) -> bool:
+    if _ROPE_TORCH or not x.is_cuda or x.dim() != 4 or x.stride(3) != 1 or x.data_ptr() % 16:
+        return False
+    if any(s % 8 for s in x.stride()[:3]):
+        return False
+    from xllm.modules.fused_ops.cute import rope as cute_rope
+    return cute_rope.supported(x.dtype, x.shape[3], rope_head_dim)
+
+
 def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and _fused_rope_ok(x, rope_head_dim):
+        from xllm.modules.fused_ops.cute import rope as cute_rope
+        return cute_rope.rope(x, freqs_cis, rope_head_dim, backward)  # new tensor: x stays intact
     if rope_head_dim == head_dim:
         x = apply_rotary_embedding(x, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
@@ -876,6 +893,9 @@ def apply_rope(x: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, 
 
 
 def apply_ropes(xq: Tensor, xk: Tensor, freqs_cis: Tensor, head_dim: int, rope_head_dim: int, backward: bool):
+    if rope_head_dim > 0 and _fused_rope_ok(xq, rope_head_dim) and _fused_rope_ok(xk, rope_head_dim):
+        from xllm.modules.fused_ops.cute import rope as cute_rope
+        return cute_rope.rope(xq, freqs_cis, rope_head_dim, backward), cute_rope.rope(xk, freqs_cis, rope_head_dim, backward)
     if rope_head_dim == head_dim:
         xq, xk = apply_rotary_embeddings(xq, xk, freqs_cis=freqs_cis, backward=backward)
     elif rope_head_dim > 0:
