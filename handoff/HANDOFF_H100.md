@@ -4,6 +4,21 @@ Working branch `hopper-kernels` (github.com/Johnsonms/xllm), based on `cute-adap
 merged with it whenever the B200 session pushes. Plan: `handoff/H100_PLAN.md` on `cute-kernels-handoff`.
 Every item below is one commit on `hopper-kernels` with its numbers in the message.
 
+## TL;DR (2026-10-24, end of day)
+
+- 8 x H100, per-rank batches, fwd+bwd per step: gekko-0.9B B2 L16384 865 -> ~604 ms (default config) / ~572 ms (all
+  opt-in knobs); gekko-4B B1 L8192 667 -> ~542 / ~493 ms; gekko-7.1B B1 L8192 (swift) 1003 -> ~827 / ~750 ms;
+  7.1B B1 L16384 (the plan's shape) now fits (~1.7 s with the FFN recompute flags). 1 GPU 0.9B B2 L16384: OOM with
+  swift / 1015 ms at the start -> ~537 ms default, ~515 ms with `XLLM_GEKKO_SAVE_QK_PREP=1`.
+- Main items: AWM wgmma kernels (Hopper), TSDN on Hopper, xattn varlen hdim-256 backward stage-2 patch (local),
+  swift SCA (interval softmax, in-place outputs, query sub-chunks, segment-aware key ranges, strided head GEMMs),
+  quack fused SwiGLU FFN and fused linear CE (optional dependency), TMA reduce-add residual folds, CE bf16 dgrad,
+  AWM small-kernel cleanup, opt-in activation keep; FSDP / NCCL config knobs measured (section 4).
+- Parity: 60-step 1-GPU 0.9B, 30-step 8-GPU 4B and 7.1B, 150-step 8-GPU 7.1B soak (within run-to-run noise).
+- Opt-in knobs: `XLLM_GEKKO_SAVE_QK_PREP=1` (+11-20 GB), `FSDP_RESHARD=0`, `NCCL_PROTO=Simple`, bf16 reduce-scatter.
+  Switches back to reference paths: `XLLM_QUACK_FFN=0`, `XLLM_QUACK_CE=0`, `XLLM_CE_DGRAD_FP32=1`,
+  `XLLM_SWIFT_QSPLIT=1`, `XLLM_SWIFT_SEG_SKIP=0`, `XLLM_SWIFT_BWD_COPY=1`, `XLLM_AWM_LSE2_TORCH=1`, `AWM_SM90_CUBLAS=1`.
+
 ## 1. Node and environment (gpu-dp-mlsf6-dvtr5)
 
 - 8x H100 SXM 80 GB, NV18 all-to-all, driver 610 (CUDA 13.3), 64 CPUs, no system nvcc.
@@ -174,6 +189,9 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
+- Also tried, no gain: swift dS = P (dP - delta) in a quack epilogue GEMM (best tile 128 x 256, cluster 2 x 1:
+  5-40 us per call less than cuBLAS dP + the softmax backward, ~0.4% of the 7.1B step; not worth splitting the C++
+  backward); `NCCL_CTA_POLICY` 1 / 2 and `fsdp_layers_per_group` 2 / 4 (4B unchanged).
 - Tried and reverted (wrong): caching the quack path's [w1; w3] from the forward for the backward, keyed on the
   weight objects' version counters. FSDP2's all-gather writes the unsharded weights (NCCL / copy-out into their
   storage) without bumping the version, so the next step reused the previous step's weights: losses drifted from
