@@ -270,63 +270,78 @@ __global__ void GammaBwdSmallKernel(
   register_utils::Save<T_ACC, T, kElementsPerThread>(sum1, cur_size, gamma_grad + group_offset + j);
 }
 
+// Row-split, vectorized version: a block of 32 x 8 threads covers 256 channels (8 contiguous channels per thread,
+// 16-byte loads) and the rows [z * rows_per_split, (z + 1) * rows_per_split) of split z = blockIdx.z; the 8 row
+// lanes are reduced through shared memory into partial[z, :] (fp32) and GammaBwdFinalizeKernel adds the splits.
+// (The previous kernel launched channels / 32 * groups blocks of 32 x 32 threads - 32 blocks for a 4-head
+// 256-dim q norm - with 64-byte row segments per warp: ~0.3 TB/s.) Needs channels_per_group % 8 == 0.
 template <typename T, typename T_ACC, bool kMemoryEfficient>
 __global__ void GammaBwdLargeKernel(
     int64_t outer_size, int64_t inner_size, const T* y_grad, const T* x_or_y,
-    const T_ACC* rstd, T* gamma_grad, const T* __restrict__ gamma) {
-
-  __shared__ T_ACC sum1_shared[cuda_utils::kWarpSize][cuda_utils::kWarpSize + 1];
-
-  const int64_t kNumGroups = gridDim.y;
+    const T_ACC* rstd, T* gamma_grad, const T* __restrict__ gamma,
+    int64_t rows_per_split, T_ACC* partial, int64_t kNumGroups) {
+  constexpr int kVec = 8;
+  __shared__ T_ACC red[8][256 + 8];
   const int64_t num_channels_per_group = inner_size / kNumGroups;
-  const int64_t group_id = blockIdx.y;
-  const int64_t group_offset = group_id * num_channels_per_group;
-  
-  // Calculate channel index with bounds checking
-  const int64_t j = blockIdx.x * blockDim.x + threadIdx.x;
-  const bool valid_channel = j < num_channels_per_group;
-  
-  T_ACC sum1 = T_ACC(0);
-
-  // Use inverse of gamma for multiplication instead of division
-  T_ACC inv_w = T_ACC(1);
-
-  if (kMemoryEfficient) {
-    // Store the inverse for better performance
-    inv_w = T_ACC(1) / gamma[j + group_offset];
+  const int64_t c = (blockIdx.x * 32 + threadIdx.x) * kVec;  // first channel of this thread
+  const bool valid = c < inner_size;
+  const int64_t group_id = valid ? c / num_channels_per_group : 0;
+  T_ACC sum1[kVec];
+  T_ACC inv_w[kVec];
+#pragma unroll
+  for (int k = 0; k < kVec; ++k) {
+    sum1[k] = T_ACC(0);
+    inv_w[k] = T_ACC(1);
   }
-
-  // Iterate over batch dimension with bounds checking
-  for (int64_t i = threadIdx.y; i < outer_size; i += blockDim.y) {
-    if (valid_channel) {
-      const T_ACC dy_acc = static_cast<T_ACC>(y_grad[i * inner_size + j + group_offset]);
-      const T_ACC v = rstd[i * kNumGroups + group_id];
-
-      if (kMemoryEfficient) {
-        const T_ACC y = static_cast<T_ACC>(x_or_y[i * inner_size + j + group_offset]);
-        // Replace division with multiplication by inverse
-        sum1 += dy_acc * (y * inv_w);
-      } else {
-        const T_ACC x_acc = static_cast<T_ACC>(x_or_y[i * inner_size + j + group_offset]);
-        sum1 += dy_acc * x_acc * v;
+  if (kMemoryEfficient && valid) {
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      inv_w[k] = T_ACC(1) / static_cast<T_ACC>(gamma[c + k]);
+    }
+  }
+  const int64_t row0 = blockIdx.z * rows_per_split;
+  const int64_t row1 = min(outer_size, row0 + rows_per_split);
+  if (valid) {
+    for (int64_t i = row0 + threadIdx.y; i < row1; i += 8) {
+      T dy[kVec];
+      T xv[kVec];
+      *reinterpret_cast<uint4*>(dy) = *reinterpret_cast<const uint4*>(y_grad + i * inner_size + c);
+      *reinterpret_cast<uint4*>(xv) = *reinterpret_cast<const uint4*>(x_or_y + i * inner_size + c);
+      const T_ACC v = kMemoryEfficient ? T_ACC(1) : rstd[i * kNumGroups + group_id];
+#pragma unroll
+      for (int k = 0; k < kVec; ++k) {
+        const T_ACC dy_acc = static_cast<T_ACC>(dy[k]);
+        const T_ACC x_acc = static_cast<T_ACC>(xv[k]);
+        sum1[k] += kMemoryEfficient ? dy_acc * (x_acc * inv_w[k]) : dy_acc * x_acc * v;
       }
     }
   }
-
-  // Store intermediate results in shared memory
-  sum1_shared[threadIdx.x][threadIdx.y] = sum1;
+#pragma unroll
+  for (int k = 0; k < kVec; ++k) {
+    red[threadIdx.y][threadIdx.x * kVec + k] = sum1[k];
+  }
   __syncthreads();
-
-  // Transpose and reduce
-  sum1 = sum1_shared[threadIdx.y][threadIdx.x];
-  sum1 = reduce::WarpReduce(sum1, reduce::SumOp<T_ACC>());
-
-  // Write results with bounds checking
-  if (threadIdx.x == 0) {
-    const int64_t k = blockIdx.x * blockDim.x + threadIdx.y;
-    if (k < num_channels_per_group) {
-      gamma_grad[k + group_offset] = sum1;
+  const int64_t cc = blockIdx.x * 256 + threadIdx.y * 32 + threadIdx.x;  // 256 threads, one channel each
+  if (cc < inner_size) {
+    T_ACC s = T_ACC(0);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      s += red[r][threadIdx.y * 32 + threadIdx.x];
     }
+    partial[blockIdx.z * inner_size + cc] = s;
+  }
+}
+
+template <typename T, typename T_ACC>
+__global__ void GammaBwdFinalizeKernel(
+    int64_t num_splits, int64_t inner_size, const T_ACC* partial, T* gamma_grad) {
+  const int64_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j < inner_size) {
+    T_ACC s = T_ACC(0);
+    for (int64_t z = 0; z < num_splits; ++z) {
+      s += partial[z * inner_size + j];
+    }
+    gamma_grad[j] = static_cast<T>(s);
   }
 }
 
@@ -390,15 +405,24 @@ __global__ void GammaBwdLargeKernel(
 // for now we use 2d thread blocks. Each y will handle a different group
 #define DISPATCH_GAMMA_BWD_CUDA_KERNEL(                                              \
     SmallKernelFunc, LargeKernelFunc, T, T_ACC, outer_size, inner_size, num_groups,  \
-    channels_per_group, memory_efficient, cuda_stream, ...)                          \
+    channels_per_group, memory_efficient, cuda_stream, gamma_grad_ptr, ...)          \
   do {                                                                               \
-    if (true) {                                                                      \
-      const int64_t num_blocks_x = utils::DivUp<int64_t>(channels_per_group, 32);    \
-      const int64_t num_blocks_y = num_groups;                                       \
-      dim3 grid_size(num_blocks_x, num_blocks_y);                                    \
-      cuda_utils::LaunchKernel(LargeKernelFunc<T, T_ACC, memory_efficient>,          \
-      grid_size, dim3(32, 32), 0, cuda_stream, __VA_ARGS__);                         \
-    }                                                                                \
+    TORCH_CHECK(channels_per_group % 8 == 0, "channels per group must be a multiple of 8"); \
+    const int64_t num_blocks_x = utils::DivUp<int64_t>(inner_size, 256);             \
+    const int64_t want = utils::DivUp<int64_t>(1024, num_blocks_x);                  \
+    const int64_t num_splits = std::max<int64_t>(                                    \
+        1, std::min<int64_t>(want, utils::DivUp<int64_t>(outer_size, 64)));          \
+    const int64_t rows_per_split = utils::DivUp<int64_t>(outer_size, num_splits);    \
+    torch::Tensor partial = torch::empty(                                            \
+        {num_splits, inner_size},                                                    \
+        torch::dtype(c10::CppTypeToScalarType<T_ACC>::value).device(torch::kCUDA));  \
+    dim3 grid_size(num_blocks_x, 1, num_splits);                                     \
+    cuda_utils::LaunchKernel(LargeKernelFunc<T, T_ACC, memory_efficient>,            \
+    grid_size, dim3(32, 8), 0, cuda_stream, __VA_ARGS__, rows_per_split,             \
+    partial.data_ptr<T_ACC>(), num_groups);                                          \
+    cuda_utils::LaunchKernel(GammaBwdFinalizeKernel<T, T_ACC>,                       \
+    dim3(utils::DivUp<int64_t>(inner_size, 256)), dim3(256), 0, cuda_stream,         \
+    num_splits, inner_size, partial.data_ptr<T_ACC>(), gamma_grad_ptr);              \
   } while (false)
 
 template <typename T>
@@ -478,7 +502,7 @@ void GroupRMSNormCUDABwdAffineImpl(
 
       DISPATCH_GAMMA_BWD_CUDA_KERNEL(
           GammaBwdSmallKernel, GammaBwdLargeKernel, T, T_ACC, outer_size,
-          inner_size, num_groups, channels_per_group, MemoryEfficient, cuda_stream,
+          inner_size, num_groups, channels_per_group, MemoryEfficient, cuda_stream, gamma_grad_data,
           outer_size, inner_size, y_grad_data, x_or_y_data, rstd_data, gamma_grad_data, gamma_data);
   );
 }
