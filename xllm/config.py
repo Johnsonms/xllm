@@ -94,6 +94,7 @@ class OptimConf(Config):
     cycles: float = 1.0  # Cycles of half period of cosine scheduler. 1 means decaying from peak to lr_end_ratio
     wsd_decay_duration_steps: Optional[int] = None  # Number of steps in the WSD decay phase. Decay starts at total_steps - wsd_decay_duration_steps.
     wsd_decay_style: str = 'cosine'  # The curve type of decay phase in WSD scheduler: cosine or linear
+    fused: bool = True  # AdamW fused CUDA kernel (one pass per tensor) instead of the multi-tensor foreach path
 
     def __post_init__(self):
         assert self.scheduler in ['linear', 'cosine', 'constant', 'wsd']
