@@ -33,6 +33,7 @@ from xllm.models.fused_blocks.utils import (
     recompute_sliding_chunk_attention,
     swiglu_forward,
     swiglu_backward,
+    swiglu_recompute,
     apply_rope,
     apply_ropes
 )
@@ -672,11 +673,7 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         xf = rearrange(xf, 'b l d -> (b l) d')
         # recompute h1 & h3 for FFN or SwiGLU
-        if h1 is None:
-            h1 = F.linear(xf, fc1_w)
-
-        if swiglu and h3 is None:
-            h3 = F.linear(xf, fc3_w)
+        h1, h3 = swiglu_recompute(xf, fc1_w, fc3_w, h1, h3, hidden_dropout, swiglu)
 
         if handle_out is not None:
             handle_out.wait()
