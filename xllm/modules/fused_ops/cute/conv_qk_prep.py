@@ -59,11 +59,19 @@ def _rows_per_warp(B: int, L: int, G: int) -> int:
 BOS_PAD, BOS_PAD_R = 8, 136  # zero bos entries before / after each sequence (>= 3 / T + 3: no bounds checks)
 
 
+def _heads_per_warp(S: int, G: int) -> int:
+    """Heads per warp: up to 256 channels, a power of two dividing G."""
+    hp = 256 // S if S < 256 and 256 % S == 0 else 1
+    while G % hp:
+        hp //= 2
+    return hp
+
+
 @cute.jit
-def _warp_reduce_n(v: cute.Tensor, n_sum: cutlass.Constexpr, n_max: cutlass.Constexpr):
-    """Butterfly all-reduce of v[0 .. n_sum) (sums) and v[n_sum .. n_sum + n_max) (maxima) across the warp, the
-    independent chains interleaved (one shuffle latency per round instead of one per value)."""
-    for o in cutlass.range_constexpr(5):
+def _warp_reduce_n(v: cute.Tensor, n_sum: cutlass.Constexpr, n_max: cutlass.Constexpr, rounds: cutlass.Constexpr = 5):
+    """Butterfly all-reduce of v[0 .. n_sum) (sums) and v[n_sum .. n_sum + n_max) (maxima) across groups of
+    2^rounds lanes, the independent chains interleaved (one shuffle latency per round instead of one per value)."""
+    for o in cutlass.range_constexpr(rounds):
         for i in cutlass.range_constexpr(n_sum):
             v[i] = v[i] + cute.arch.shuffle_sync_bfly(v[i], offset=1 << o)
         for i in cutlass.range_constexpr(n_sum, n_sum + n_max):
@@ -72,10 +80,15 @@ def _warp_reduce_n(v: cute.Tensor, n_sum: cutlass.Constexpr, n_max: cutlass.Cons
 
 class _ConvQkBase:
     def __init__(self, G: int, S: int, R: int, T: int, U: int, NST: int, affine: bool, has_bos: bool, normalize: bool):
-        self.G, self.S, self.R, self.T, self.U, self.NST, self.affine, self.has_bos = G, S, R, T, U, NST, affine, has_bos
+        # heads narrower than 256 channels are packed HP to a warp (G / HP groups of S * HP channels, S / E lanes per
+        # head) so each lane still owns 8 channels and the per-head reductions run over half / quarter warps
+        HP = _heads_per_warp(S, G)
+        self.SH, self.LH = S, 32 // HP
+        self.G, self.S, self.R, self.T, self.U, self.NST, self.affine, self.has_bos = G // HP, S * HP, R, T, U, NST, affine, has_bos
         self.normalize = normalize
-        self.E = S // 32
-        assert S % 32 == 0 and self.E in (2, 4, 8, 16) and R % self.E == 0 and 0 <= R <= S and NST >= 2 and T <= BOS_PAD_R - HALO
+        self.E = self.S // 32
+        self.RED = self.LH.bit_length() - 1  # butterfly rounds of a head's lanes
+        assert self.S % 32 == 0 and self.E in (2, 4, 8, 16) and R % self.E == 0 and 0 <= R <= S and NST >= 2 and T <= BOS_PAD_R - HALO
 
     @cute.jit
     def _weights(self, pWc: cute.Pointer, pW: cute.Pointer, c0: Int32, wc: cute.Tensor, wv: cute.Tensor):
@@ -164,7 +177,7 @@ class ConvQkFwd(_ConvQkBase):
             base = pX + Int64(b) * L * D + c0
             obase = Int64(b) * L * D + c0
             bbase = pBos + (Int64(b) * (L + BOS_PAD + BOS_PAD_R) + BOS_PAD)
-            rope = lane * E < R
+            rope = (lane % self.LH) * E < R
             n_groups = T // U
             wslot = warp * NST
 
@@ -223,10 +236,10 @@ class ConvQkFwd(_ConvQkBase):
                         mx = cute.arch.fmax(mx, cr[k])
                     red[u] = ss
                     red[U + u] = mx
-                _warp_reduce_n(red, U, U)
+                _warp_reduce_n(red, U, U, self.RED)
                 # y = rope(bf16(rmsnorm(c) w)); exp for the softmax (in place of c)
                 for u in cutlass.range_constexpr(U):
-                    rstd = cute.math.rsqrt(red[u] * (1.0 / S) + eps, fastmath=True)
+                    rstd = cute.math.rsqrt(red[u] * (1.0 / self.SH) + eps, fastmath=True)
                     yv = cute.make_rmem_tensor(cute.make_layout(E), Float32)
                     for k in cutlass.range_constexpr(E):
                         yv[k] = cv[u, k] * rstd * wv[k]
@@ -253,7 +266,7 @@ class ConvQkFwd(_ConvQkBase):
                         cv[u, k] = cute.math.exp2(cv[u, k] * LOG2E + neg, fastmath=True)
                         tsum = tsum + cv[u, k]
                     red[u] = tsum
-                _warp_reduce_n(red, U, 0)
+                _warp_reduce_n(red, U, 0, self.RED)
                 for u in cutlass.range_constexpr(U):
                     inv = cute.arch.rcp_approx(red[u])
                     pv = cute.make_rmem_tensor(cute.make_layout(E), Float32)
@@ -280,7 +293,7 @@ class ConvQkFwd(_ConvQkBase):
                 self._cp(base + Int64(tt) * D, sX.iterator + (so + u * 32 * E), BFloat16)
                 if cutlass.const_expr(R > 0):
                     if rope:
-                        self._cp(pF + (Int64(tt) * R + lane * E), sF.iterator + (so + u * 32 * E), Float32)
+                        self._cp(pF + (Int64(tt) * R + (lane % self.LH) * E), sF.iterator + (so + u * 32 * E), Float32)
         cute.arch.cp_async_commit_group()
 
 
@@ -337,7 +350,7 @@ class ConvQkBwd(_ConvQkBase):
             base = pX + Int64(b) * L * D + c0
             obase = Int64(b) * L * D + c0
             bbase = pBos + (Int64(b) * (L + BOS_PAD + BOS_PAD_R) + BOS_PAD)
-            rope = lane * E < R
+            rope = (lane % self.LH) * E < R
             tb0 = t0 + T + HALO
             n_groups = (T + HALO + 1) // U
             wslot = warp * NST
@@ -448,10 +461,10 @@ class ConvQkBwd(_ConvQkBase):
                         x0, x1, c, s = gy[u, 2 * i], gy[u, 2 * i + 1], fr[2 * i], fr[2 * i + 1]
                         gy[u, 2 * i] = x0 * c + x1 * s
                         gy[u, 2 * i + 1] = x1 * c - x0 * s
-        _warp_reduce_n(red, U, U)
+        _warp_reduce_n(red, U, U, self.RED)
         # rmsnorm backward dot, softmax exponentials; c becomes xhat = c rstd
         for u in cutlass.range_constexpr(U):
-            rstd = cute.math.rsqrt(red[u] * (1.0 / S) + eps, fastmath=True)
+            rstd = cute.math.rsqrt(red[u] * (1.0 / self.SH) + eps, fastmath=True)
             rs[u] = rstd
             in_tile = tb - u < t0 + T
             neg = -red[U + u] * LOG2E
@@ -469,11 +482,11 @@ class ConvQkBwd(_ConvQkBase):
                 dot = dot + gy[u, k] * xh
             red[u] = dot
             red[U + u] = tsum
-        _warp_reduce_n(red, 2 * U, 0)
+        _warp_reduce_n(red, 2 * U, 0, self.RED)
         # norm gradient rstd (dxhat - xhat mean(dxhat xhat)); softmax probabilities and their dot with dp
         for u in cutlass.range_constexpr(U):
             rstd = rs[u]
-            dot = red[u] * (1.0 / S)
+            dot = red[u] * (1.0 / self.SH)
             inv = cute.arch.rcp_approx(red[U + u])
             gp = self._ld(sDp.iterator + (so + u * 32 * E), BFloat16)
             sdot = Float32(0.0)
@@ -482,7 +495,7 @@ class ConvQkBwd(_ConvQkBase):
                 pv[u, k] = pv[u, k] * inv
                 sdot = sdot + pv[u, k] * gp[k]
             red[u] = sdot
-        _warp_reduce_n(red, U, 0)
+        _warp_reduce_n(red, U, 0, self.RED)
         # g = bf16(norm gradient + softmax gradient + extra) (the unfused path stores it in bf16); conv weight sums
         for u in cutlass.range_constexpr(U):
             r = tb - u
@@ -559,7 +572,7 @@ class ConvQkBwd(_ConvQkBase):
                         self._cp(pEx + off, sEx.iterator + o, BFloat16)
                     if cutlass.const_expr(R > 0):
                         if rope:
-                            self._cp(pF + (Int64(r) * R + lane * E), sF.iterator + o, Float32)
+                            self._cp(pF + (Int64(r) * R + (lane % self.LH) * E), sF.iterator + o, Float32)
                 else:
                     self._zero(sDy.iterator + o)
                     self._zero(sDp.iterator + o)
@@ -595,7 +608,7 @@ def conv_qk_prep_fwd(x: torch.Tensor, conv_weight: torch.Tensor, normalize: bool
     B, L, D = x.shape
     S = D // G
     R = rope_dim if freqs_cis is not None else 0
-    T = _rows_per_warp(B, L, G)
+    T = _rows_per_warp(B, L, G // _heads_per_warp(D // G, G))
     x = x.contiguous()
     dev = x.device
     wc = conv_weight.float().contiguous()
@@ -624,15 +637,17 @@ def conv_qk_prep_bwd(dy: torch.Tensor, dp: torch.Tensor, extra: Optional[torch.T
     B, L, D = x.shape
     S = D // G
     R = rope_dim if freqs_cis is not None else 0
-    T = _rows_per_warp(B, L, G)
+    T = _rows_per_warp(B, L, G // _heads_per_warp(D // G, G))
     x = x.contiguous()
     dev = x.device
     wc = conv_weight.float().contiguous()
     bos, has_bos = _bos_u8(bos_mask, x)
-    n_cta = -(-(-(-L // T)) // WARPS) * G
+    HP = _heads_per_warp(S, G)
+    Gp, Sp = G // HP, S * HP
+    n_cta = -(-(-(-L // T)) // WARPS) * Gp
     affine = weight is not None
     dx = torch.empty(B, L, D, dtype=torch.bfloat16, device=dev)
-    part = torch.empty(B * n_cta, WIDTH + 1, S, dtype=torch.float32, device=dev)
+    part = torch.empty(B * n_cta, WIDTH + 1, Sp, dtype=torch.float32, device=dev)
     db, df = _dummy(dev)
     f = torch.view_as_real(freqs_cis).contiguous().reshape(-1) if R > 0 else df
     w = weight.float().contiguous().reshape(-1) if affine else df
@@ -644,7 +659,7 @@ def conv_qk_prep_bwd(dy: torch.Tensor, dp: torch.Tensor, extra: Optional[torch.T
     fn(dy.contiguous().reshape(-1), dp.contiguous().reshape(-1), (extra.contiguous() if extra is not None else dy).reshape(-1),
        x.reshape(-1), wc.reshape(-1), bos, f, w, dx.reshape(-1), part.reshape(-1), B, L, float(eps))
     # CTA rows are (b, tile group, head): head = row % G
-    sums = part.view(-1, G, WIDTH + 1, S).sum(0)
+    sums = part.view(-1, Gp, WIDTH + 1, Sp).sum(0)
     dwc = sums[:, :WIDTH].permute(0, 2, 1).reshape(D, WIDTH)
     if normalize:
         dwc = torch.ops.aten._softmax_backward_data(dwc, torch.softmax(wc, dim=-1), -1, torch.float32)
