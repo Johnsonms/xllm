@@ -1,11 +1,14 @@
 # CuTe DSL kernels for xllm: handoff
 
-This handoff covers three tasks:
+This handoff covers four tasks:
 
 - `TimestepDecayNorm` (TSDN): forward and backward are done.
 - `AdaptiveWorkingMemory` (AWM): forward and backward are done (section 6 has what is left).
 - Sliding chunk attention (SCA): forward and backward are done (section 6b), after a full-step profile showed the
   swift SCA at 58% of the 0.9B step on B200.
+- 8-GPU FSDP2 overlap investigation (section 6c): the collectives were already hidden; it found a default-device
+  bug costing ~10% of the CPU time of every step, added `fsdp_layers_per_group`, and quantified data-dependent
+  straggling.
 
 Both are written in the CuTe Python DSL (nvidia-cutlass-dsl 4.8.1) and target B200 (sm_100a).
 
@@ -303,6 +306,58 @@ prefetching, or bucketing).
 - Remaining step time (0.9B, 590 ms): dense GEMMs ~250, fused-block elementwise ~90, cross-entropy ~85 (TF32 in
   train.py makes it ~5), swiglu ~90, rope ~70, norms ~65, SCA ~115, AWM ~10.
 
+## 6c. FSDP2 overlap on 8 GPUs: done (2026-10-24, slinky-0)
+
+Question (after §6b): with the shorter cute kernels, 8-GPU FSDP2 steps looked slower than 1-GPU steps (7.1B 1043
+vs 968 ms, 4B 565 vs 455). Method: `profile/fsdp_trace.py` (torchrun, all cute backends, chrome trace of one
+step on rank 0 with a `FWDBWD` annotation that includes a `torch.cuda.synchronize()`, so the CPU annotation is
+the fwd+bwd window), `gaps.py` (compute-stream idle time inside that window and whether NCCL was running),
+`gapattr.py` / `cpuself.py` (GPU-idle time and CPU self time by python frame, `WITH_STACK=1`), `kcmp.py`.
+
+### Findings
+
+1. **Communication is overlapped.** Compute-stream gaps under NCCL are <= 15 ms per step on all three presets
+   (the first all-gather of the forward and the last reduce-scatter of the backward are the only exposed ones).
+   `fp32_reduce_scatter=False` and `reshard_after_forward=False` change nothing (7.1B 1021 -> 1017 / 1019 ms).
+   NCCL kernel durations in the profile (~450 ms on 7.1B) are mostly waiting for peers, not bandwidth.
+2. **The 8-GPU "penalty" is straggling from data-dependent compute.** The cute SCA skips key blocks across
+   segment boundaries, so a rank's step time depends on its batch: with one seed, consecutive 4B steps take 432
+   to 520 ms (SCA kernels 79 vs 155 ms; a sequence without eos is the worst case), reproducibly and independent
+   of CPU/NUMA pinning. The 8-GPU step is the max over ranks: with identical batches on all ranks 7.1B = 960 ms
+   (1 GPU 942) and 4B = 449 (1 GPU 444). Not an FSDP problem; the levers are a faster worst-case SCA backward
+   (S = 128: ~0.57 PFLOPS vs ~1.2 in the forward) or work-balanced batches.
+3. **Bug (fixed, commit 671884b):** `create_on_gpu()` restored the default device with
+   `set_default_device("cpu")`, which installs a `DeviceContext` TorchFunctionMode (python `__torch_function__`
+   on every torch op) for the rest of the process: 24k calls per 4B forward. Restoring the raw setting (`None`)
+   removes it. 1 GPU: 4B 554 -> 444 ms, 0.9B 590 -> 530; 8 GPUs: 4B 614 -> 504, 0.9B 600 -> 591. train.py uses
+   `build_model` -> `create_on_gpu`, so production runs had it too.
+4. **gekko-4B's forward is launch-bound** even after the fix (1 GPU: ~50 ms GPU idle per step; 8 GPUs 60-80 ms,
+   the FSDP2 hooks add per-parameter python work, ~16 parameters per layer). Remaining host costs per step:
+   triton causal conv (108 calls, ~17 ms of launcher time), `F.linear` ~55 us per call (296 calls), FSDP2
+   `_get_param_all_gather_inputs` / copy-out / `alloc_storage`, the TSDN / AWM / SCA wrappers (0.2-0.3 ms per
+   call). `ModelConf.fsdp_layers_per_group` (commit 1f9d3c0) groups consecutive GekkoBlocks into one
+   `fully_shard` parameter group (layer 0 alone, so the exposed collectives stay small): 4B 8 GPUs 504 -> 485 ms
+   at 4 (same batches: 449 -> 430), +1 GB peak memory, loss / grad norm parity to bf16 noise; 6 and 9 are not
+   better; 0.9B and 7.1B gain nothing (not launch-bound). The SCA `segment_starts` / `query_limits` cache their
+   result per segment_idx tensor (all layers of a step share it).
+
+### Numbers (fwd+bwd ms, B200, torchrun, cute TSDN/AWM/SCA, per-rank random batches unless noted)
+
+| preset | 1 GPU before | 1 GPU after fix | 8 GPUs before | 8 GPUs after fix | 8 GPUs grp=4 | 8 GPUs same batches |
+|---|---|---|---|---|---|---|
+| 0.9B B2 L16384 | 590 | 530 | 600 | 591 | 585 | - |
+| 4B B1 L8192 | 554 | 444 | 614 | 504 | 485 | 449 (grp=1) / 430 (grp=4) |
+| 7.1B B1 L16384 | 946 | 942 | 1021 | 1031 | 1035 | 960 |
+
+### Open items
+
+- Launch-bound 4B forward: CUDA graphs are out (FSDP2 reallocates the unsharded parameters every step); the
+  per-call host costs above are the list to shrink (fewer triton launches in the conv, fewer `reshape` / dtype
+  casts in the kernel wrappers, fusing the three conv calls per layer).
+- Straggling: a data loader that balances attention work (segment structure) across ranks, or a faster
+  worst-case SCA backward.
+- Per-rank step-time telemetry in train.py would make straggling visible in production.
+
 ## 7. Dev scripts (`handoff/scripts/`)
 
 These were copied from the session scratchpad and are not polished. Most assume the repo is at `/home/johnson/xllm`.
@@ -328,7 +383,12 @@ These were copied from the session scratchpad and are not polished. Most assume 
   <trace> <regex> <depth>` attributes kernel time to xllm call sites (launches via cuda_runtime and cuda_driver);
   `fsdp_step.py` (torchrun) FSDP2 steps with clip + optimizer and a kernel-class breakdown on rank 0;
   `parity_sca.py <preset> <B> <L>` swift vs cute SCA losses / grad norms / step time / peak memory. Env:
-  `TN_BACKEND`, `AWM_BACKEND`, `CFG_<model field>=value`.
+  `TN_BACKEND`, `AWM_BACKEND`, `CFG_<model field>=value`. For §6c: `run1.sh <gpus> <nproc> <port> <trace>
+  <preset> <B> <L> [steps]` wraps `fsdp_trace.py` (env `FSDP_FP32_RS`, `FSDP_RESHARD`, `SAME_SEED`,
+  `SEED_OFFSET`, `PROF_STEP`, `WITH_STACK`, `TRACE_OUT`); `gaps.py <trace> [top]` compute-stream gaps and NCCL
+  overlap inside the FWDBWD window; `gapattr.py <trace> [depth] [regex] [--ops]` GPU-idle time by python frame
+  or cpu op; `cpuself.py <trace> [top] [--fwd]` CPU self time per python function; `kcmp.py <a> <b>` kernel
+  time diff of two traces.
 - **`tsdn/`**: check, bench, sweep and profile scripts for TSDN. `cubext/` builds the CUB baseline.
 - **`common/ncu_src.sh <tag> [shape] [cfg]`**: source-level ncu stall breakdown. Set `NCU`, `KNAME` (kernel regex) and `SCRIPT` (a driver such as `../awm/ncu_awm.py`), plus `SRC` and `NLINES`. It uses `CUTE_DSL_LINEINFO=1` and `--import-source yes`. `src_an.py` aggregates per source line.
 
