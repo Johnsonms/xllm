@@ -316,15 +316,20 @@ def layernorm_bwd(
     weight: Optional[Tensor],
     bias: Optional[Tensor],
     num_groups: int,
+    residual: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    """``residual``: a gradient added to x_grad (in the cute kernel's epilogue when it runs)."""
     xdim = x.shape[-1]
     if _cute_ln(x, weight, bias, num_groups):
         from xllm.modules.fused_ops.cute.layer_norm import ln_bwd
-        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups)
+        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups, residual=residual)
     if weight is not None:
-        return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
-        return xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+        x_grad, w_grad, b_grad = xllm_ops.group_layer_norm_bwd(y_grad, x, xdim, num_groups, mean, rstd, False), None, None
+    if residual is not None:
+        x_grad = torch.add(x_grad, residual, out=x_grad)
+    return x_grad, w_grad, b_grad
 
 
 def rmsnorm_fwd(
@@ -391,12 +396,15 @@ def layer_or_rmsnorm_bwd(
     bias: Optional[Tensor],
     num_groups: int,
     apply_rmsnorm: bool,
+    residual: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     if apply_rmsnorm:
         x_grad, w_grad = rmsnorm_bwd(y_grad, x, rstd, weight, num_groups)
         b_grad = None
+        if residual is not None:
+            x_grad = torch.add(x_grad, residual, out=x_grad)
     else:
-        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups)
+        x_grad, w_grad, b_grad = layernorm_bwd(y_grad, x, mean, rstd, weight, bias, num_groups, residual=residual)
 
     return x_grad, w_grad, b_grad
 
@@ -708,7 +716,9 @@ def swiglu_backward(
     norm_groups: int,
     apply_rmsnorm: bool,
     gather_before_norm: bool,
+    residual_grad: Optional[Tensor] = None,
 ):
+    """``residual_grad`` ([B, L, D], local): added to x_grad (fused into the norm backward when possible)."""
     assert xf.shape == y_grad.shape, (xf.shape, y_grad.shape)
     bsz, seq_len, _ = x.shape
 
@@ -766,8 +776,10 @@ def swiglu_backward(
 
     if not gather_before_norm:
         x_grad, norm_w_grad, norm_b_grad = layer_or_rmsnorm_bwd(
-            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm
+            xf_grad, x, x_mean, x_invvar, norm_w, norm_b, norm_groups, apply_rmsnorm, residual=residual_grad
         )
+    elif residual_grad is not None:
+        x_grad = torch.add(x_grad, residual_grad, out=x_grad)
 
     return x_grad, w1_grad, w2_grad, w3_grad, norm_w_grad, norm_b_grad
 

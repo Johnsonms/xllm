@@ -686,12 +686,12 @@ class GekkoBlockFunction(torch.autograd.Function):
         mx, handle_mx = all_gather(mx, parallel_region='model', async_op=True)
 
         out_grad = rearrange(out_grad, 'b l d -> (b l) d')
-        xo_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, ffn_norm_w_grad, ffn_norm_b_grad = swiglu_backward(
+        # the residual gradient is added in the norm backward's epilogue
+        residual_grad, fc1_w_grad, fc2_w_grad, fc3_w_grad, ffn_norm_w_grad, ffn_norm_b_grad = swiglu_backward(
             out_grad, xf, fc1_w, fc2_w, fc3_w, h1, h3, hidden_dropout, hidden_rng_state,
             xo, xo_mean, xo_invvar, ffn_norm_w, ffn_norm_b, ffn_norm_local_groups, apply_rmsnorm, False,
+            residual_grad=residual_grad,
         )
-
-        residual_grad = torch.add(xo_grad, residual_grad, out=xo_grad)
         xh_grad = residual_grad
         xh_grad = memory_efficient_dropout_bwd(xh_grad, dropout, xh_rng_state)
         xh_grad, handle_xh = all_gather(xh_grad, parallel_region='model', async_op=True)
