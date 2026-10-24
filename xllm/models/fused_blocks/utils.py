@@ -52,9 +52,12 @@ def timenorm_fwd(
     gamma = gamma + 1.0
     if backend == 'cute':
         from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_fwd
-        y, count, mean, var, cummean, cumrstd, _ = timestep_decay_norm_fwd(
+        y, count, mean, var, cummean, cumrstd, step_count = timestep_decay_norm_fwd(
             x, bos_mask, prev_count, prev_mean, prev_var, gamma, beta, None, num_groups, beta1, beta2, eps,
         )
+        # the backward needs the per-step counts; they ride on cummean (which it receives) so the 6-tuple of every
+        # backend stays the same and timenorm_bwd skips recomputing them with scans
+        cummean._xllm_step_count = step_count
         return y, count, mean, var, cummean, cumrstd
     timestep_norm_fwd = xllm_ops.group_timestep_decay_norm_cub_fwd if backend == 'cub' else xllm_ops.group_timestep_decay_norm_fwd
     y, count, mean, var, cummean, cumrstd = timestep_norm_fwd(
@@ -88,7 +91,7 @@ def timenorm_bwd(
         from xllm.modules.fused_ops.cute.timestep_decay_norm import timestep_decay_norm_bwd
         # per-step counts are recomputed from prev_count and the bos mask
         x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad = timestep_decay_norm_bwd(
-            y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, None,
+            y_grad, mean_grad, var_grad, x_or_y, bos_mask, cummean, cumrstd, getattr(cummean, "_xllm_step_count", None),
             gamma, None, num_groups, beta1, beta2, prev_count=prev_count
         )
     elif backend == 'cub':
