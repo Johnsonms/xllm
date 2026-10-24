@@ -519,9 +519,21 @@ SCA (`sliding_chunk_attention.py`):
   element): `cute/causal_conv.py` (commit "cute causal conv1d forward"), 0.9B q 128 -> 75 us, v (silu) 126 ->
   59, 7.1B v 207 -> 164 vs Triton; six calls per layer (the block recomputes the convs in its backward). The
   backward kernel in the module and the cp.async shared-memory staged variant (`conv/causal_conv_smem.py`) are
-  correct but slower than Triton's backward (latency bound; the bwd needs 7-row x and g windows -> 69-122
-  registers, 24-37% warps active): opt-in via `XLLM_CUTE_CONV_BWD=1`. Remaining: ~10 / 17 / 11 ms per step of
-  Triton conv backward on 0.9B / 7.1B / 4B.
+  correct but slower than Triton's backward even after the same treatment (4-channel threads, bf16 register
+  windows, packed math, mask-free path: 186 vs 140 us on the 0.9B q shape, 473 vs 338 on 7.1B v; the dx of
+  row t needs g of rows t..t+3 and g of row t needs x of rows t-3..t, so the live state per thread stays
+  large): opt-in via `XLLM_CUTE_CONV_BWD=1`. Remaining: ~10 / 17 / 11 ms per step of Triton conv backward on
+  0.9B / 7.1B / 4B. A different decomposition (threads along time, channels in a warp-wide shuffle) is the next
+  thing to try.
+
+### What applies where
+
+All block-level fusions (q/k prep, attention gate + delta, swiglu, layernorm, the fused-linear cross entropy)
+live in the fused block (`GekkoBlockFunction`, `cfg.fused_block=True`, as the harness and every number here).
+With `fused_block=False` only the op-level backends apply (cute SCA / AWM / TSDN as before, the conv forward,
+the csrc norm kernels); the non-fused modules (`gated_delta_attention.py`, `normalized_feedforward_network.py`,
+`rotary_positional_embedding.py`, `vocab_parallel_cross_entropy`) would need autograd.Function wrappers around
+the same kernels.
 - Fusing dS into ScaPmat (three variants, §6b) stays slower.
 
 ### Remaining (1-GPU shares)
