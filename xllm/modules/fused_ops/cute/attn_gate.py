@@ -132,22 +132,23 @@ class AttnGateBwd:
     dn = bf16(g r), dsca = rstd (dn - n mean(dn n)); dr = bf16(g n), drmx = gate'(rmx) dr; optionally also the
     recomputed attn = bf16(n r) (the wo weight gradient needs it)."""
 
-    def __init__(self, V: int, silu: bool, want_attn: bool):
-        self.V, self.silu, self.want_attn = V, silu, want_attn
+    def __init__(self, V: int, silu: bool, want_attn: bool, H: int = 1, want_delta: bool = False):
+        self.V, self.silu, self.want_attn, self.H, self.want_delta = V, silu, want_attn, H, want_delta
         self.WPR = max(1, V // 256)
         self.E = V // (32 * self.WPR)
         assert V % 32 == 0 and self.E in (4, 8) and WARPS % self.WPR == 0
 
     @cute.jit
     def __call__(self, tG: cute.Tensor, tA: cute.Tensor, tB: cute.Tensor, tR: cute.Tensor, tDs: cute.Tensor, tDr: cute.Tensor,
-                 tAttn: cute.Tensor, rows: Int32, eps: Float32, stream: cuda.CUstream):
+                 tAttn: cute.Tensor, tDelta: cute.Tensor, rows: Int32, L: Int32, eps: Float32, stream: cuda.CUstream):
         rows_per_cta = WARPS // self.WPR
-        self.kernel(tG.iterator, tA.iterator, tB.iterator, tR.iterator, tDs.iterator, tDr.iterator, tAttn.iterator, rows, eps).launch(
+        self.kernel(tG.iterator, tA.iterator, tB.iterator, tR.iterator, tDs.iterator, tDr.iterator, tAttn.iterator, tDelta.iterator,
+                    rows, L, eps).launch(
             grid=[(rows + rows_per_cta - 1) // rows_per_cta, 1, 1], block=[32 * WARPS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(self, pG: cute.Pointer, pA: cute.Pointer, pB: cute.Pointer, pR: cute.Pointer, pDs: cute.Pointer, pDr: cute.Pointer,
-               pAttn: cute.Pointer, rows: Int32, eps: Float32):
+               pAttn: cute.Pointer, pDelta: cute.Pointer, rows: Int32, L: Int32, eps: Float32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         V, E, WPR = self.V, self.E, self.WPR
@@ -197,6 +198,21 @@ class AttnGateBwd:
         dot = _row_sum(dot, red, WPR, widx, lane) * (1.0 / V)
         for k in cutlass.range_constexpr(E):
             dn[k] = rstd * (dn[k] - sv[k] * dot)
+        if cutlass.const_expr(self.want_delta):
+            # delta[b, h, l] = sum_v dS[v] y[v] (bf16 operands, as the SCA backward's RowDot) for the SCA backward
+            dsb = dn.load().to(BFloat16).to(Float32)
+            dd = Float32(0.0)
+            for k in cutlass.range_constexpr(E):
+                dd = dd + dsb[k] * a8[k]
+            dd = _row_sum(dd, red, WPR, widx, lane)
+            if valid:
+                if tidx % (32 * WPR) == 0:
+                    H = self.H
+                    h = row % H
+                    bl = row // H
+                    b = bl // L
+                    l = bl - b * L
+                    cute.make_tensor(pDelta + ((b * H + h) * L + l), cute.make_layout(1))[0] = dd
         if valid:
             cute.make_tensor((pDs + off).align(2 * E), cute.make_layout(E)).store(dn.load().to(BFloat16))
             cute.make_tensor((pDr + off).align(2 * E), cute.make_layout(E)).store(drv.load().to(BFloat16))
@@ -217,20 +233,23 @@ def attn_gate_fwd(sca_out: torch.Tensor, awk_out: torch.Tensor, rmx: torch.Tenso
 
 
 def attn_gate_bwd(attn_grad: torch.Tensor, sca_out: torch.Tensor, awk_out: torch.Tensor, rmx: torch.Tensor, H: int, gate: str,
-                  eps: float, want_attn: bool = False):
-    """(sca_out_grad [B, L, H * V] (also the awk_out gradient), rmx_grad [B, L, H * V], attn or None) of attn_gate_fwd."""
+                  eps: float, want_attn: bool = False, want_delta: bool = False):
+    """(sca_out_grad [B, L, H * V] (also the awk_out gradient), rmx_grad [B, L, H * V], attn or None, delta or None) of
+    attn_gate_fwd; delta [B, H, L] fp32 = rowsum(sca_out_grad * sca_out) is the SCA backward's delta."""
     B, L, D = sca_out.shape
     V = D // H
     rows = B * L * H
     ds = torch.empty_like(sca_out)
     dr = torch.empty_like(sca_out)
     attn = torch.empty_like(sca_out) if want_attn else None
-    fn = _compiled(("attn_gate_bwd", V, gate, want_attn), lambda: AttnGateBwd(V, gate == "silu", want_attn), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16),
-        Int32(0), Float32(0.0)))
+    delta = torch.empty(B, H, L, dtype=torch.float32, device=sca_out.device) if want_delta else None
+    fn = _compiled(("attn_gate_bwd", V, gate, want_attn, H if want_delta else 0), lambda: AttnGateBwd(V, gate == "silu", want_attn, H, want_delta),
+                   lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16),
+                            _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0), Float32(0.0)))
     fn(attn_grad.contiguous().reshape(-1), sca_out.contiguous().reshape(-1), awk_out.contiguous().reshape(-1), rmx.contiguous().reshape(-1),
-       ds.reshape(-1), dr.reshape(-1), (attn if want_attn else ds).reshape(-1), rows, float(eps))
-    return ds, dr, attn
+       ds.reshape(-1), dr.reshape(-1), (attn if want_attn else ds).reshape(-1),
+       (delta if want_delta else torch.empty(16, dtype=torch.float32, device=sca_out.device)).reshape(-1), rows, L, float(eps))
+    return ds, dr, attn, delta
 
 
 def attn_gate_supported(x: torch.Tensor, H: int, gate: str, dropout: float) -> bool:

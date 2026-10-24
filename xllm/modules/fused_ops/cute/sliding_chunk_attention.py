@@ -3065,8 +3065,9 @@ class ScaBwdDkT:
             tmem.free(tmem_ptr)
 
 
-def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
-    """Gradients of sca_fwd: dq [B, L, H, S], dk [B, L, K, S], dv [B, L, K, V] (bf16)."""
+def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax, delta=None):
+    """Gradients of sca_fwd: dq [B, L, H, S], dk [B, L, K, S], dv [B, L, K, V] (bf16). delta [B, H, L] fp32 =
+    rowsum(dout * y) may be passed in (the fused attention gate backward produces it), else it is computed here."""
     B, L, H, S = q.shape
     K, V = v.shape[2], v.shape[3]
     C = chunk_size
@@ -3075,10 +3076,14 @@ def sca_bwd(q, k, v, y, lse2, dout, chunk_size, scale, kmin, qmax):
     dev = q.device
     dout = dout.contiguous()
     # delta[b, h, q] = sum_v dO O
-    delta = torch.empty(B, H, L, dtype=torch.float32, device=dev)
-    f_delta = _compiled(("sca_rowdot", H, V), lambda: RowDot(H, V), lambda: (
-        _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
-    f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
+    if delta is None:
+        delta = torch.empty(B, H, L, dtype=torch.float32, device=dev)
+        f_delta = _compiled(("sca_rowdot", H, V), lambda: RowDot(H, V), lambda: (
+            _fake(BFloat16), _fake(BFloat16), _fake(Float32, 4), Int32(0), Int32(0)))
+        f_delta(dout.reshape(-1), y.reshape(-1), delta.reshape(-1), B, L)
+    else:
+        assert delta.shape == (B, H, L) and delta.dtype == torch.float32
+        delta = delta.contiguous()
     dv = torch.empty(B, L, K, V, dtype=torch.bfloat16, device=dev)
     if 3 * (S + V) // 2 + 4 * 32 <= 512 and os.environ.get("SCA_FUSED_DKDV", "1") == "1":
         # dK and dV in one pass (S^T / P^T computed once)
