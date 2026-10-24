@@ -276,6 +276,18 @@ def causal_conv1d_bwd(
     return x_grad, initial_state_grad, w_grad, b_grad
 
 
+def _cute_ln(x: Tensor, weight: Optional[Tensor], bias: Optional[Tensor], num_groups: int) -> bool:
+    """Whether the CuTe DSL group layer norm (Blackwell, bf16, affine, >= 2048 tokens; env XLLM_CUTE_LN=0 disables it)
+    handles this input."""
+    if weight is None or bias is None or x.dim() != 3 or x.shape[0] * x.shape[1] < 2048:
+        return False
+    try:
+        from xllm.modules.fused_ops.cute.layer_norm import ln_supported
+    except ImportError:
+        return False
+    return ln_supported(x, num_groups)
+
+
 def layernorm_fwd(
     x: Tensor,
     weight: Optional[Tensor],
@@ -284,6 +296,9 @@ def layernorm_fwd(
     eps: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     xdim = x.shape[-1]
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_fwd
+        return ln_fwd(x, weight, bias, num_groups, eps)
     if weight is not None:
         return xllm_ops.group_layer_norm_fwd_affine(x, xdim, num_groups, weight + 1.0, bias, eps)
     else:
@@ -300,6 +315,9 @@ def layernorm_bwd(
     num_groups: int,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     xdim = x.shape[-1]
+    if _cute_ln(x, weight, bias, num_groups):
+        from xllm.modules.fused_ops.cute.layer_norm import ln_bwd
+        return ln_bwd(y_grad, x, mean, rstd, weight, num_groups)
     if weight is not None:
         return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
