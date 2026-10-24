@@ -25,7 +25,7 @@ rewrite; "P" marks code that should port with small changes.
 | `ScaFwdT` (default) | same | `ScaFwd` | q tile in TMEM as the A operand; 4B: 256 TMEM cols, two CTAs per SM | 4B 668 -> 550 us per call, 0.9B 558 -> 540 | B (no TMEM on Hopper: nothing to port, FA3 keeps Q in smem / registers) |
 | `ScaBwdDv`, `ScaBwdDk`, `ScaBwdDq` | same | swift backward | generic backward (3 kernels, v slabs for V > 256, fp32 dP from cuBLAS for V > 256) | 0.9B bwd 3.0 ms/layer vs ~11 | B |
 | `ScaBwdDkDv`, `ScaBwdDqT` (default for S + V <= 256) | same | `ScaBwdDv` + `ScaBwdDk`, `ScaBwdDq` | fused dK+dV, K/V/Q/dO in TMEM as A operands, 2 compute groups, raw mbarriers | 4B bwd 3.6 -> 1.8 ms/layer | B (the FA3 backward is the Hopper equivalent; pipeline order and the predication pitfall transfer) |
-| `ScaPmat` + cuBLAS bmm (default for V > 256 when > 50% of the window is attended) | same | `ScaBwdDv` v-slab path | materialized bf16 P (chunk-major [C x 2C]) then two bmm per chunk for dV; chosen per call from qmax | 7.1B dV 2.86 -> 1.47 ms/layer (no boundaries) | B for the kernel (q in TMEM); the cuBLAS path itself is portable as is |
+| `ScaPmat`, `ScaDsMat` + cuBLAS bmm (default for V > 256 when > 50% of the window is attended) | same | `ScaBwdDv` v-slab path, `ScaBwdDk`, `ScaBwdDq` | materialized bf16 P and dS = P (dP - delta) (chunk-major [C x 2C]); dV, dK, dQ as two bmm per chunk each; chosen per call from qmax | 7.1B backward 6.13 -> 4.16 ms/layer (no boundaries) | B for ScaPmat (q in TMEM); ScaDsMat is a plain memory kernel (P); the cuBLAS path is portable as is |
 | `ChunkMajorCopy`, `ChunkMajorUncopy`, `RowDot` | same | torch permute copies / fp32 casts | layout copies (~1.7 TB/s in torch) and delta = rowsum(dO * y) | ~2.4 ms/layer saved on 7.1B | P (plain memory kernels) |
 | host: `segment_starts` / `query_limits` (cached), `_use_pmat_dv` | same | - | per-row key ranges from segment_idx; path choice with one sync | - | P |
 
@@ -179,10 +179,11 @@ baseline profile if it disagrees.
   bmm per chunk (1.47 ms/layer); since the GEMM path costs the same whatever the segment structure while the
   kernel path shrinks with it, `_use_pmat_dv` picks per call from the attended fraction (> 0.5). dP is a
   cuBLAS fp32 GEMM (1.2 ms); dK / dQ kernels read it (1.1 + 0.7 ms); dense model GEMMs are ~55% of the step.
-- **H100 plan:** the materialize-P + cuBLAS idea is portable (any kernel that writes P, even a torch one, plus
-  bmm) and on H100 the same crossover logic applies; the next step on both archs is to materialize dS =
-  P (dP - delta) bf16 too and do dK / dQ as GEMMs (estimated 0.8 ms vs 1.8 on B200). Check cuBLAS GEMM
-  efficiency on H100 for the 7.1B shapes (dim 4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak.
+- **H100 plan:** the materialize-P/dS + cuBLAS path is portable (any kernel that writes P, even a torch one,
+  plus `ScaDsMat` and bmm) and on H100 the same crossover logic applies (re-measure the crossover: the kernel
+  and GEMM costs scale differently). Do not fuse dS into the P kernel (three variants were slower on B200: the
+  strided fp32 dP reads are latency bound). Check cuBLAS GEMM efficiency on H100 for the 7.1B shapes (dim
+  4096, ffn 8192, V 2048 x 4 heads) vs the ~1 PFLOPS peak.
 
 ## 4. How to work (what worked on B200)
 

@@ -354,8 +354,19 @@ cost is fixed (dense [C x C] blocks) while the v-slab kernel's shrinks with the 
 (1.1 ms at 7 segments per 16K tokens, 0.58 at 19), crossover at an attended fraction of ~0.5, so
 `_use_pmat_dv` computes that fraction from qmax (one `.item()` per layer backward) and picks the path;
 `SCA_DV_PMAT=0/1` forces one. Training batches with a few eos per sequence take the kernel path, so the 7.1B
-step is unchanged (939 ms); batches without boundaries (the stragglers of §6c) get the GEMM path. Next on this
-line: materialize dS = P (dP - delta) bf16 and do dK / dQ as GEMMs too (estimated 0.8 ms vs 1.8).
+step is unchanged (939 ms); batches without boundaries (the stragglers of §6c) get the GEMM path.
+
+dK / dQ on the same path (commit 88b246b): dP is computed as fp32 [queries x keys] GEMMs (dO_c V_c^T,
+dO_c V_{c-1}^T), `ScaDsMat` writes dS = P (dP - delta) scale bf16 in the layout of P, and dQ_c =
+dS_c[:, C:] K_c + dS_c[:, :C] K_{c-1}, dK_c = dS_c[:, C:]^T Q_c + dS_{c+1}[:, :C]^T Q_{c+1} are bmm /
+baddbmm_ on chunk-major copies of K and Q. Per layer without boundaries: dK + dQ 1.8 -> 1.0 ms, backward
+6.13 -> 4.16 ms (kernel path 2.52 ms at 19 segments per 16K, unchanged). Model losses / grad norms with the
+path forced match the kernel path to bf16 noise. Fusing the dS computation into `ScaPmat` was tried three
+ways (register reads, early-issued reads, cp.async staging one block ahead) and was always slower
+(1.2-1.5 ms vs 0.46 + 0.52): the per-thread 256-byte strided fp32 dP reads are latency bound and the
+2-CTA/SM budget (registers <= 168, smem <= 114 KB) leaves no room for deeper prefetch. The remaining cost of
+the path is dominated by the dense GEMMs over half-empty causal blocks (dP 1.2 ms, dV 1.06 ms): splitting the
+[C x C] causal blocks into 2 x 2 sub-blocks and skipping the upper one would save ~25% of them.
 
 ### Open items
 
