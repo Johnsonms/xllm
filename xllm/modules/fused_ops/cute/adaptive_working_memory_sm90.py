@@ -470,3 +470,319 @@ class AwmOutGemmSm90:
         k = t4 % self.K
         b = t4 // self.K
         return rt, hr, c, k, b, vt
+
+
+class AwmChunkBwdSm90:
+    """Phase 1' (AwmChunkBwd) per update chunk j and 128 time rows t of it, rows outside the segment of the chunk's
+    last row ([lo, C) kept) contributing nothing:
+
+      dP^T = qk dA^T + v dB^T              (128 x S; wgmma, K = S + V streamed in 64-wide feature blocks)
+      P^T  = exp2(k log2e - lse2)          (from k in global memory, 0 on dropped rows)
+      dk   = P^T (dP^T - delta + dlse)     (bf16, stored from the registers)
+      dqk  = P^T dA,  dv = P^T dB          (P^T bf16 in shared memory as the A operand, dA / dB streamed MN-major)
+
+    k, qk, v, dk, dqk, dv are [B, L, K, *]; dA16 / dB16 [B, K, nu, S, S or V] (bf16), lse2 / delta / dlse
+    [B, K, nu, S] (fp32). One CTA per (b, k, j, time block), 256 threads (two warpgroups of 64 rows), warp 0 issues
+    the TMA loads. The rows of the last chunk (no update) are zeroed by the caller."""
+
+    def __init__(self, K: int, S: int, V: int, C: int):
+        self.K, self.S, self.V, self.C = K, S, V, C
+        self.TM, self.KB = 128, 64
+        self.NS = min(S, 256)      # N of the dP^T / dqk tiles (S <= 256)
+        self.NV = min(V, 256)      # N of a dv tile
+        assert S % self.KB == 0 and S <= 256 and V % self.NV == 0 and C % self.TM == 0
+        self.f_blocks = (S + V) // self.KB
+        self.s_blocks = S // self.KB
+        self.n_vt = V // self.NV
+        self.row_blocks = C // self.TM
+        assert self.NS == self.NV  # one B ring (fixed transaction bytes) serves dA and dB tiles
+        self.p1_stages = 2
+        self.p2_stages = 2
+        self.threads = 256
+
+    @cute.jit
+    def __call__(self, tK: cute.Tensor, tQK: cute.Tensor, tV: cute.Tensor, tDA: cute.Tensor, tDB: cute.Tensor,
+                 tLse2: cute.Tensor, tDelta: cute.Tensor, tDlse: cute.Tensor, tLo: cute.Tensor, tDK: cute.Tensor,
+                 tDQK: cute.Tensor, tDV: cute.Tensor, B: Int32, L: Int32, nu: Int32, stream: cuda.CUstream):
+        K, S, V = self.K, self.S, self.V
+        mQK = cute.make_tensor(tQK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mV = cute.make_tensor(tV.iterator, cute.make_layout((L, V, K, B), stride=(K * V, 1, V, L * K * V)))
+        # dA / dB as the K-major B operand of dP^T (N = s, K = feature) and the MN-major B operand of dqk / dv
+        # (N = feature, K = s): the same [S, F] storage per (b, k, j)
+        mDA_k = cute.make_tensor(tDA.iterator, cute.make_layout((S, S, nu * K * B), stride=(S, 1, S * S)))
+        mDB_k = cute.make_tensor(tDB.iterator, cute.make_layout((S, V, nu * K * B), stride=(V, 1, S * V)))
+        mDA_mn = cute.make_tensor(tDA.iterator, cute.make_layout((S, S, nu * K * B), stride=(1, S, S * S)))
+        mDB_mn = cute.make_tensor(tDB.iterator, cute.make_layout((V, S, nu * K * B), stride=(1, V, S * V)))
+
+        mma1 = sm90_utils.make_trivial_tiled_mma(BFloat16, BFloat16, warpgroup.OperandMajorMode.K,
+                                                 warpgroup.OperandMajorMode.K, Float32, (2, 1, 1), tiler_mn=(64, self.NS))
+        mma_s = sm90_utils.make_trivial_tiled_mma(BFloat16, BFloat16, warpgroup.OperandMajorMode.K,
+                                                  warpgroup.OperandMajorMode.MN, Float32, (2, 1, 1), tiler_mn=(64, self.NS))
+        mma_v = sm90_utils.make_trivial_tiled_mma(BFloat16, BFloat16, warpgroup.OperandMajorMode.K,
+                                                  warpgroup.OperandMajorMode.MN, Float32, (2, 1, 1), tiler_mn=(64, self.NV))
+        t1 = (self.TM, self.NS, self.KB)
+        a1_layout = sm90_utils.make_smem_layout_a(ROW_MAJOR, t1, BFloat16, self.p1_stages)
+        b1_layout = sm90_utils.make_smem_layout_b(ROW_MAJOR, t1, BFloat16, self.p1_stages)
+        p_layout = sm90_utils.make_smem_layout_a(ROW_MAJOR, (self.TM, self.NS, S), BFloat16, 1)
+        nb = max(self.NS, self.NV)
+        b2_layout = sm90_utils.make_smem_layout_b(COL_MAJOR, (self.TM, nb, self.KB), BFloat16, self.p2_stages)
+        g2s = cpasync.CopyBulkTensorTileG2SOp()
+        a1_one = cute.slice_(a1_layout, (None, None, 0))
+        b1_one = cute.slice_(b1_layout, (None, None, 0))
+        tma_qk, mQK_t = cpasync.make_tiled_tma_atom(g2s, mQK, a1_one, (self.TM, self.KB))
+        tma_v, mV_t = cpasync.make_tiled_tma_atom(g2s, mV, a1_one, (self.TM, self.KB))
+        tma_da, mDA_t = cpasync.make_tiled_tma_atom(g2s, mDA_k, b1_one, (self.NS, self.KB))
+        tma_db, mDB_t = cpasync.make_tiled_tma_atom(g2s, mDB_k, b1_one, (self.NS, self.KB))
+        b2s_layout = sm90_utils.make_smem_layout_b(COL_MAJOR, (self.TM, self.NS, self.KB), BFloat16, self.p2_stages)
+        b2v_layout = sm90_utils.make_smem_layout_b(COL_MAJOR, (self.TM, self.NV, self.KB), BFloat16, self.p2_stages)
+        tma_das, mDAs_t = cpasync.make_tiled_tma_atom(g2s, mDA_mn, cute.slice_(b2s_layout, (None, None, 0)), (self.NS, self.KB))
+        tma_dbv, mDBv_t = cpasync.make_tiled_tma_atom(g2s, mDB_mn, cute.slice_(b2v_layout, (None, None, 0)), (self.NV, self.KB))
+
+        @cute.struct
+        class SharedStorage:
+            p1_mbar: cute.struct.MemRange[cutlass.Int64, self.p1_stages * 2]
+            p2_mbar: cute.struct.MemRange[cutlass.Int64, self.p2_stages * 2]
+            sA1: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(a1_layout)], 1024]
+            sB1: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(b1_layout)], 1024]
+            sP: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(p_layout)], 1024]
+            sB2: cute.struct.Align[cute.struct.MemRange[BFloat16, cute.cosize(b2_layout)], 1024]
+
+        self.shared_storage = SharedStorage
+        mK = cute.make_tensor(tK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mDK = cute.make_tensor(tDK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mDQK = cute.make_tensor(tDQK.iterator, cute.make_layout((L, S, K, B), stride=(K * S, 1, S, L * K * S)))
+        mDV = cute.make_tensor(tDV.iterator, cute.make_layout((L, V, K, B), stride=(K * V, 1, V, L * K * V)))
+        vec = cute.make_layout((S, nu, K, B), stride=(1, S, nu * S, K * nu * S))
+        mLse2 = cute.make_tensor(tLse2.iterator, vec)
+        mDelta = cute.make_tensor(tDelta.iterator, vec)
+        mDlse = cute.make_tensor(tDlse.iterator, vec)
+        mLo = cute.make_tensor(tLo.iterator, cute.make_layout((nu, B), stride=(1, nu)))
+        grid = B * K * nu * self.row_blocks
+        self.kernel(mma1, mma_s, mma_v, tma_qk, mQK_t, tma_v, mV_t, tma_da, mDA_t, tma_db, mDB_t, tma_das, mDAs_t,
+                    tma_dbv, mDBv_t, mK, mDK, mDQK, mDV, mLse2, mDelta, mDlse, mLo, a1_layout, b1_layout, p_layout,
+                    b2s_layout, b2v_layout, nu).launch(grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, mma1: cute.TiledMma, mma_s: cute.TiledMma, mma_v: cute.TiledMma, tma_qk: cute.CopyAtom,
+               mQK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor, tma_da: cute.CopyAtom, mDA: cute.Tensor,
+               tma_db: cute.CopyAtom, mDB: cute.Tensor, tma_das: cute.CopyAtom, mDAs: cute.Tensor,
+               tma_dbv: cute.CopyAtom, mDBv: cute.Tensor, mK: cute.Tensor, mDK: cute.Tensor, mDQK: cute.Tensor,
+               mDV: cute.Tensor, mLse2: cute.Tensor, mDelta: cute.Tensor, mDlse: cute.Tensor, mLo: cute.Tensor,
+               a1_layout: cute.ComposedLayout, b1_layout: cute.ComposedLayout, p_layout: cute.ComposedLayout,
+               b2s_layout: cute.ComposedLayout, b2v_layout: cute.ComposedLayout, nu: Int32):
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        if warp == 0:
+            for atom in (tma_qk, tma_v, tma_da, tma_db, tma_das, tma_dbv):
+                cpasync.prefetch_descriptor(atom)
+        rb = bidx % self.row_blocks
+        t1 = bidx // self.row_blocks
+        j = t1 % nu
+        t2 = t1 // nu
+        k = t2 % self.K
+        b = t2 // self.K
+        mem = (b * self.K + k) * nu + j  # (b, k, j) index of dA / dB
+        lo = mLo[j, b]
+        row0 = rb * self.TM  # first row of the block in the chunk
+        trow0 = j * self.C + row0  # ... in the sequence
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        p1_bytes = (cute.size_in_bytes(BFloat16, cute.slice_(a1_layout, (None, None, 0)))
+                    + cute.size_in_bytes(BFloat16, cute.slice_(b1_layout, (None, None, 0))))
+        cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.threads // 32)
+        p1 = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.p1_mbar.data_ptr(), num_stages=self.p1_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), consumer_group=cons_group,
+            tx_count=p1_bytes, cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)), defer_sync=True)
+        p2s_bytes = cute.size_in_bytes(BFloat16, cute.slice_(b2s_layout, (None, None, 0)))
+        p2 = pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.p2_mbar.data_ptr(), num_stages=self.p2_stages,
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread), consumer_group=cons_group,
+            tx_count=p2s_bytes, cta_layout_vmnk=cute.make_layout((1, 1, 1, 1)), defer_sync=True)
+        pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+        sA1 = storage.sA1.get_tensor(a1_layout.outer, swizzle=a1_layout.inner)
+        sB1 = storage.sB1.get_tensor(b1_layout.outer, swizzle=b1_layout.inner)
+        sP = storage.sP.get_tensor(p_layout.outer, swizzle=p_layout.inner)
+        sB2s = storage.sB2.get_tensor(b2s_layout.outer, swizzle=b2s_layout.inner)
+        sB2v = cute.make_tensor(cute.recast_ptr(sB2s.iterator, b2v_layout.inner, dtype=BFloat16), b2v_layout.outer)
+
+        wg = cute.arch.make_warp_uniform(tidx // 128)
+        wg_sel = cute.make_layout(2, stride=128)(wg)
+        wg1, wgs, wgv = mma1.get_slice(wg_sel), mma_s.get_slice(wg_sel), mma_v.get_slice(wg_sel)
+        tCrA1 = mma1.make_fragment_A(wg1.partition_A(sA1))
+        tCrB1 = mma1.make_fragment_B(wg1.partition_B(sB1))
+        tCrP_s = mma_s.make_fragment_A(wgs.partition_A(sP))
+        tCrB2s = mma_s.make_fragment_B(wgs.partition_B(sB2s))
+        tCrP_v = mma_v.make_fragment_A(wgv.partition_A(sP))
+        tCrB2v = mma_v.make_fragment_B(wgv.partition_B(sB2v))
+        acc = cute.make_rmem_tensor(wg1.partition_shape_C((self.TM, self.NS)), Float32)
+        acc_v = cute.make_rmem_tensor(wgv.partition_shape_C((self.TM, self.NV)), Float32)
+        tCc = mma1.get_slice(tidx).partition_C(cute.make_identity_tensor((self.TM, self.NS)))
+        tCcv = mma_v.get_slice(tidx).partition_C(cute.make_identity_tensor((self.TM, self.NV)))
+        pipeline_init_wait(cluster_shape_mn=(1, 1))
+
+        if row0 + self.TM <= lo:
+            # every row dropped: zero gradients
+            for e in cutlass.range_constexpr(cute.size(acc)):
+                r, cc = tCc[e]
+                mDK[trow0 + r, cc, k, b] = BFloat16(0.0)
+                mDQK[trow0 + r, cc, k, b] = BFloat16(0.0)
+            for vt in cutlass.range(self.n_vt, unroll=1):
+                for e in cutlass.range_constexpr(cute.size(acc_v)):
+                    r, cc = tCcv[e]
+                    mDV[trow0 + r, vt * self.NV + cc, k, b] = BFloat16(0.0)
+        else:
+            # ---- dP^T = [qk | v] [dA | dB]^T over the feature blocks ----
+            prod1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.p1_stages)
+            if warp == 0:
+                for _ in cutlass.range(min(self.p1_stages, self.f_blocks), unroll=1):
+                    self._load1(p1, prod1, tma_qk, mQK, tma_v, mV, tma_da, mDA, tma_db, mDB, sA1, sB1, trow0, k, b, mem)
+                    prod1.advance()
+            cons1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.p1_stages)
+            rel1 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.p1_stages)
+            mma1.set(warpgroup.Field.ACCUMULATE, False)
+            for f in cutlass.range(self.f_blocks, unroll=1):
+                p1.consumer_wait(cons1)
+                warpgroup.fence()
+                for kb in cutlass.range(cute.size(tCrA1, mode=[2]), unroll_full=True):
+                    cute.gemm(mma1, acc, tCrA1[(None, None, kb, cons1.index)], tCrB1[(None, None, kb, cons1.index)], acc)
+                    mma1.set(warpgroup.Field.ACCUMULATE, True)
+                warpgroup.commit_group()
+                cons1.advance()
+                if f > 0:
+                    warpgroup.wait_group(1)
+                    p1.consumer_release(rel1)
+                    rel1.advance()
+                    if warp == 0 and prod1.count < self.f_blocks:
+                        self._load1(p1, prod1, tma_qk, mQK, tma_v, mV, tma_da, mDA, tma_db, mDB, sA1, sB1, trow0, k, b, mem)
+                        prod1.advance()
+            warpgroup.wait_group(0)
+            # the first dA blocks of dqk start loading while the elementwise part runs
+            prod2 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.p2_stages)
+            if warp == 0:
+                for _ in cutlass.range(min(self.p2_stages, self.s_blocks), unroll=1):
+                    self._load2(p2, prod2, tma_das, mDAs, sB2s, Int32(0), mem)
+                    prod2.advance()
+
+            # ---- P^T, dk = P^T (dP^T - delta + dlse), P^T (bf16) into shared memory ----
+            rP = cute.make_rmem_tensor_like(acc, BFloat16)
+            for e in cutlass.range_constexpr(cute.size(acc)):
+                r, cc = tCc[e]
+                keep = row0 + r >= lo
+                x = BFloat16(mK[trow0 + r, cc, k, b]).to(Float32)
+                p = cute.math.exp2(x * LOG2E - Float32(mLse2[cc, j, k, b]), fastmath=True)
+                p = Float32(cutlass.select_(keep, p, Float32(0.0)))
+                g = acc[e] - Float32(mDelta[cc, j, k, b]) + Float32(mDlse[cc, j, k, b])
+                mDK[trow0 + r, cc, k, b] = (p * g).to(BFloat16)
+                rP[e] = p.to(BFloat16)
+            copy_p = cute.make_tiled_copy_C(cute.make_copy_atom(cute.nvgpu.warp.StMatrix8x8x16bOp(False, 4), BFloat16), mma1)
+            thr_p = copy_p.get_slice(tidx)
+            cute.copy(copy_p, thr_p.retile(rP), thr_p.partition_D(cute.slice_(sP, (None, None, 0))))
+            cute.arch.fence_proxy("async.shared", space="cta")
+            pipeline.sync(barrier_id=2)
+
+            # ---- dqk = P^T dA ----
+            cons2 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.p2_stages)
+            rel2 = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.p2_stages)
+            kpb = cute.size(tCrB2s, mode=[2])  # mma K steps per 64-row s block
+            mma_s.set(warpgroup.Field.ACCUMULATE, False)
+            for sbk in cutlass.range(self.s_blocks, unroll=1):
+                p2.consumer_wait(cons2)
+                warpgroup.fence()
+                for kb in cutlass.range(kpb, unroll_full=True):
+                    cute.gemm(mma_s, acc, tCrP_s[(None, None, sbk * kpb + kb, 0)], tCrB2s[(None, None, kb, cons2.index)], acc)
+                    mma_s.set(warpgroup.Field.ACCUMULATE, True)
+                warpgroup.commit_group()
+                cons2.advance()
+                if sbk > 0:
+                    warpgroup.wait_group(1)
+                    p2.consumer_release(rel2)
+                    rel2.advance()
+                    if warp == 0 and prod2.count < self.s_blocks:
+                        self._load2(p2, prod2, tma_das, mDAs, sB2s, Int32(0), mem)
+                        prod2.advance()
+            warpgroup.wait_group(0)
+            p2.consumer_release(rel2)
+            rel2.advance()
+            for e in cutlass.range_constexpr(cute.size(acc)):
+                r, cc = tCc[e]
+                mDQK[trow0 + r, cc, k, b] = acc[e].to(BFloat16)
+
+            # ---- dv = P^T dB, one NV-wide tile at a time ----
+            n2 = self.n_vt * self.s_blocks
+            base = prod2.count
+            if warp == 0:
+                for i in cutlass.range(min(self.p2_stages, n2), unroll=1):
+                    self._load2v(p2, prod2, tma_dbv, mDBv, sB2v, (prod2.count - base) // self.s_blocks,
+                                 (prod2.count - base) % self.s_blocks, mem)
+                    prod2.advance()
+            kpv = cute.size(tCrB2v, mode=[2])
+            for vt in cutlass.range(self.n_vt, unroll=1):
+                mma_v.set(warpgroup.Field.ACCUMULATE, False)
+                for sbk in cutlass.range(self.s_blocks, unroll=1):
+                    p2.consumer_wait(cons2)
+                    warpgroup.fence()
+                    for kb in cutlass.range(kpv, unroll_full=True):
+                        cute.gemm(mma_v, acc_v, tCrP_v[(None, None, sbk * kpv + kb, 0)], tCrB2v[(None, None, kb, cons2.index)], acc_v)
+                        mma_v.set(warpgroup.Field.ACCUMULATE, True)
+                    warpgroup.commit_group()
+                    cons2.advance()
+                    warpgroup.wait_group(0)
+                    p2.consumer_release(rel2)
+                    rel2.advance()
+                    if warp == 0 and prod2.count - base < n2:
+                        self._load2v(p2, prod2, tma_dbv, mDBv, sB2v, (prod2.count - base) // self.s_blocks,
+                                     (prod2.count - base) % self.s_blocks, mem)
+                        prod2.advance()
+                for e in cutlass.range_constexpr(cute.size(acc_v)):
+                    r, cc = tCcv[e]
+                    mDV[trow0 + r, vt * self.NV + cc, k, b] = acc_v[e].to(BFloat16)
+
+    @cute.jit
+    def _load1(self, p1, prod, tma_qk: cute.CopyAtom, mQK: cute.Tensor, tma_v: cute.CopyAtom, mV: cute.Tensor,
+               tma_da: cute.CopyAtom, mDA: cute.Tensor, tma_db: cute.CopyAtom, mDB: cute.Tensor, sA1: cute.Tensor,
+               sB1: cute.Tensor, trow0: Int32, k: Int32, b: Int32, mem: Int32):
+        """Feature block prod.count of [qk | v] (rows of the block) and of [dA | dB] into stage prod.index."""
+        f = prod.count
+        p1.producer_acquire(prod)
+        bar = p1.producer_get_barrier(prod)
+        sa = cute.group_modes(sA1, 0, 2)
+        sb = cute.group_modes(sB1, 0, 2)
+        rblk = trow0 // self.TM
+        if f < self.s_blocks:
+            ga = cute.group_modes(cute.local_tile(mQK[None, None, k, b], (self.TM, self.KB), (rblk, f)), 0, 2)
+            tsa, tga = cpasync.tma_partition(tma_qk, 0, cute.make_layout(1), sa, ga)
+            cute.copy(tma_qk, tga, tsa[(None, prod.index)], tma_bar_ptr=bar)
+            gb = cute.group_modes(cute.local_tile(mDA[None, None, mem], (self.NS, self.KB), (0, f)), 0, 2)
+            tsb, tgb = cpasync.tma_partition(tma_da, 0, cute.make_layout(1), sb, gb)
+            cute.copy(tma_da, tgb, tsb[(None, prod.index)], tma_bar_ptr=bar)
+        else:
+            fv = f - self.s_blocks
+            ga = cute.group_modes(cute.local_tile(mV[None, None, k, b], (self.TM, self.KB), (rblk, fv)), 0, 2)
+            tsa, tga = cpasync.tma_partition(tma_v, 0, cute.make_layout(1), sa, ga)
+            cute.copy(tma_v, tga, tsa[(None, prod.index)], tma_bar_ptr=bar)
+            gb = cute.group_modes(cute.local_tile(mDB[None, None, mem], (self.NS, self.KB), (0, fv)), 0, 2)
+            tsb, tgb = cpasync.tma_partition(tma_db, 0, cute.make_layout(1), sb, gb)
+            cute.copy(tma_db, tgb, tsb[(None, prod.index)], tma_bar_ptr=bar)
+        p1.producer_commit(prod)
+
+    @cute.jit
+    def _load2(self, p2, prod, tma_das: cute.CopyAtom, mDAs: cute.Tensor, sB2s: cute.Tensor, nt: Int32, mem: Int32):
+        """s block prod.count of dA (MN-major, N = feature) into stage prod.index."""
+        p2.producer_acquire(prod)
+        gb = cute.group_modes(cute.local_tile(mDAs[None, None, mem], (self.NS, self.KB), (nt, prod.count)), 0, 2)
+        tsb, tgb = cpasync.tma_partition(tma_das, 0, cute.make_layout(1), cute.group_modes(sB2s, 0, 2), gb)
+        cute.copy(tma_das, tgb, tsb[(None, prod.index)], tma_bar_ptr=p2.producer_get_barrier(prod))
+        p2.producer_commit(prod)
+
+    @cute.jit
+    def _load2v(self, p2, prod, tma_dbv: cute.CopyAtom, mDBv: cute.Tensor, sB2v: cute.Tensor, vt: Int32, sbk: Int32,
+                mem: Int32):
+        """s block sbk of the v tile vt of dB (MN-major) into stage prod.index."""
+        p2.producer_acquire(prod)
+        gb = cute.group_modes(cute.local_tile(mDBv[None, None, mem], (self.NV, self.KB), (vt, sbk)), 0, 2)
+        tsb, tgb = cpasync.tma_partition(tma_dbv, 0, cute.make_layout(1), cute.group_modes(sB2v, 0, 2), gb)
+        cute.copy(tma_dbv, tgb, tsb[(None, prod.index)], tma_bar_ptr=p2.producer_get_barrier(prod))
+        p2.producer_commit(prod)

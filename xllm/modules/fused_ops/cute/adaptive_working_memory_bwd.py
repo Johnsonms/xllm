@@ -1191,6 +1191,27 @@ def _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V
     dv[:, :nu * C] = back(torch.bmm(pt.transpose(1, 2), dB), V)
 
 
+def _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg):
+    """AwmChunkBwd on Hopper (AwmChunkBwdSm90): rows of each update chunk outside the segment of its last row drop."""
+    B, L = k.shape[0], k.shape[1]
+    nu = w["nu"]
+    dev = k.device
+    fwd = _fwd_mod()
+    lse2 = fwd._lse2_of(w["part"], 0, nu)
+    if has_seg:
+        sg = w["seg"][:, :nu * C].view(B, nu, C)
+        lo = (C - (sg == sg[:, :, -1:]).sum(-1)).to(torch.int32)
+    else:
+        lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
+    sm90 = fwd._sm90()
+    f = _compiled(("chunkb90", K, S, V, C), lambda: sm90.AwmChunkBwdSm90(K, S, V, C), lambda: (
+        *[_fake(BFloat16) for _ in range(5)], _fake(Float32), _fake(Float32), _fake(Float32), _fake(Int32, 4),
+        *[_fake(BFloat16) for _ in range(3)], *([Int32(0)] * 3)))
+    f(k.reshape(-1), qk.reshape(-1), v.reshape(-1), dA16.reshape(-1), dB16.reshape(-1), lse2.reshape(-1),
+      delta.contiguous().reshape(-1), dlse.contiguous().reshape(-1), lo.reshape(-1), dk.reshape(-1), dqk.reshape(-1),
+      dv.reshape(-1), B, L, nu)
+
+
 def _phase3_bwd(dout, q, w, H, K, S, V, C, has_prev, has_seg):
     """dq [B, L, H, S] (bf16), the output row mask [B, L] and dMo [B, K, nc, S, V] (fp32) from dOut and q
     ([B, L, H, *], contiguous) and the forward workspaces ``w`` (_phases12 with save)."""
@@ -1277,7 +1298,10 @@ def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
         _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
     f_zero(dqk.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L)  # the last chunk has no update
     if w["nu"] > 0 and _is_hopper(dev):
-        _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
+        if _fwd_mod()._AWM_SM90_CUBLAS or min(S, 256) != min(V, 256):
+            _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
+        else:
+            _chunk_bwd_sm90(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
     elif w["nu"] > 0:
         f = _compiled(("chunkb", K, S, V, C, w["R_splits"], has_seg), lambda: AwmChunkBwd(K, S, V, C, w["R_splits"], has_seg),
                       lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32),
