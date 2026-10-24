@@ -9,6 +9,8 @@ from xllm_extension.ops import (
     attention_bwd,
     multiseg_attention_fwd
 )
+import xllm_extension.ops as _xllm_ops
+_MULTISEG_FWD_OUT = getattr(_xllm_ops, "multiseg_attention_fwd_out", None)  # older builds: copy instead
 try:
     from xattn.ops import (
         flash_sca_fwd,
@@ -173,6 +175,14 @@ def _sequential_sliding_chunk_attention_fwd(
             v = repeat(v, 'b l h d -> b l (h n) d', n=n_rep)
         # y: [bsz, chunk_size, nheads, vdim]
         # w: [bsz, nheads, chunk_size, 2*chunk_size]
+        if q_idx is not None and save_attention_matrix and _MULTISEG_FWD_OUT is not None:
+            # the probabilities go straight into their chunk-major slot of attn_w (no copy)
+            w_shape = (bsz, n_heads, q.shape[1], k.shape[1])
+            n_w = w_shape[0] * w_shape[1] * w_shape[2] * w_shape[3]
+            y = _MULTISEG_FWD_OUT(q, k, v, q_idx, k_idx, scale, dropout, True, attn_w[w_off:w_off + n_w].view(w_shape))
+            w_off += n_w
+            out[:, qbos:eos] = y
+            continue
         if q_idx is None:
             y, w = attention_fwd(q, k, v, scale, dropout, True)
         else:

@@ -39,6 +39,17 @@ std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionCUDAFwd(
     const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
     double scale, double dropout, bool use_causal_mask);
 
+// as MultiSegAttentionFwd, writing the attention probabilities into w (contiguous [B, N, L1, L2], dtype of v)
+torch::Tensor MultiSegAttentionFwdOut(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w);
+
+torch::Tensor MultiSegAttentionCUDAFwdOut(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w);
+
 void DefineMultiSegAttentionOp(py::module& m);
 
 

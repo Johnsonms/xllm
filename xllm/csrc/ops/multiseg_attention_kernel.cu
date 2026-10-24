@@ -93,10 +93,23 @@ void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k
   const int64_t outer_size = L1;
   const int64_t inner_size = L2;
   if (dropout == 0.0) {
-    DISPATCH_ATTENTION_SOFTMAX_CUDA_KERNEL(
-        softmax::MultiSegAttentionSoftmaxFwdKernel, T, T_ACC,
-        dim3(outer_size, batch_size), inner_size, kShmSize, cuda_stream,
-        outer_size, inner_size, N, use_causal_mask, w_data, w_data, q_segment_idx_data, k_segment_idx_data);
+    // 256 threads per row for long rows (several 16-byte vectors per thread): more rows in flight than the shared
+    // dispatch's 1024-thread blocks, whose two block reductions per row made the kernel latency-bound
+    const dim3 grid(outer_size, batch_size);
+    if (inner_size > 2048 && inner_size <= 4096) {
+      cuda_utils::LaunchKernel(softmax::MultiSegAttentionSoftmaxFwdKernelV2<T, T_ACC, 4096, 256>, grid, 256, kShmSize,
+                               cuda_stream, outer_size, inner_size, N, use_causal_mask, w_data, w_data,
+                               q_segment_idx_data, k_segment_idx_data);
+    } else if (inner_size > 4096 && inner_size <= 8192) {
+      cuda_utils::LaunchKernel(softmax::MultiSegAttentionSoftmaxFwdKernelV2<T, T_ACC, 8192, 256>, grid, 256, kShmSize,
+                               cuda_stream, outer_size, inner_size, N, use_causal_mask, w_data, w_data,
+                               q_segment_idx_data, k_segment_idx_data);
+    } else {
+      DISPATCH_ATTENTION_SOFTMAX_CUDA_KERNEL(
+          softmax::MultiSegAttentionSoftmaxFwdKernelV2, T, T_ACC,
+          dim3(outer_size, batch_size), inner_size, kShmSize, cuda_stream,
+          outer_size, inner_size, N, use_causal_mask, w_data, w_data, q_segment_idx_data, k_segment_idx_data);
+    }
   } else {
     const int64_t random_capacity =
         std::max(int64_t(1) << utils::CeilLog2(inner_size),
@@ -134,6 +147,30 @@ void MultiSegAttentionCUDAFwdImpl(const torch::Tensor& q, const torch::Tensor& k
 }
 
 }  // namespace
+
+torch::Tensor MultiSegAttentionCUDAFwdOut(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w) {
+  const int64_t B = q.size(0);
+  const int64_t L1 = q.size(1);
+  const int64_t L2 = k.size(1);
+  const int64_t N = q.size(2);
+  const int64_t H2 = v.size(3);
+  TORCH_CHECK(w.is_contiguous() && w.scalar_type() == v.scalar_type() && w.dim() == 4 && w.size(0) == B &&
+              w.size(1) == N && w.size(2) == L1 && w.size(3) == L2,
+              "multiseg_attention_fwd_out: w must be a contiguous [B, N, L1, L2] tensor of v's dtype");
+  torch::Tensor y = torch::empty(
+      {B, L1, N, H2}, v.options().memory_format(at::MemoryFormat::Contiguous));
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf, at::kBFloat16, q.scalar_type(), "MultiSegAttentionCUDAFwdOut", [&]() {
+        MultiSegAttentionCUDAFwdImpl<scalar_t>(
+            *(q.expect_contiguous()), *(k.expect_contiguous()),
+            *(v.expect_contiguous()),  *(q_segment_idx.expect_contiguous()),
+            *(k_segment_idx.expect_contiguous()), scale, dropout, use_causal_mask, y, w);
+      });
+  return y;
+}
 
 std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionCUDAFwd(
     const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,

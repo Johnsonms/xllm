@@ -39,8 +39,19 @@ std::tuple<torch::Tensor, torch::Tensor> MultiSegAttentionFwd(
   return MultiSegAttentionCUDAFwd(q, k, v, q_segment_idx, k_segment_idx, scale, dropout, use_causal_mask);
 }
 
+torch::Tensor MultiSegAttentionFwdOut(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& q_segment_idx, const torch::Tensor& k_segment_idx,
+    double scale, double dropout, bool use_causal_mask, torch::Tensor w) {
+  TORCH_CHECK(q.device().type() == torch::kCUDA);
+  TORCH_CHECK(k.device().type() == torch::kCUDA);
+  TORCH_CHECK(v.device().type() == torch::kCUDA);
+  return MultiSegAttentionCUDAFwdOut(q, k, v, q_segment_idx, k_segment_idx, scale, dropout, use_causal_mask, w);
+}
+
 void DefineMultiSegAttentionOp(py::module& m) {
-  m.def("multiseg_attention_fwd", &MultiSegAttentionFwd, "MultiSegAttentionFwd");
+  m.def("multiseg_attention_fwd", &MultiSegAttentionFwd, "MultiSegAttentionFwd")
+      .def("multiseg_attention_fwd_out", &MultiSegAttentionFwdOut, "MultiSegAttentionFwdOut");
 }
 
 
