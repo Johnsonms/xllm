@@ -51,8 +51,15 @@ Every item below is one commit on `hopper-kernels` with its numbers in the messa
 | CE row kernels (`cute/cross_entropy.py`, MP 1) | 2b4e274 | CE 43 -> 25 ms; step 660 -> 644 |
 | group norm backward in CuTe, fused gamma/beta | 652077e | norm 42 -> 32 ms; steady ~630 -> ~620 |
 | CE grad_input GEMM from the bf16 scores (was tf32 on fp32 scores + fp32 weight copy; same error after the bf16 rounding of grad_input) | 474ec48 | 581 -> 246 us per chunk; step 570 -> 562 ms |
+| FFN residual gradient added in the layer norm backward's epilogue | d8c8404 | step 562.2 -> 560.9 ms |
+| SwiGLU FFN through quack's gated GEMMs (`gemm_gated` fwd over [w1; w3], `gemm_dgated` for the fc2 input gradient; optional, used when `quack-kernels` is installed, `XLLM_QUACK_FFN=0` off) | 8e93fb7 | FFN fwd+bwd/layer 0.9B 5613 -> 5148 us, 4B 5209 -> 4889, 7.1B equal; step 561 -> 542 ms; 8 GPUs 4B 536 -> 529 |
+| fused linear cross entropy through quack's scaled-exp path on sm_90 (scores never written, dw in fp32; `XLLM_QUACK_CE=0` off) | c59b2cc | unchanged at the harness vocab (32000); with the llama3 vocab (128256) step 606 -> 585 ms |
 | AWM reverse recurrence on warp MMAs (`AwmRecurrenceBwdWarp`) | d713534 | replaces the torch recurrence backward |
 | xattn varlen hdim-256 backward with the 2-stage pipeline (xattn patch, below) | not in xllm | xattn EOS bwd 4.8 -> 3.9 ms/layer; step 585 -> 570 ms (12-step means) |
+
+`quack-kernels` 0.6.5 (Dao-AILab, Apache-2.0, CuTe DSL) is already in this venv from PyPI; the two quack paths are
+imported lazily and fall back to the previous code when it is missing. The harness takes `VOCAB=<n>` (default 32000,
+the B200 harness value); the llama3 tokenizer in `xllm/data` has 128256 entries, where cross entropy is ~4x larger.
 
 All fused kernels have torch / extension fallbacks behind env switches (`XLLM_ROPE_TORCH`, `XLLM_SOFTMAX_BWD_TORCH`,
 `XLLM_SWIGLU_TORCH`, `XLLM_GATE_TORCH`, `XLLM_NORM_EXT`, `XLLM_CE_TORCH`, `AWM_SM90_CUBLAS`) and tests in
@@ -142,7 +149,11 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
-- Also tried, no gain: the B200 CuTe causal conv on H100 (forward ties Triton at ~2.4 TB/s, backward slower); `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
+- Also tried, no gain: quack's plain GEMM vs cuBLAS on the projection shapes (wins on some, e.g. K=1024 accumulates
+  217 -> 170 us, loses on others); merging the q / k / v / r projections into one GEMM (forward equal, only the
+  accumulated input gradient gains ~15%, eaten by the extra copies); Triton conv backward block / warp configs (the
+  default is the best of 10); xattn varlen hdim-256 backward with BN 64 / 96 (4490 / 8162 vs 3875 us at BN 80).
+- Also tried, no gain (earlier): the B200 CuTe causal conv on H100 (forward ties Triton at ~2.4 TB/s, backward slower); `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
   more forward work); FLA conv backend (conv 26 -> 44 ms).
 
 ## 6. Open items / next

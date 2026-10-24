@@ -21,7 +21,7 @@ from xllm.optim import build_optimizer
 from xllm.utils import clip_grad_norm_
 from xllm.config import OptimConf
 from xllm.configuration import ConfStore
-class Tok: bos_id, eos_id, pad_id, vocab_size, n_words = 1, 2, 0, 32000, 32000
+class Tok: bos_id, eos_id, pad_id, vocab_size, n_words = 1, 2, 0, int(os.environ.get("VOCAB", "32000")), int(os.environ.get("VOCAB", "32000"))
 cfg = ConfStore[preset]; cfg.vocab_size = Tok.vocab_size; cfg.fused_block = True
 cfg.awm_backend = os.environ.get("AWM_BACKEND", "cute"); cfg.timenorm_backend = os.environ.get("TN_BACKEND", "cub")
 for k, v in os.environ.items():
@@ -53,7 +53,7 @@ def step(prof=None):
 res = []
 for s in range(steps):
     if s == int(os.environ.get("PROF_STEP", steps - 1)) and rank == 0:
-        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU], with_stack=bool(int(os.environ.get("WITH_STACK", "0")))) as prof:
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU], with_stack=bool(int(os.environ.get("WITH_STACK", "0"))), record_shapes=bool(int(os.environ.get("RECORD_SHAPES", "0")))) as prof:
             r = step(); torch.cuda.synchronize()
         prof.export_chrome_trace(os.environ.get("TRACE_OUT", f"fsdp_{preset}_w{world}.json"))
     else:
