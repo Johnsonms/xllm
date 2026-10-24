@@ -1115,9 +1115,11 @@ def timestep_decay_norm_fwd(
 class TimestepDecayNormBwd(TimestepDecayNormFwd):
 
     def __init__(self, dtype, w_dtype, s_dtype, hidden, num_groups, has_bos, has_pad,
-                 groups_per_tile, tile_len, num_threads, prefetch, lag, min_ctas_per_sm=0, vec_mult=1):
+                 groups_per_tile, tile_len, num_threads, prefetch, lag, min_ctas_per_sm=0, vec_mult=1, accumulate=False):
         super().__init__(dtype, w_dtype, s_dtype, hidden, num_groups, has_bos, has_pad,
                          groups_per_tile, tile_len, num_threads, prefetch, lag, min_ctas_per_sm, vec_mult)
+        # accumulate: dx tiles leave through TMA reduce-add stores into dx (which holds a residual gradient)
+        self.accumulate = accumulate
         # two resolve warps take alternate tiles (the look-back latency of one overlaps the other); the
         # aggregate -> resolve hand-off then needs an even number of buffers so that each resolve warp
         # owns its own barrier ids
@@ -1165,7 +1167,8 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
         tile = (1, self.T, self.W)
         tma_x, mXt = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), cute.make_tensor(tX.iterator, xy_layout), tile_smem, tile)
         tma_dy, mDyt = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), cute.make_tensor(tDy.iterator, xy_layout), tile_smem, tile)
-        tma_dx, mDxt = cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileS2GOp(), cute.make_tensor(tDx.iterator, xy_layout), tile_smem, tile)
+        dx_op = cpasync.CopyReduceBulkTensorTileS2GOp() if cutlass.const_expr(self.accumulate) else cpasync.CopyBulkTensorTileS2GOp()
+        tma_dx, mDxt = cpasync.make_tiled_tma_atom(dx_op, cute.make_tensor(tDx.iterator, xy_layout), tile_smem, tile)
         self.kernel(
             tma_x, mXt, tma_dy, mDyt, tma_dx, mDxt,
             tBos.iterator, tPad.iterator, tMeanGrad.iterator, tVarGrad.iterator, tCumMean.iterator, tCumRstd.iterator,
@@ -1762,11 +1765,13 @@ def timestep_decay_norm_bwd(
     beta2: float,
     config: Optional[Tuple[int, int, int, int, int, int, int]] = None,
     prev_count: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
 ):
     """Returns (x_grad, prev_mean_grad, prev_var_grad, gamma_grad, beta_grad).
 
     ``step_count`` is the per-step count returned by the forward pass; when it is not at hand it is
-    recomputed from ``prev_count`` and the masks."""
+    recomputed from ``prev_count`` and the masks. With ``residual`` (contiguous, x's shape and dtype) the dx tiles
+    are reduce-added into it by the TMA stores and x_grad is ``residual`` itself (overwritten with residual + dx)."""
     B, L, H = x.shape
     if step_count is None:
         step_count = step_counts(bos_mask, padding_mask, prev_count, L)
@@ -1785,7 +1790,10 @@ def timestep_decay_norm_bwd(
     num_tiles = B * (G // gt) * num_segs
     num_ctas = min(num_tiles, _sm_count(x.device.index) * ctas_per_sm)
 
-    x_grad = torch.empty_like(x)
+    accumulate = residual is not None
+    if accumulate:
+        assert residual.shape == x.shape and residual.dtype == x.dtype and residual.is_contiguous()
+    x_grad = residual if accumulate else torch.empty_like(x)
     prev_mean_grad = torch.empty_like(mean_grad)
     prev_var_grad = torch.empty_like(var_grad)
     zero_count = _zeros_int64(x.device, B)
@@ -1797,7 +1805,8 @@ def timestep_decay_norm_bwd(
 
     has_bos = bos_mask is not None
     has_pad = padding_mask is not None
-    key = (x.dtype, gamma.dtype, mean_grad.dtype, H, G, has_bos, has_pad, gt, tile_len, nt, prefetch, lag, ctas_per_sm, vec_mult)
+    key = (x.dtype, gamma.dtype, mean_grad.dtype, H, G, has_bos, has_pad, gt, tile_len, nt, prefetch, lag, ctas_per_sm, vec_mult,
+           accumulate)
     dummy = ws.view(torch.uint8)
     tensors = [
         x, y_grad, bos_mask.view(torch.uint8) if has_bos else dummy, padding_mask.view(torch.uint8) if has_pad else dummy,
@@ -1810,7 +1819,7 @@ def timestep_decay_norm_bwd(
         fakes = [_fake(TORCH2CUTE.get(t.dtype, dtypes.get(t.dtype)), al) for t, al in zip(tensors, aligns)]
         op = TimestepDecayNormBwd(
             TORCH2CUTE[x.dtype], TORCH2CUTE[gamma.dtype], TORCH2CUTE[mean_grad.dtype],
-            H, G, has_bos, has_pad, gt, tile_len, nt, prefetch, lag, ctas_per_sm, vec_mult,
+            H, G, has_bos, has_pad, gt, tile_len, nt, prefetch, lag, ctas_per_sm, vec_mult, accumulate,
         )
         _COMPILED_BWD[key] = cute.compile(
             op, *fakes, Int32(0), Int32(0), Int32(0), Float32(0.0), Float32(0.0), Int32(0),

@@ -151,6 +151,27 @@ def test_backward_matches_autograd(B, L, H, G, dtype, bos_ratio, pad_ratio, reco
         assert rel_err(out, leaf.grad) < tol
 
 
+@pytest.mark.parametrize("B,L,H,G,dtype,bos_ratio,pad_ratio", [BWD_CASES[0], BWD_CASES[2], BWD_CASES[4]])
+def test_backward_residual_accumulate(B, L, H, G, dtype, bos_ratio, pad_ratio):
+    """residual=: dx reduce-added into the residual gradient by the TMA stores (x_grad is the residual tensor)."""
+    x, bos, pc, pm, pv, w, b, pad = make_inputs(B, L, H, G, dtype, bos_ratio, pad_ratio)
+    _, _, _, _, cummean, cumrstd, step_count = tsdn.timestep_decay_norm_fwd(
+        x, bos, pc, pm, pv, w, b, pad, G, BETA1, BETA2, EPS)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    dy = torch.randn(B, L, H, device="cuda", generator=g).to(dtype)
+    mean_grad = torch.randn(B, G, device="cuda", generator=g).to(dtype)
+    var_grad = torch.randn(B, G, device="cuda", generator=g).to(dtype)
+    res = torch.randn(B, L, H, device="cuda", generator=g).to(dtype)
+    args = (dy, mean_grad, var_grad, x, bos, cummean, cumrstd, step_count, w, pad, G, BETA1, BETA2)
+    ref = tsdn.timestep_decay_norm_bwd(*args, prev_count=pc)
+    acc = res.clone()
+    got = tsdn.timestep_decay_norm_bwd(*args, prev_count=pc, residual=acc)
+    assert got[0] is acc
+    torch.testing.assert_close(got[0], (ref[0] + res).to(dtype), rtol=0, atol=0)  # same bf16 / fp32 add as torch
+    for a, r in zip(got[1:], ref[1:]):  # gamma / beta gradients come from atomics: not bitwise reproducible
+        torch.testing.assert_close(a, r, rtol=1e-3, atol=1e-3)
+
+
 def test_step_counts_match_forward():
     x, bos, pc, pm, pv, w, b, pad = make_inputs(3, 2000, 256, 4, torch.float32, 0.01, 0.05)
     step_count = tsdn.timestep_decay_norm_fwd(x, bos, pc, pm, pv, w, b, pad, 4, BETA1, BETA2, EPS)[6]

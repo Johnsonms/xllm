@@ -1069,9 +1069,11 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_tsn.wait()
             tsn_mean_grad, tsn_var_grad = torch.unbind(mean_var_grad, dim=2)
 
+        # the residual connection's gradient is accumulated by the norm backward (residual_grad is dead afterwards)
         x_grad, prev_mean_grad, prev_var_grad, timenorm_w_grad, timenorm_b_grad = timenorm_bwd(
             mx_grad, tsn_mean_grad, tsn_var_grad, x, bos_mask_curr, prev_count, prev_mean, cummean, cumrstd,
-            timenorm_w, timenorm_b, timenorm_local_groups, timenorm_beta1, timenorm_beta2, timenorm_eps, False, timenorm_backend
+            timenorm_w, timenorm_b, timenorm_local_groups, timenorm_beta1, timenorm_beta2, timenorm_eps, False, timenorm_backend,
+            residual=residual_grad,
         )
 
         if recv_from_prev:
@@ -1079,8 +1081,6 @@ class GekkoBlockFunction(torch.autograd.Function):
         else:
             handle1 = None
 
-        # residual connection
-        x_grad = torch.add(x_grad, residual_grad, out=x_grad)
         wr_grad = torch.mm(rmx_grad.t(), mx_flat)
         br_grad = None if br is None else rmx_grad.sum(dim=0)
         wq_grad = torch.mm(xq_grad.t(), mx_flat)
