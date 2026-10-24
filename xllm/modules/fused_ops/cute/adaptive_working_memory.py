@@ -31,6 +31,7 @@ bf16, L = 16384, chunk 4096, with segment_idx, B200 (GPU time per call vs the Py
 
 import math
 import os
+import weakref
 from functools import lru_cache
 from typing import Tuple
 
@@ -1240,6 +1241,45 @@ class AwmAToBf16:
             cute.make_tensor((pA16 + (row * self.S + col)).align(16), cute.make_layout(8)).store(x.to(BFloat16))
 
 
+class AwmLse2:
+    """lse2[b, k, u, s] = mm + log2(sum_r l_r exp2(m_r - mm)), mm = max_r m_r: the combined base-2 log normalizer of
+    the R partials (m, l) of part [B, K, nu_all, R, S, 2] for updates j_off .. j_off + nu - 1 (one thread per output;
+    the 7 torch ops of _lse2_of in one launch)."""
+
+    def __init__(self, R: int, S: int):
+        self.R, self.S = R, S
+        self.threads = 256
+
+    @cute.jit
+    def __call__(self, tPart: cute.Tensor, tOut: cute.Tensor, total: Int32, nu: Int32, nu_all: Int32, j_off: Int32,
+                 stream: cuda.CUstream):
+        grid = (total + self.threads - 1) // self.threads
+        self.kernel(tPart.iterator, tOut.iterator, total, nu, nu_all, j_off).launch(
+            grid=[grid, 1, 1], block=[self.threads, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, pPart: cute.Pointer, pOut: cute.Pointer, total: Int32, nu: Int32, nu_all: Int32, j_off: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        i = bidx * self.threads + tidx
+        if i < total:
+            S, R = self.S, self.R
+            si = i % S
+            t = i // S
+            u = t % nu
+            bk = t // nu
+            base = (Int64(bk) * nu_all + j_off + u) * (R * S * 2) + si * 2
+            m = cute.make_rmem_tensor(cute.make_layout(R), Float32)
+            mm = Float32(-math.inf)
+            for r in cutlass.range_constexpr(R):
+                m[r] = cute.make_tensor(pPart + (base + r * S * 2), cute.make_layout(1))[0]
+                mm = cute.arch.fmax(mm, m[r])
+            acc = Float32(0.0)
+            for r in cutlass.range_constexpr(R):
+                acc = acc + cute.make_tensor(pPart + (base + r * S * 2 + 1), cute.make_layout(1))[0] * cute.math.exp2(m[r] - mm)
+            cute.make_tensor(pOut + i, cute.make_layout(1))[0] = mm + cute.math.log2(acc)
+
+
 # ======================================================================================================
 # Host side
 # ======================================================================================================
@@ -1327,10 +1367,40 @@ def _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, ha
 
 def _lse2_of(part, j_off, nu):
     """Combined base-2 lse [B, K, nu, S] of the R partials (m, l) of update chunks j_off .. j_off + nu - 1."""
-    p = part[:, :, j_off:j_off + nu]
-    m, l = p[..., 0], p[..., 1]
-    mm = m.amax(3, keepdim=True)
-    return (mm.squeeze(3) + torch.log2((l * torch.exp2(m - mm)).sum(3))).contiguous()
+    B, K, nu_all, R, S, _ = part.shape
+    if not part.is_contiguous() or os.environ.get("XLLM_AWM_LSE2_TORCH") == "1":
+        p = part[:, :, j_off:j_off + nu]
+        m, l = p[..., 0], p[..., 1]
+        mm = m.amax(3, keepdim=True)
+        return (mm.squeeze(3) + torch.log2((l * torch.exp2(m - mm)).sum(3))).contiguous()
+    out = torch.empty(B, K, nu, S, dtype=torch.float32, device=part.device)
+    f = _compiled(("lse2", R, S), lambda: AwmLse2(R, S), lambda: (_fake(Float32, 8), _fake(Float32, 4), *([Int32(0)] * 4)))
+    f(part.reshape(-1), out.reshape(-1), out.numel(), nu, nu_all, j_off)
+    return out
+
+
+_SEG_BOUNDS = []  # [(weakref to seg, version, seg_off, nu, C, lo)]: the per-update row bounds, cached per step
+_HI = {}
+
+
+def _chunk_row_bounds(seg, seg_off, B, nu, C, has_seg, dev):
+    """(lo, hi) int32 [B, nu]: the rows [lo, C) of each update chunk in the segment of its last row (all rows
+    without segments). They depend on the segment ids only, so they are cached across the layers (and the
+    backward) of a step on the segment tensor object."""
+    key = (B, nu, C, dev)
+    if key not in _HI:
+        _HI[key] = torch.full((B, nu), C, dtype=torch.int32, device=dev)
+    hi = _HI[key]
+    if not has_seg:
+        return torch.zeros(B, nu, dtype=torch.int32, device=dev), hi
+    for ref, ver, off, n, c, lo in reversed(_SEG_BOUNDS):
+        if ref() is seg and ver == seg._version and off == seg_off and n == nu and c == C:
+            return lo, hi
+    sg = seg[:, seg_off:seg_off + nu * C].view(B, nu, C)
+    lo = (C - (sg == sg[:, :, -1:]).sum(-1)).to(torch.int32)
+    _SEG_BOUNDS.append((weakref.ref(seg), seg._version, seg_off, nu, C, lo))
+    del _SEG_BOUNDS[:-8]
+    return lo, hi
 
 
 def _splitk_splits(base_ctas, n_t, device):
@@ -1343,12 +1413,7 @@ def _chunk_ab_sm90(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_
     B, L = k.shape[0], k.shape[1]
     dev = k.device
     lse2 = _lse2_of(part, j_off, nu)
-    hi = torch.full((B, nu), C, dtype=torch.int32, device=dev)
-    if has_seg:
-        sg = seg[:, seg_off:seg_off + nu * C].view(B, nu, C)
-        lo = (C - (sg == sg[:, :, -1:]).sum(-1)).to(torch.int32)
-    else:
-        lo = torch.zeros(B, nu, dtype=torch.int32, device=dev)
+    lo, hi = _chunk_row_bounds(seg, seg_off, B, nu, C, has_seg, dev)
     sm90 = _sm90()
     m_blocks, n_blocks = S // 128, (S + V) // min(256, S)
     splits = _splitk_splits(B * K * nu * m_blocks * n_blocks, C // 64, dev)

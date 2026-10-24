@@ -704,6 +704,19 @@ def _is_packed_swiglu(h3: Optional[Tensor]) -> bool:
     return h3 is not None and h3.numel() == 0
 
 
+def swiglu_recompute(x: Tensor, w1: Tensor, w3: Optional[Tensor], h1: Optional[Tensor], h3: Optional[Tensor],
+                     dropout: float, swiglu: bool) -> Tuple[Tensor, Optional[Tensor]]:
+    """The backward's recompute of the FFN pre-activations not saved by the forward: with both missing on the quack
+    path, the packed [h1 | h3] from one GEMM over [w1; w3] (and the empty h3 marker), else F.linear for each."""
+    if swiglu and h1 is None and h3 is None and _quack_swiglu(x, w1, dropout):
+        return _QUACK_GEMM[2](x, torch.cat([w1, w3]).t(), concat_layout=("B",)), x.new_empty(0)
+    if h1 is None:
+        h1 = F.linear(x, w1)
+    if swiglu and h3 is None:
+        h3 = F.linear(x, w3)
+    return h1, h3
+
+
 def swiglu_forward(
     x: Tensor,
     w1: Tensor,

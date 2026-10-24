@@ -34,11 +34,13 @@ def _run(monkeypatch, quack: bool, recompute: str):
         h1 = F.linear(xf, w1)
     if recompute in ("fc3", "both"):
         h3 = F.linear(xf, w3)
+    if recompute == "helper":  # the gekko backward's recompute of both (packed on the quack path)
+        h1, h3 = utils.swiglu_recompute(xf, w1, w3, None, None, 0.0, True)
     grads = utils.swiglu_backward(dy, xf, w1, w2, w3, h1, h3, 0.0, rng, x, mean, rstd, nw, nb, 1, False, False)
     return (out,) + tuple(grads[:4])
 
 
-@pytest.mark.parametrize("recompute", ["none", "fc1", "fc3", "both"])
+@pytest.mark.parametrize("recompute", ["none", "fc1", "fc3", "both", "helper"])
 def test_quack_swiglu_ffn(monkeypatch, recompute):
     ref = _run(monkeypatch, False, recompute)
     got = _run(monkeypatch, True, recompute)
