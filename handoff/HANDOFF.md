@@ -494,6 +494,10 @@ SCA (`sliding_chunk_attention.py`):
 - `ScaBwdDkT(load_dp=True)` for V > 256: no V tile / dO blocks / dP^T MMAs, the compute warps read their key
   row of the fp32 dPcur / dPprev GEMMs per 64-query block: 7.1B dK 750 -> 485 us (kernel-path backward
   3208 -> 3055 us/layer). `ScaBwdDq` (load_dp) is the remaining old-style kernel on 7.1B (311 us).
+- `ScaBwdDqT(load_dp=True)` for V > 256 (Q in TMEM, 64-key blocks, dP columns from the GEMMs): 7.1B dQ 311 ->
+  159 us. The kernel-path dP GEMMs run per head on strided views of v / dout into dPcur [B, nc, H, C, C] and
+  dPprev [B, nc - 1, H, C, C] (the kernels index that layout), so the two ChunkMajorCopy passes are gone:
+  7.1B kernel-path backward 3394 (morning) -> 2766 us/layer; 1-GPU step 805 ms.
 - The gate kernels were instruction bound (ncu: 51 instructions per element, math-pipe throttle): with
   beta = ln 2, softplus(x) = log2(1 + 2^x) and its derivative 1 / (1 + 2^-x) (ex2 + lg2 / rcp): forward
   116 -> 79 us (0.9B), 247 -> 167 (7.1B), same numerics. The q/k prep backward with exp2 + rcp and packed
