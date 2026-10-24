@@ -174,6 +174,11 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
+- Tried and reverted (wrong): caching the quack path's [w1; w3] from the forward for the backward, keyed on the
+  weight objects' version counters. FSDP2's all-gather writes the unsharded weights (NCCL / copy-out into their
+  storage) without bumping the version, so the next step reused the previous step's weights: losses drifted from
+  step 1 (4B: 0.0002 -> 0.0025 over 7 steps). The segment-id caches (swift call layout, AWM row bounds) are safe
+  because `get_segment_idx_from_bos_mask` builds a new tensor every forward; keep that assumption in mind.
 - Also tried, no gain: keeping the FFN norm / TSDN outputs too under `XLLM_GEKKO_SAVE_QK_PREP` (8 GPUs -3 / -4 ms
   for +5 GB; slower on 1 GPU at 74 GB, allocator pressure); swift dK / dV as one beta = 1 GEMM after zeroing the new rows (2159 -> 2233 us, slower than
   the beta = 1 / beta = 0 pair); the B200 CuTe conv backward rework on H100 (232-268 vs Triton 154-166 us); quack's plain GEMM vs cuBLAS on the projection shapes (wins on some, e.g. K=1024 accumulates
