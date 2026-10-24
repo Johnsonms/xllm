@@ -160,6 +160,9 @@ quack fused cross entropy is worth 16 / 13 / 21 ms there (`XLLM_QUACK_CE=0`: 674
 - After the quack items, with the llama3 vocab (`VOCAB=128256`; reference adds `XLLM_QUACK_FFN=0 XLLM_QUACK_CE=0`):
   loss |diff| <= 0.0004, grad norms within 0.19% over 60 steps; median step 395 -> 214 ms. quack autotunes and
   compiles at its first call of a shape (first step 44 s instead of 13 s once; cached in `/tmp/<user>/quack_cache`).
+- 30-step 8-GPU gekko-4B B1 L8192, current head vs every reference path (unpatched xattn, torch AWM incl. torch lse2,
+  CUB TSDN, foreach Adam, quack / cute fused kernels off, fp32 CE dgrad): loss |diff| <= 0.0004, grad norms within
+  0.12%; median step 801 -> 553 ms.
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
