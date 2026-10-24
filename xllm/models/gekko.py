@@ -348,9 +348,16 @@ class Gekko(XLLModel):
             self.rope = None
 
         self.layers = nn.ModuleList()
+        group = cfg.fsdp_layers_per_group if cfg.ddp_backend == 'fsdp2' else 1
         for layer_id in range(self.num_layers):
             layer = GekkoBlock(cfg, layer_id)
-            self.layers.append(wrap(layer))
+            self.layers.append(wrap(layer) if group == 1 else layer)
+        if group > 1:
+            # one FSDP2 parameter group per `group` consecutive layers; layer 0 stays alone so that the two
+            # exposed collectives (first all-gather of the forward, last reduce-scatter of the backward) stay small
+            bounds = sorted({0, 1, *range(1 + group, self.num_layers, group), self.num_layers})
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                wrap(list(self.layers[a:b]))
 
         self.output = wrap(GekkoOutputLayer(cfg))
 
