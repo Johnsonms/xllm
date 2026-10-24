@@ -107,6 +107,9 @@ def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
 
 
 _SAVE_QK_PREP = os.environ.get("XLLM_GEKKO_SAVE_QK_PREP", "0") == "1"
+# opt-in (XLLM_GEKKO_SAVE_RMX=1, implied by XLLM_GEKKO_SAVE_QK_PREP): keep only the gate projection rmx for the backward
+# (one [B, L, E] bf16 tensor per layer instead of a GEMM recompute)
+_SAVE_RMX = _SAVE_QK_PREP or os.environ.get("XLLM_GEKKO_SAVE_RMX", "0") == "1"
 
 
 class GekkoBlockFunction(torch.autograd.Function):
@@ -548,7 +551,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
             *qk_prep_cache,  # xv_, xk_, xq_, sk, aqk, sq, aq (XLLM_GEKKO_SAVE_QK_PREP), else None
-            rmx if qk_prep_cache[0] is not None else None,  # the gate projection, kept with them
+            rmx if _SAVE_RMX else None,  # the gate projection (XLLM_GEKKO_SAVE_RMX / XLLM_GEKKO_SAVE_QK_PREP)
             *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
