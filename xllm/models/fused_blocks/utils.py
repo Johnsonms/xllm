@@ -642,10 +642,11 @@ def sliding_chunk_attention_bwd(
     stability_control: int,
     deterministic: bool,
     backend: str,
+    delta: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     return sca_bwd(
         y_grad, xq, xk, xv, y, aux, chunk_size, scale, prev_k, prev_v,
-        bos_mask, segment_idx, stability_control, deterministic, backend
+        bos_mask, segment_idx, stability_control, deterministic, backend, delta=delta
     )
 
 
