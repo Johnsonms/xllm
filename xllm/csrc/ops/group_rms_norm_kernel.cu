@@ -270,6 +270,85 @@ __global__ void GammaBwdSmallKernel(
   register_utils::Save<T_ACC, T, kElementsPerThread>(sum1, cur_size, gamma_grad + group_offset + j);
 }
 
+// kVec contiguous elements of T through 16-byte loads (the rows are 16-byte aligned: the dispatch checks)
+template <typename T, int kVec>
+__device__ __forceinline__ void LoadVec(const T* src, T* dst) {
+  constexpr int kBytes = sizeof(T) * kVec;
+  if constexpr (kBytes % 16 == 0) {
+#pragma unroll
+    for (int q = 0; q < kBytes / 16; ++q) {
+      reinterpret_cast<uint4*>(dst)[q] = reinterpret_cast<const uint4*>(src)[q];
+    }
+  } else {
+#pragma unroll
+    for (int k = 0; k < kVec; ++k) {
+      dst[k] = src[k];
+    }
+  }
+}
+
+// The original kernel (one channel per thread, 32 x 32 blocks over all rows): the fallback for channel counts
+// that are not a multiple of 8 or unaligned rows.
+template <typename T, typename T_ACC, bool kMemoryEfficient>
+__global__ void GammaBwdLargeKernelScalar(
+    int64_t outer_size, int64_t inner_size, const T* y_grad, const T* x_or_y,
+    const T_ACC* rstd, T* gamma_grad, const T* __restrict__ gamma) {
+
+  __shared__ T_ACC sum1_shared[cuda_utils::kWarpSize][cuda_utils::kWarpSize + 1];
+
+  const int64_t kNumGroups = gridDim.y;
+  const int64_t num_channels_per_group = inner_size / kNumGroups;
+  const int64_t group_id = blockIdx.y;
+  const int64_t group_offset = group_id * num_channels_per_group;
+  
+  // Calculate channel index with bounds checking
+  const int64_t j = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid_channel = j < num_channels_per_group;
+  
+  T_ACC sum1 = T_ACC(0);
+
+  // Use inverse of gamma for multiplication instead of division
+  T_ACC inv_w = T_ACC(1);
+
+  if (kMemoryEfficient) {
+    // Store the inverse for better performance
+    inv_w = T_ACC(1) / gamma[j + group_offset];
+  }
+
+  // Iterate over batch dimension with bounds checking
+  for (int64_t i = threadIdx.y; i < outer_size; i += blockDim.y) {
+    if (valid_channel) {
+      const T_ACC dy_acc = static_cast<T_ACC>(y_grad[i * inner_size + j + group_offset]);
+      const T_ACC v = rstd[i * kNumGroups + group_id];
+
+      if (kMemoryEfficient) {
+        const T_ACC y = static_cast<T_ACC>(x_or_y[i * inner_size + j + group_offset]);
+        // Replace division with multiplication by inverse
+        sum1 += dy_acc * (y * inv_w);
+      } else {
+        const T_ACC x_acc = static_cast<T_ACC>(x_or_y[i * inner_size + j + group_offset]);
+        sum1 += dy_acc * x_acc * v;
+      }
+    }
+  }
+
+  // Store intermediate results in shared memory
+  sum1_shared[threadIdx.x][threadIdx.y] = sum1;
+  __syncthreads();
+
+  // Transpose and reduce
+  sum1 = sum1_shared[threadIdx.y][threadIdx.x];
+  sum1 = reduce::WarpReduce(sum1, reduce::SumOp<T_ACC>());
+
+  // Write results with bounds checking
+  if (threadIdx.x == 0) {
+    const int64_t k = blockIdx.x * blockDim.x + threadIdx.y;
+    if (k < num_channels_per_group) {
+      gamma_grad[k + group_offset] = sum1;
+    }
+  }
+}
+
 // Row-split, vectorized version: a block of 32 x 8 threads covers 256 channels (8 contiguous channels per thread,
 // 16-byte loads) and the rows [z * rows_per_split, (z + 1) * rows_per_split) of split z = blockIdx.z; the 8 row
 // lanes are reduced through shared memory into partial[z, :] (fp32) and GammaBwdFinalizeKernel adds the splits.
@@ -305,8 +384,8 @@ __global__ void GammaBwdLargeKernel(
     for (int64_t i = row0 + threadIdx.y; i < row1; i += 8) {
       T dy[kVec];
       T xv[kVec];
-      *reinterpret_cast<uint4*>(dy) = *reinterpret_cast<const uint4*>(y_grad + i * inner_size + c);
-      *reinterpret_cast<uint4*>(xv) = *reinterpret_cast<const uint4*>(x_or_y + i * inner_size + c);
+      LoadVec<T, kVec>(y_grad + i * inner_size + c, dy);
+      LoadVec<T, kVec>(x_or_y + i * inner_size + c, xv);
       const T_ACC v = kMemoryEfficient ? T_ACC(1) : rstd[i * kNumGroups + group_id];
 #pragma unroll
       for (int k = 0; k < kVec; ++k) {
@@ -403,11 +482,18 @@ __global__ void GammaBwdFinalizeKernel(
         elementwise_affine, cuda_stream, __VA_ARGS__)
 
 // for now we use 2d thread blocks. Each y will handle a different group
+inline bool is_aligned16(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; }
+
 #define DISPATCH_GAMMA_BWD_CUDA_KERNEL(                                              \
     SmallKernelFunc, LargeKernelFunc, T, T_ACC, outer_size, inner_size, num_groups,  \
     channels_per_group, memory_efficient, cuda_stream, gamma_grad_ptr, ...)          \
   do {                                                                               \
-    TORCH_CHECK(channels_per_group % 8 == 0, "channels per group must be a multiple of 8"); \
+    if (channels_per_group % 8 != 0 || !is_aligned16(y_grad_data) || !is_aligned16(x_or_y_data)) { \
+      const int64_t nbx = utils::DivUp<int64_t>(channels_per_group, 32);             \
+      cuda_utils::LaunchKernel(GammaBwdLargeKernelScalar<T, T_ACC, memory_efficient>, \
+      dim3(nbx, num_groups), dim3(32, 32), 0, cuda_stream, __VA_ARGS__);             \
+      break;                                                                         \
+    }                                                                                \
     const int64_t num_blocks_x = utils::DivUp<int64_t>(inner_size, 256);             \
     const int64_t want = utils::DivUp<int64_t>(1024, num_blocks_x);                  \
     const int64_t num_splits = std::max<int64_t>(                                    \
