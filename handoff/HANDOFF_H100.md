@@ -113,9 +113,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
 
 | preset | shape | start of session | now | same batches on all ranks |
 |---|---|---|---|---|
-| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | 640 ms (xattn patch, CE) | 598 ms (before them) |
-| gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | 554 ms | 526 ms |
-| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~847 ms (swift items above) | ~823 ms |
+| gekko-0.9B | B2 L16384 | swift OOM; xattn + torch AWM 865 ms | ~608 ms | ~572 ms |
+| gekko-4B | B1 L8192 | swift OOM; xattn + torch AWM 667 ms | ~547 ms | ~530 ms |
+| gekko-7.1B (swift) | B1 L8192 | 1003 ms (L16384 OOM) | ~837 ms | ~822 ms |
 
 - Straggling (§6c finding) holds on H100 and is larger for 0.9B (14%): xattn's backward costs ~1.7x more per
   layer without segment boundaries, so ranks whose batch has fewer EOS take longer. Data balancing, not kernels.
@@ -146,6 +146,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
   loss |diff| <= 0.0005, grad norms within 0.24%; median step 322 -> 198 ms.
 - 30-step 8-GPU gekko-7.1B B1 L8192, swift items on vs `XLLM_SWIFT_QSPLIT=1 XLLM_SWIFT_SEG_SKIP=0 XLLM_SWIFT_BWD_COPY=1`:
   loss |diff| <= 0.0002, grad norms within 0.03%; median 885 -> 848 ms.
+- After the quack items, with the llama3 vocab (`VOCAB=128256`; reference adds `XLLM_QUACK_FFN=0 XLLM_QUACK_CE=0`):
+  loss |diff| <= 0.0004, grad norms within 0.19% over 60 steps; median step 395 -> 214 ms. quack autotunes and
+  compiles at its first call of a shape (first step 44 s instead of 13 s once; cached in `/tmp/<user>/quack_cache`).
 - Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
