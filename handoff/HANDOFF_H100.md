@@ -135,9 +135,14 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
   / foreach Adam via the env switches): loss |diff| <= 0.0004, grad norms within 0.3%; median step 324 -> 216 ms.
   Repeated on the merged head (B200 kernels off via `XLLM_CUTE_{CE,GATE,LN,QK,ROPE,SWIGLU}=0`): loss |diff| <= 0.0006,
   grad norms within 0.25%; median step 322 -> 202 ms.
+  Repeated after the swift / xattn / CE items (reference adds `XLLM_CE_DGRAD_FP32=1` and the unpatched xattn library):
+  loss |diff| <= 0.0005, grad norms within 0.24%; median step 322 -> 198 ms.
+- 30-step 8-GPU gekko-7.1B B1 L8192, swift items on vs `XLLM_SWIFT_QSPLIT=1 XLLM_SWIFT_SEG_SKIP=0 XLLM_SWIFT_BWD_COPY=1`:
+  loss |diff| <= 0.0002, grad norms within 0.03%; median 885 -> 848 ms.
+- Comparison script: `h100_scripts/parity_cmp.py <opt.log> <ref.log>`.
 - 1 GPU gekko-0.9B B2 L16384 (the plan's shape) fwd+bwd: swift OOM -> 1015 ms (xattn, torch AWM, CUB TSDN) ->
   ~570 ms steady now.
-- Also tried, no gain: `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
+- Also tried, no gain: the B200 CuTe causal conv on H100 (forward ties Triton at ~2.4 TB/s, backward slower); `NCCL_MAX_NCHANNELS` 4 / 8 (4B 554 -> 568-575 ms); xattn with K/V expanded to MHA (bwd -2%,
   more forward work); FLA conv backend (conv 26 -> 44 ms).
 
 ## 6. Open items / next

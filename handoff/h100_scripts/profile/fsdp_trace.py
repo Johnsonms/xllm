@@ -11,6 +11,7 @@ sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"
 preset, bsz, seq_len = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 steps = int(sys.argv[4]) if len(sys.argv) > 4 else 5
 local_rank = int(os.environ.get("LOCAL_RANK", 0)); torch.cuda.set_device(local_rank)
+if os.environ.get("SM_CARVEOUT"): torch._C._set_sm_carveout_experimental(int(os.environ["SM_CARVEOUT"]))
 from xllm.distributed import init_torch_distributed, initialize_model_parallel
 init_torch_distributed(1800); initialize_model_parallel(1, 1, 1800)
 rank, world = dist.get_rank(), dist.get_world_size()
