@@ -130,6 +130,9 @@ pairs on Hopper). Worth keeping that pattern upstream for any kernel that has to
   help (8 / 16 / 24 SMs: 554 -> 560-575 ms).
 - `reshard_after_forward=False` (keep the unsharded params until the backward) fits on 80 GB and skips the backward
   all-gathers: 4B 554 -> 536 ms (+7 GB), 7.1B ~846 -> ~819 (+12 GB), 0.9B 640 -> 635. Config, not code.
+- All three config knobs together (`FSDP_RESHARD=0 NCCL_PROTO=Simple FSDP_FP32_RS=0` in the harness) on the current
+  head: 0.9B ~606 -> ~598 ms, 4B ~547 -> ~515 (35.6 GB), 7.1B ~837 -> ~791 (61.1 GB); losses equal to 3-4 decimals
+  over 10 steps. Recommended for H100 training runs if bf16 gradient reduction is acceptable.
 - cuBLAS efficiency (plan §3.6): 7.1B shapes 755-790 TFLOPS (76-80% of dense peak), 4B ~770, 0.9B (K = 1536)
   ~680. Nothing to do kernel-side.
 
