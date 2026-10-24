@@ -1,5 +1,6 @@
 from typing import Optional, Tuple, Any
 import math
+import os
 from functools import partial
 import torch
 from torch.nn import functional as F
@@ -90,6 +91,9 @@ def _cute_gate(x: torch.Tensor, heads: int, gate: str, dropout: float) -> bool:
     except ImportError:
         return False
     return attn_gate_supported(x, heads, gate, dropout)
+
+
+_SAVE_QK_PREP = os.environ.get("XLLM_GEKKO_SAVE_QK_PREP", "0") == "1"
 
 
 class GekkoBlockFunction(torch.autograd.Function):
@@ -315,6 +319,15 @@ class GekkoBlockFunction(torch.autograd.Function):
             # apply softmax to aq
             aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
 
+        # opt-in (XLLM_GEKKO_SAVE_QK_PREP=1): keep the conv / q-k prep outputs for the backward instead of recomputing
+        # the three convs and both q / k preps there (~0.7 GB per layer at gekko-0.9B B2 L16384); cute q / k path,
+        # no conv state or pipeline neighbours
+        qk_prep_cache = (None,) * 7
+        if (_SAVE_QK_PREP and not send_to_next and not recv_from_prev and conv_state_q is None and conv_state_k is None
+                and conv_state_v is None and _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis)
+                and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)):
+            qk_prep_cache = (xv_, xk_, xq_, sk, aqk, sq, aq)
+
         if handle_prev_v is not None:
             handle_prev_v.wait()
             handle_prev_k.wait()
@@ -500,6 +513,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1 if not recompute_fc1_out else None,  # (bsz*slen, v/MP)
             h3 if not recompute_fc3_out else None,  # (bsz*slen, v/MP)
+            *qk_prep_cache,  # xv_, xk_, xq_, sk, aqk, sq, aq (XLLM_GEKKO_SAVE_QK_PREP), else None
             *awm_workspace,  # CuTe AWM forward workspaces (training case), else nothing
         )
         ctx.local_heads = local_heads
@@ -592,6 +606,7 @@ class GekkoBlockFunction(torch.autograd.Function):
             xo,  # (bsz, slen, d/MP)
             h1,  # (bsz*slen, v/MP)
             h3,  # (bsz*slen, v/MP)
+            c_xv_, c_xk_, c_xq_, c_sk, c_aqk, c_sq, c_aq,  # forward's conv / q-k prep outputs, or None
             *awm_workspace,
         ) = ctx.saved_tensors
 
@@ -709,54 +724,69 @@ class GekkoBlockFunction(torch.autograd.Function):
             handle_mx.wait()
             mx = reshape_gathered_tensor_along_specific_dim(mx, gather_dim=2)
 
-        # recompute kv
-        if xv is None:
-            assert xk is None
-            xv = F.linear(mx, wv, bv)
-            xk = F.linear(mx, wk, None)
-        xv_, _, _ = causal_conv1d_fwd(
-            xv, v_conv_w, None, conv_state_v, bos_mask_curr, False, 'silu',
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
-        xk_, _, _ = causal_conv1d_fwd(
-            xk, k_conv_w, None, conv_state_k, bos_mask_curr, False, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
-        # B x L x K x V
-        xv_ = rearrange(xv_, 'b l (k v) -> b l k v', k=local_kv_heads)
-
-        # recompute q
-        if xq is None:
-            xq = F.linear(mx, wq, None)
-        xq_, _, _ = causal_conv1d_fwd(
-            xq, q_conv_w, None, conv_state_q, bos_mask_curr, False, None,
-            causal_conv_weight_normalization, causal_conv_backend, deterministic
-        )
-
-        # B x L x K|H x S
-        akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-        cute_qk = _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)
-        if cute_qk:
-            # rmsnorm, rope and softmax from one read each of xk_ and xq_; the gradients below are fused the same way
+        if c_xv_ is not None:
+            # the forward kept the conv and q / k prep outputs (XLLM_GEKKO_SAVE_QK_PREP): no recompute
+            if xv is None:
+                assert xk is None
+                xv = F.linear(mx, wv, bv)
+                xk = F.linear(mx, wk, None)
+            if xq is None:
+                xq = F.linear(mx, wq, None)
+            xv_, xk_, xq_, sk, aqk, sq, aq = c_xv_, c_xk_, c_xq_, c_sk, c_aqk, c_sq, c_aq
+            akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+            cute_qk = True
             from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
             fc = freqs_cis if rope_head_dim > 0 else None
-            sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
-            sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
             sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
         else:
-            sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
-            sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
-            # B x L x H x S
-            sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
-            sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
-            # apply rotary embeddings
-            sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
-            aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-            # softmax for aq and aqk
-            aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
-            aqk = aqk_fp32.to(akk)
-            aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
-            aq = aq_fp32.to(aq)
+            # recompute kv
+            if xv is None:
+                assert xk is None
+                xv = F.linear(mx, wv, bv)
+                xk = F.linear(mx, wk, None)
+            xv_, _, _ = causal_conv1d_fwd(
+                xv, v_conv_w, None, conv_state_v, bos_mask_curr, False, 'silu',
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
+            xk_, _, _ = causal_conv1d_fwd(
+                xk, k_conv_w, None, conv_state_k, bos_mask_curr, False, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
+            # B x L x K x V
+            xv_ = rearrange(xv_, 'b l (k v) -> b l k v', k=local_kv_heads)
+
+            # recompute q
+            if xq is None:
+                xq = F.linear(mx, wq, None)
+            xq_, _, _ = causal_conv1d_fwd(
+                xq, q_conv_w, None, conv_state_q, bos_mask_curr, False, None,
+                causal_conv_weight_normalization, causal_conv_backend, deterministic
+            )
+
+            # B x L x K|H x S
+            akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+            cute_qk = _cute_qk(xq_, local_heads, rope_head_dim, freqs_cis) and _cute_qk(xk_, local_kv_heads, rope_head_dim, freqs_cis)
+            if cute_qk:
+                # rmsnorm, rope and softmax from one read each of xk_ and xq_; the gradients below are fused the same way
+                from xllm.modules.fused_ops.cute.qk_prep import qk_prep_fwd, qk_prep_bwd
+                fc = freqs_cis if rope_head_dim > 0 else None
+                sk, _, aqk, _ = qk_prep_fwd(xk_, local_kv_heads, None, fc, rope_head_dim, rmsnorm_eps)
+                sq, _, aq, _ = qk_prep_fwd(xq_, local_heads, qnorm_w, fc, rope_head_dim, rmsnorm_eps)
+                sk_ = sk_rstd = sq_rstd = aqk_fp32 = aq_fp32 = None
+            else:
+                sk_, sk_rstd = rmsnorm_fwd(xk_, None, local_kv_heads, rmsnorm_eps)
+                sq, sq_rstd = rmsnorm_fwd(xq_, qnorm_w, local_heads, rmsnorm_eps)
+                # B x L x H x S
+                sk = rearrange(sk_, 'b l (k s) -> b l k s', k=local_kv_heads)
+                sq = rearrange(sq, 'b l (h s) -> b l h s', h=local_heads)
+                # apply rotary embeddings
+                sq, sk = apply_ropes(sq, sk, freqs_cis, head_dim, rope_head_dim, False)
+                aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
+                # softmax for aq and aqk
+                aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
+                aqk = aqk_fp32.to(akk)
+                aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
+                aq = aq_fp32.to(aq)
 
         if send_to_next:
             memory_grad, handle_memory = recv_memory_grad_from_next(x, local_kv_heads, head_dim, v_head_dim)
