@@ -654,11 +654,12 @@ def adaptive_working_memory_fwd(
 
 
 def _cute_supported(query: Tensor, value: Tensor, chunk_size: int, ortho: bool) -> bool:
-    """Shapes handled by the CuTe DSL forward kernels (bf16, no orthogonal update, Blackwell)."""
+    """Shapes handled by the CuTe DSL forward kernels (bf16, no orthogonal update, Blackwell; on Hopper the GEMM
+    phases run on cuBLAS)."""
     S, V, L = query.shape[3], value.shape[3], query.shape[2]
     return (
         not ortho and query.dtype == torch.bfloat16 and query.is_cuda
-        and torch.cuda.get_device_capability(query.device)[0] == 10
+        and torch.cuda.get_device_capability(query.device)[0] in (9, 10)
         and S in (128, 256) and V % 64 == 0 and chunk_size % 128 == 0 and L % chunk_size == 0
     )
 

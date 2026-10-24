@@ -1277,6 +1277,59 @@ def _sm_count_of(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _is_hopper(device) -> bool:
+    """No tcgen05 below sm_100: the GEMM phases run on cuBLAS instead (bf16 operands, fp32 accumulation)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return _major_of(idx) < 10
+
+
+@lru_cache(maxsize=None)
+def _major_of(device_index: int) -> int:
+    return torch.cuda.get_device_capability(device_index)[0]
+
+
+def _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg):
+    """AwmChunkGemm on cuBLAS: P[s, t] = exp2(k[t, s] log2e - lse2[s]) (bf16, 0 on rows outside the segment of
+    the chunk's last row), AB[:, :, j_off + j] = P_j [qk_j | v_j] with fp32 accumulation."""
+    B = k.shape[0]
+    p = part[:, :, j_off:j_off + nu]  # [B, K, nu, R, S, (m, l)]
+    m, l = p[..., 0], p[..., 1]
+    mm = m.amax(3, keepdim=True)
+    lse2 = mm.squeeze(3) + torch.log2((l * torch.exp2(m - mm)).sum(3))  # [B, K, nu, S]
+    kc = k[:, :nu * C].view(B, nu, C, K, S)
+    e = torch.exp2(kc.float() * LOG2E - lse2.permute(0, 2, 1, 3).unsqueeze(2))
+    if has_seg:
+        sg = seg[:, seg_off:seg_off + nu * C].view(B, nu, C)
+        e = torch.where((sg == sg[:, :, -1:]).view(B, nu, C, 1, 1), e, 0.0)
+    pt = e.to(torch.bfloat16).permute(0, 3, 1, 4, 2).reshape(B * K * nu, S, C)
+    rhs = torch.cat([qk[:, :nu * C].view(B, nu, C, K, S), v[:, :nu * C].view(B, nu, C, K, V)], -1)
+    rhs = rhs.permute(0, 3, 1, 2, 4).reshape(B * K * nu, C, S + V)
+    AB[:, :, j_off:j_off + nu] = torch.bmm(pt, rhs, out_dtype=torch.float32).view(B, K, nu, S, S + V)
+
+
+def _out_gemm_cublas(q, MT, seg, prev_cnt, dead, seg_off, H, K, S, V, C, has_prev, has_seg, out_mask):
+    """AwmOutGemm on cuBLAS: out[b, l, h] = q[b, l, h] M_c (c = l // C, kv head h // n_rep), rows zeroed when the
+    chunk's memory is empty or the row is not in the segment the memory ends in (that of chunk c - 2)."""
+    B, L = q.shape[0], q.shape[1]
+    nc, n_rep = L // C, H // K
+    qv = q.view(B, nc, C, K, n_rep, S).permute(0, 3, 1, 4, 2, 5).reshape(B * K * nc, n_rep * C, S)
+    out = torch.bmm(qv, MT.view(B * K * nc, V, S).transpose(1, 2))
+    out = out.view(B, K, nc, n_rep, C, V).permute(0, 2, 4, 1, 3, 5).contiguous().view(B, L, H, V)
+    masked = (dead != 0).repeat_interleave(C, 1)  # [B, L]
+    if has_seg:
+        rows = seg[:, seg_off:seg_off + L]
+        idx = torch.arange(nc, device=q.device) - 2  # anchor chunk c - 2: its last row, -1 = the previous call's chunk
+        anchor = seg[:, (seg_off + idx * C + C - 1).clamp_min(0)]
+        if has_prev:  # -2: the previous segment count
+            anchor = torch.where(idx == -2, prev_cnt.view(B, 1), anchor)
+        anchor = anchor.repeat_interleave(C, 1)
+        if not has_prev:  # chunks 0 and 1 have no anchor chunk: never masked by segment
+            anchor = torch.where(torch.arange(L, device=q.device) < 2 * C, rows, anchor)
+        masked = masked | (rows != anchor)
+    out_mask.copy_(masked)
+    return out.masked_fill_(masked.view(B, L, 1, 1), 0.0), out_mask
+
+
 def _blhs(t: torch.Tensor) -> torch.Tensor:
     """[B, H, L, D] view -> [B, L, H, D] contiguous storage (free for the transposed views of the fused block)."""
     t = t.transpose(1, 2)
@@ -1314,6 +1367,9 @@ def _chunk_ab(k, qk, v, seg, part, AB, K, S, V, C, R, nu, j_off, seg_off, has_se
     f_lse = _compiled(("lse", K, S, C, R, has_seg), lambda: AwmKeyLsePart(K, S, C, R, has_seg), lambda: (
         _fake(BFloat16), _fake(Int64, 8), _fake(Float32), *([Int32(0)] * 7)))
     f_lse(k.reshape(-1), seg.reshape(-1), part.reshape(-1), B, L, nu, j_off, nu_tot, seg_off, seg_stride)
+    if _is_hopper(k.device):
+        _chunk_ab_cublas(k, qk, v, seg, part, AB, K, S, V, C, nu, j_off, seg_off, has_seg)
+        return
     _, _, n_blocks = chunk_gemm_tiling(S, V)
     base = B * K * nu * (S // 128) * n_blocks
     splits = max(1, min(C // 32, round(_sm_count(k.device) / base)))
@@ -1359,7 +1415,7 @@ def _phases12(qkey, key, value, segment_idx, prev_segment_count, memory, log_nor
     lnt_out = torch.empty(B, K, S, dtype=torch.float32, device=dev)
     dead = torch.empty(B, nc, dtype=torch.uint8, device=dev)
     # wide V: tcgen05 (few, wide CTAs); otherwise warp MMAs over more, narrower CTAs (measured on B200)
-    if V >= 1024:
+    if V >= 1024 and not _is_hopper(dev):
         rec_vt, rec_cls = 64, AwmRecurrenceUmma
     else:
         rec_vt = next((vt for vt in (64, 32, 16) if V % vt == 0 and B * K * (V // vt) >= 128), 16)
@@ -1400,9 +1456,11 @@ def _out_gemm(q, MT, seg, prev_cnt, dead, seg_off, seg_stride, H, K, S, V, C, ha
     B, L = q.shape[0], q.shape[1]
     dev = q.device
     nc = L // C
-    out = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
     if out_mask is None:
         out_mask = torch.empty(B, L, dtype=torch.bool, device=dev)
+    if _is_hopper(dev):
+        return _out_gemm_cublas(q, MT, seg, prev_cnt, dead, seg_off, H, K, S, V, C, has_prev, has_seg, out_mask)
+    out = torch.empty(B, L, H, V, dtype=torch.bfloat16, device=dev)
     out_vt, out_stages, resident = _out_tiling(S, V)
     out_key = ("out", H, K, S, V, C, has_prev, has_seg, out_vt, out_stages, resident)
     f_out = _compiled(out_key, lambda: AwmOutGemm(H, K, S, V, C, has_prev, has_seg, out_vt, out_stages, resident), lambda: (

@@ -44,8 +44,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 try:
     from .adaptive_working_memory import (  # noqa: F401
-        LOG2E, _U8, _blhs, _combine_lse2, _compiled, _dummy, _fake, _out_gemm, _phases12, _seg_anchor, _sm_count,
-        _u32_as_f32, chunk_gemm_tiling, WORKSPACE_KEYS,
+        LOG2E, _U8, _blhs, _combine_lse2, _compiled, _dummy, _fake, _is_hopper, _out_gemm, _phases12, _seg_anchor,
+        _sm_count, _u32_as_f32, chunk_gemm_tiling, WORKSPACE_KEYS,
     )
 except ImportError:  # loaded from its file (tests): load the forward module from its file as well
     import importlib.util as _ilu
@@ -58,6 +58,7 @@ except ImportError:  # loaded from its file (tests): load the forward module fro
         _fwd.LOG2E, _fwd._U8, _fwd._blhs, _fwd._combine_lse2, _fwd._compiled, _fwd._dummy, _fwd._fake, _fwd._out_gemm,
         _fwd._phases12, _fwd._seg_anchor, _fwd._sm_count)
     _u32_as_f32, chunk_gemm_tiling, WORKSPACE_KEYS = _fwd._u32_as_f32, _fwd.chunk_gemm_tiling, _fwd.WORKSPACE_KEYS
+    _is_hopper = _fwd._is_hopper
 
 import torch  # noqa: E402
 
@@ -1089,6 +1090,80 @@ class AwmChunkBwd:
 # Host side
 # ======================================================================================================
 
+# ======================================================================================================
+# Hopper (no tcgen05): AwmDmoGemm, AwmRecurrenceBwd and AwmChunkBwd on cuBLAS / torch, same numerics
+# (bf16 operands, fp32 accumulation); the delta, lse chain and zero-tail kernels are shared
+# ======================================================================================================
+
+
+def _group_rows(t, K, nc, C):
+    """[B, L, H, D] -> [(b, k, c), (head of the group, row of the chunk), D] (contiguous)."""
+    B, L, H, D = t.shape
+    return t.view(B, nc, C, K, H // K, D).permute(0, 3, 1, 4, 2, 5).reshape(B * K * nc, (H // K) * C, D)
+
+
+def _dmo_cublas(q, dout, out_mask, K, S, V, C):
+    """dMo[b, k, c] = sum over the heads of the group and the kept rows of chunk c of q^T dOut (fp32)."""
+    B, L = q.shape[0], q.shape[1]
+    nc = L // C
+    dm = dout.masked_fill(out_mask.view(B, L, 1, 1), 0.0)
+    return torch.bmm(_group_rows(q, K, nc, C).transpose(1, 2), _group_rows(dm, K, nc, C),
+                     out_dtype=torch.float32).view(B, K, nc, S, V)
+
+
+def _recurrence_bwd_torch(w, dMo, dmem, K, S, V, C, has_seg):
+    """AwmRecurrenceBwd (training case: no previous chunk): dB16 = r G per update, dr (full sums over V, as one
+    v tile [B, K, nu, 1, S]) and the final G (the input memory's gradient), backwards over the updates."""
+    B, nc = dMo.shape[0], dMo.shape[2]
+    nu = max(w["nu"], 1)
+    dev = dMo.device
+    A16, R, D = w["A16"], w["R"], w["D"]
+    G = dmem.float().clone() if dmem is not None else torch.zeros(B, K, S, V, dtype=torch.float32, device=dev)
+    dB16 = torch.empty(B, K, nu, S, V, dtype=torch.bfloat16, device=dev)
+    drp = torch.empty(B, K, nu, 1, S, dtype=torch.float32, device=dev)
+    ends = w["seg"][:, C - 1::C][:, :nc] if has_seg else None  # segment id at the end of each chunk
+    for u in reversed(range(w["nu"])):
+        c = u + 1
+        r = R[:, :, u].unsqueeze(-1)
+        drp[:, :, u, 0] = (G * D[:, :, u]).sum(-1)
+        rG = (r * G).to(torch.bfloat16)
+        dB16[:, :, u] = rG
+        X = torch.bmm(A16[:, :, u].reshape(B * K, S, S).transpose(1, 2), rG.view(B * K, S, V), out_dtype=torch.float32)
+        G = (1 - r) * G - X.view(B, K, S, V)
+        if has_seg and c >= 2:  # memory reset before update u: no gradient to the state before it
+            G = G.masked_fill((ends[:, c - 2] != ends[:, c - 1]).view(B, 1, 1, 1), 0.0)
+        G = G + dMo[:, :, c]
+    return dB16, drp, G
+
+
+def _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg):
+    """AwmChunkBwd: with P[s, t] = exp2(k[t, s] log2e - lse2[s]) (rows outside the segment of the chunk's last
+    row 0), dP = dA qk^T + dB v^T, dk = P (dP - delta + dlse), dqk = P^T dA, dv = P^T dB for the update chunks."""
+    B = k.shape[0]
+    nu = w["nu"]
+    BKn = B * K * nu
+    p = w["part"][:, :, :nu]
+    m, l = p[..., 0], p[..., 1]
+    mm = m.amax(3, keepdim=True)
+    lse2 = mm.squeeze(3) + torch.log2((l * torch.exp2(m - mm)).sum(3))  # [B, K, nu, S]
+    kc = k[:, :nu * C].view(B, nu, C, K, S).permute(0, 3, 1, 4, 2)  # [B, K, nu, S, C]
+    e = torch.exp2(kc.float() * LOG2E - lse2.unsqueeze(-1))
+    if has_seg:
+        sg = w["seg"][:, :nu * C].view(B, nu, C)
+        e = torch.where((sg == sg[:, :, -1:]).view(B, 1, nu, 1, C), e, 0.0)
+    e = e.reshape(BKn, S, C)
+    pt = e.to(torch.bfloat16)
+    rows = lambda t, D: t[:, :nu * C].view(B, nu, C, K, D).permute(0, 3, 1, 2, 4).reshape(BKn, C, D)
+    dA, dB = dA16.reshape(BKn, S, S), dB16.reshape(BKn, S, V)
+    dP = torch.bmm(dA, rows(qk, S).transpose(1, 2), out_dtype=torch.float32)
+    dP.add_(torch.bmm(dB, rows(v, V).transpose(1, 2), out_dtype=torch.float32))
+    dkT = e * (dP - (delta - dlse).reshape(BKn, S, 1))
+    back = lambda t, D: t.view(B, K, nu, C, D).permute(0, 2, 3, 1, 4).reshape(B, nu * C, K, D)
+    dk[:, :nu * C] = back(dkT.transpose(1, 2), S)
+    dqk[:, :nu * C] = back(torch.bmm(pt.transpose(1, 2), dA), S)
+    dv[:, :nu * C] = back(torch.bmm(pt.transpose(1, 2), dB), V)
+
+
 def _phase3_bwd(dout, q, w, H, K, S, V, C, has_prev, has_seg):
     """dq [B, L, H, S] (bf16), the output row mask [B, L] and dMo [B, K, nc, S, V] (fp32) from dOut and q
     ([B, L, H, *], contiguous) and the forward workspaces ``w`` (_phases12 with save)."""
@@ -1098,6 +1173,8 @@ def _phase3_bwd(dout, q, w, H, K, S, V, C, has_prev, has_seg):
     # dq = dOut M_c^T: the output GEMM with the roles of S and V swapped (M_c as the K-major [S, V] operand)
     dq, out_mask = _out_gemm(dout, w["Mseq"], w["seg"], w["prev_cnt"], w["dead"], w["seg_off"], w["seg_stride"],
                              H, K, V, S, C, has_prev, has_seg)
+    if _is_hopper(dev):
+        return dq, out_mask, _dmo_cublas(q, dout, out_mask, K, S, V, C)
     dMo = torch.zeros(B, K, nc, S, V, dtype=torch.float32, device=dev)
     base = B * K * nc * (S // 128) * chunk_gemm_tiling(0, V)[2]
     k_tiles = (H // K) * (C // DMO_KB)
@@ -1118,16 +1195,11 @@ def _phase2_bwd(w, dMo, dmem, dlnt, K, S, V, C, has_prev, has_seg):
     VT = 64
     n_vt = V // VT
     has_dmem, has_dlnt = dmem is not None, dlnt is not None
-    dB16 = torch.empty(B, K, nu, S, V, dtype=torch.bfloat16, device=dev)
-    drp = torch.empty(B, K, nu, n_vt, S, dtype=torch.float32, device=dev)
-    gmem = torch.empty(B, K, S, V, dtype=torch.float32, device=dev)
-    f_rec = _compiled(("recb", K, S, V, C, has_prev, has_seg, has_dmem), lambda: AwmRecurrenceBwd(K, S, V, C, has_prev, has_seg, has_dmem),
-                      lambda: (_fake(BFloat16), _fake(Float32), _fake(Float32), _fake(Float32), _fake(Int64, 8),
-                               _fake(Int64, 8), _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(Float32),
-                               *([Int32(0)] * 5)))
-    f_rec(w["A16"].reshape(-1), dMo.reshape(-1), w["R"].reshape(-1), w["D"].reshape(-1),
-          w["seg"].reshape(-1), w["prev_cnt"].reshape(-1), (dmem.float().contiguous() if has_dmem else _dummy(torch.float32, dev)).reshape(-1),
-          dB16.reshape(-1), drp.reshape(-1), gmem.reshape(-1), B, nc, nu, w["seg_off"], w["seg_stride"])
+    if _is_hopper(dev):
+        n_vt = 1  # dr written as full sums over V
+        dB16, drp, gmem = _recurrence_bwd_torch(w, dMo, dmem, K, S, V, C, has_seg)
+    else:
+        dB16, drp, gmem = _recurrence_bwd_sm100(w, dMo, dmem, K, S, V, C, has_prev, has_seg, n_vt)
     # dA_u = -(rG) M^T with M the state update u starts from (Mneg = -M, 0 after a reset): off the sequential chain
     dA16 = torch.matmul(dB16, w["Mneg"].transpose(-1, -2))
     delta = torch.empty(B, K, nu, S, dtype=torch.float32, device=dev)
@@ -1145,6 +1217,25 @@ def _phase2_bwd(w, dMo, dmem, dlnt, K, S, V, C, has_prev, has_seg):
     return dB16, dA16, delta, dlse, gmem, glnt
 
 
+def _recurrence_bwd_sm100(w, dMo, dmem, K, S, V, C, has_prev, has_seg, n_vt):
+    """AwmRecurrenceBwd (tcgen05): dB16 [B, K, nu, S, V], the dr partials [B, K, nu, n_vt, S] and the final G."""
+    B, nc = dMo.shape[0], dMo.shape[2]
+    nu = max(w["nu"], 1)
+    dev = dMo.device
+    has_dmem = dmem is not None
+    dB16 = torch.empty(B, K, nu, S, V, dtype=torch.bfloat16, device=dev)
+    drp = torch.empty(B, K, nu, n_vt, S, dtype=torch.float32, device=dev)
+    gmem = torch.empty(B, K, S, V, dtype=torch.float32, device=dev)
+    f_rec = _compiled(("recb", K, S, V, C, has_prev, has_seg, has_dmem), lambda: AwmRecurrenceBwd(K, S, V, C, has_prev, has_seg, has_dmem),
+                      lambda: (_fake(BFloat16), _fake(Float32), _fake(Float32), _fake(Float32), _fake(Int64, 8),
+                               _fake(Int64, 8), _fake(Float32), _fake(BFloat16), _fake(Float32), _fake(Float32),
+                               *([Int32(0)] * 5)))
+    f_rec(w["A16"].reshape(-1), dMo.reshape(-1), w["R"].reshape(-1), w["D"].reshape(-1),
+          w["seg"].reshape(-1), w["prev_cnt"].reshape(-1), (dmem.float().contiguous() if has_dmem else _dummy(torch.float32, dev)).reshape(-1),
+          dB16.reshape(-1), drp.reshape(-1), gmem.reshape(-1), B, nc, nu, w["seg_off"], w["seg_stride"])
+    return dB16, drp, gmem
+
+
 def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
     """dqk, dk [B, L, K, S] and dv [B, L, K, V] (bf16) for the update chunks (rows of the last chunk are 0)."""
     B, L = k.shape[0], k.shape[1]
@@ -1156,7 +1247,9 @@ def _phase1_bwd(w, dA16, dB16, delta, dlse, qk, k, v, K, S, V, C, has_seg):
     f_zero = _compiled(("zerotail", K, S, V, C), lambda: AwmZeroTail(K, S, V, C), lambda: (
         _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), Int32(0), Int32(0)))
     f_zero(dqk.reshape(-1), dk.reshape(-1), dv.reshape(-1), B, L)  # the last chunk has no update
-    if w["nu"] > 0:
+    if w["nu"] > 0 and _is_hopper(dev):
+        _chunk_bwd_cublas(w, dA16, dB16, delta, dlse, qk, k, v, dqk, dk, dv, K, S, V, C, has_seg)
+    elif w["nu"] > 0:
         f = _compiled(("chunkb", K, S, V, C, w["R_splits"], has_seg), lambda: AwmChunkBwd(K, S, V, C, w["R_splits"], has_seg),
                       lambda: (_fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16), _fake(Float32),
                                _fake(Float32), _fake(Float32), _fake(Int64, 8), _fake(BFloat16), _fake(BFloat16), _fake(BFloat16),
