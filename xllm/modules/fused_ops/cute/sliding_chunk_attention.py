@@ -3317,10 +3317,10 @@ def _compile_bwd_paths(H, K, S, V, C):
 
 def _use_pmat_dv(qmax, B, L, C):
     """Whether the V > 256 backward should materialize P / dS and use cuBLAS (fixed cost) rather than the kernels
-    (cost ~ attended fraction of the [C x 2C] windows): GEMMs when the fraction exceeds a threshold, 0.5 on one GPU
-    (per layer the paths cross there) and 0.35 under data parallelism, where the slowest rank's batch sets the step
-    time and the fixed-cost path avoids the straggling (8 x B200 7.1B: 893 -> 870 ms/step). Env SCA_DV_PMAT=0/1
-    forces the kernel / GEMM path, SCA_PMAT_FRAC overrides the threshold."""
+    (cost ~ attended fraction of the [C x 2C] windows): GEMMs when the fraction exceeds a threshold, 0.75 on one
+    GPU (7.1B per layer: kernels 2.7 ms at 0.47 / 4.5 at 1.0, GEMMs 3.6-3.8) and 0.5 under data parallelism, where
+    the slowest rank's batch sets the step time and the fixed-cost path limits the straggling (8 x B200 7.1B: both
+    ~875 ms/step). Env SCA_DV_PMAT=0/1 forces the kernel / GEMM path, SCA_PMAT_FRAC overrides the threshold."""
     env = os.environ.get("SCA_DV_PMAT", "auto")
     if env in ("0", "1"):
         return env == "1"
@@ -3331,7 +3331,7 @@ def _use_pmat_dv(qmax, B, L, C):
     frac = os.environ.get("SCA_PMAT_FRAC")
     if frac is None:
         dp = torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        frac = 0.35 if dp else 0.5
+        frac = 0.5 if dp else 0.75
     return attended.item() > float(frac) * full.item()
 
 
