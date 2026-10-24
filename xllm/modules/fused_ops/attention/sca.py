@@ -143,8 +143,12 @@ def _sequential_sliding_chunk_attention_fwd(
     # B x L x H x V
     out = torch.empty(bsz, seq_len, n_heads, v_head_dim, dtype=value.dtype, device=value.device)
     if save_attention_matrix:
+        # chunk-major: the [B, H, C, keys of chunk c] matrix of every chunk is contiguous in one flat buffer, so the
+        # backward reads it without a copy (a [B, H, C, all keys] layout made both passes strided copies)
         offset = 0 if prev_key_chunk is not None else 1
-        attn_w = torch.empty(bsz, n_heads, chunk_size, (2 * nc - offset) * chunk_size, dtype=value.dtype, device=value.device)
+        attn_w = torch.empty(bsz * n_heads * chunk_size * (2 * nc - offset) * chunk_size, dtype=value.dtype,
+                             device=value.device)
+        w_off = 0
     else:
         offset = None
         attn_w = None
@@ -176,9 +180,8 @@ def _sequential_sliding_chunk_attention_fwd(
 
         out[:, qbos:eos] = y
         if save_attention_matrix:
-            wbos = (0 if c == 0 else 2 * c - offset) * chunk_size
-            weos = (2 * c + 2 - offset) * chunk_size
-            attn_w[:, :, :, wbos:weos] = w
+            attn_w[w_off:w_off + w.numel()].view(w.shape).copy_(w)
+            w_off += w.numel()
 
     return out, attn_w
 
@@ -214,7 +217,11 @@ def _sequential_sliding_chunk_attention_bwd(
         prev_key_grad = None
         prev_value_grad = None
 
-    ws = torch.split(w, splits, dim=-1)
+    if w.dim() == 1:  # chunk-major flat buffer of _sequential_sliding_chunk_attention_fwd
+        sizes = [bsz * n_heads * chunk_size * kc for kc in splits]
+        ws = [t.view(bsz, n_heads, chunk_size, kc) for t, kc in zip(torch.split(w, sizes), splits)]
+    else:
+        ws = torch.split(w, splits, dim=-1)
     for c in range(nc):
         qbos = c * chunk_size
         kvbos = c * chunk_size if c == 0 else (c - 1) * chunk_size
