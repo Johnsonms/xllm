@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Any
 import math
 from functools import partial
@@ -66,6 +67,19 @@ from xllm.models.fused_blocks.distributed import (
     send_log_norm_term_grad_to_prev,
 )
 
+
+
+def softmax_bwd_fusable(x: torch.Tensor) -> bool:
+    """The fused softmax backward (cute/softmax_bwd.py) takes contiguous bf16 / fp16 rows of 64 .. 256 elements."""
+    if os.environ.get("XLLM_SOFTMAX_BWD_TORCH", "0") == "1" or not x.is_contiguous():
+        return False
+    from xllm.modules.fused_ops.cute.softmax_bwd import supported
+    return supported(x)
+
+
+def softmax_bwd_acc_(out: torch.Tensor, x: torch.Tensor, g: torch.Tensor, add: Optional[torch.Tensor] = None) -> torch.Tensor:
+    from xllm.modules.fused_ops.cute.softmax_bwd import softmax_bwd_acc_ as fused
+    return fused(out, x, g, add)
 
 class GekkoBlockFunction(torch.autograd.Function):
     """
@@ -249,7 +263,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x K x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
         # apply softmax to aqk
-        aqk = F.softmax(akk, dim=-1, dtype=torch.float32).to(akk)
+        aqk = torch.softmax(akk, dim=-1)  # bf16 in / out, fp32 inside: same bits as softmax(fp32).to(bf16), one pass less
 
         if send_to_next:
             psk = sk[:, (seq_len - attention_chunk_size):]
@@ -281,7 +295,7 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x H x S
         aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
         # apply softmax to aq
-        aq = F.softmax(aq, dim=-1, dtype=torch.float32).to(aq)
+        aq = torch.softmax(aq, dim=-1)
 
         if handle_prev_v is not None:
             handle_prev_v.wait()
@@ -696,11 +710,18 @@ class GekkoBlockFunction(torch.autograd.Function):
         # B x L x K|H x S
         akk = rearrange(xk_, 'b l (k s) -> b l k s', k=local_kv_heads)
         aq = rearrange(xq_, 'b l (h s) -> b l h s', h=local_heads)
-        # softmax for aq and aqk
-        aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
-        aqk = aqk_fp32.to(akk)
-        aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
-        aq = aq_fp32.to(aq)
+        # softmax for aq and aqk; the fused softmax backward recomputes the fp32 probabilities from the logits
+        aq_logits, akk_logits = aq, akk
+        fused_softmax_bwd = softmax_bwd_fusable(akk) and softmax_bwd_fusable(aq)
+        if fused_softmax_bwd:
+            aqk_fp32 = aq_fp32 = None
+            aqk = torch.softmax(akk, dim=-1)
+            aq = torch.softmax(aq, dim=-1)
+        else:
+            aqk_fp32 = F.softmax(akk, dim=-1, dtype=torch.float32)
+            aqk = aqk_fp32.to(akk)
+            aq_fp32 = F.softmax(aq, dim=-1, dtype=torch.float32)
+            aq = aq_fp32.to(aq)
 
         if send_to_next:
             memory_grad, handle_memory = recv_memory_grad_from_next(x, local_kv_heads, head_dim, v_head_dim)
@@ -881,12 +902,15 @@ class GekkoBlockFunction(torch.autograd.Function):
 
         # B x H x L x S -> B x L x H x S
         aq_grad = aq_grad.transpose(1, 2)
-        aq_grad = torch.ops.aten._softmax_backward_data(
-            aq_grad.float(), aq_fp32, -1, torch.float32
-        ).to(aq)
+        if fused_softmax_bwd:
+            softmax_bwd_acc_(xq_grad.view(aq_logits.shape), aq_logits, aq_grad.contiguous())
+        else:
+            aq_grad = torch.ops.aten._softmax_backward_data(
+                aq_grad.float(), aq_fp32, -1, torch.float32
+            ).to(aq)
 
-        aq_grad = rearrange(aq_grad, 'b l h s -> b l (h s)')
-        xq_grad = torch.add(xq_grad, aq_grad, out=xq_grad)
+            aq_grad = rearrange(aq_grad, 'b l h s -> b l (h s)')
+            xq_grad = torch.add(xq_grad, aq_grad, out=xq_grad)
 
         # B x K x L x S -> B x L x K x S
         aqk_grad = aqk_grad.transpose(1, 2)
@@ -905,13 +929,17 @@ class GekkoBlockFunction(torch.autograd.Function):
         # k norm grad
         xk_grad = mem_effn_rmsnorm_bwd(rearrange(sk_grad, 'b l k s -> b l (k s)'), sk_, sk_rstd, local_kv_heads)
 
-        aqk_grad = torch.ops.aten._softmax_backward_data(
-            aqk_grad.float(), aqk_fp32, -1, torch.float32
-        ).to(aqk)
-        ak_grad = rearrange(torch.add(akk_grad, aqk_grad, out=aqk_grad), 'b l k s -> b l (k s)')
+        if fused_softmax_bwd:
+            # grads of xk: xk_grad += akk_grad + softmax backward of aqk_grad
+            softmax_bwd_acc_(xk_grad.view(akk_logits.shape), akk_logits, aqk_grad.contiguous(), akk_grad.contiguous())
+        else:
+            aqk_grad = torch.ops.aten._softmax_backward_data(
+                aqk_grad.float(), aqk_fp32, -1, torch.float32
+            ).to(aqk)
+            ak_grad = rearrange(torch.add(akk_grad, aqk_grad, out=aqk_grad), 'b l k s -> b l (k s)')
 
-        # grads of xk & xv
-        xk_grad = torch.add(xk_grad, ak_grad, out=xk_grad)
+            # grads of xk & xv
+            xk_grad = torch.add(xk_grad, ak_grad, out=xk_grad)
         xv_grad = torch.add(xv_grad, av_grad.transpose(1, 2), out=xv_grad)
         if handle_prev_v is not None:
             handle_prev_v.wait()
