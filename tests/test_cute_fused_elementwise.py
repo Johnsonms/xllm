@@ -132,3 +132,34 @@ def test_cross_entropy_rows():
     torch.testing.assert_close(loss.double(), ref_loss, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(s32.double(), ref_s, atol=1e-6, rtol=1e-4)
     torch.testing.assert_close(s16.double(), ref_s, atol=1e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("kind,D,G", [("rms", 1024, 4), ("rms_aff", 2048, 8), ("rms_mem", 2048, 8), ("rms_aff", 4096, 32),
+                                      ("layer", 1536, 2), ("layer", 2560, 2)])
+def test_group_norm_bwd(kind, D, G):
+    import xllm_extension.ops as ops
+    from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
+    torch.manual_seed(0)
+    x = torch.randn(2, 1024, D, device="cuda").bfloat16()
+    dy = torch.randn_like(x)
+    w = (torch.randn(D, device="cuda") * 0.5 + 1).bfloat16()
+    b = torch.randn(D, device="cuda").bfloat16()
+    if kind == "layer":
+        _, m, r = ops.group_layer_norm_fwd_affine(x, D, G, w, b, 1e-5)
+        ref = ops.group_layer_norm_bwd_affine(dy, x, D, G, m, r, w, b, False)
+        out = group_norm_bwd(dy, x, G, r, m, w, layer=True)
+    elif kind == "rms_aff":
+        _, r = ops.group_rms_norm_fwd_affine(x, D, G, w, 1e-6)
+        ref = ops.group_rms_norm_bwd_affine(dy, x, D, G, r, w, False)
+        out = group_norm_bwd(dy, x, G, r, None, w)
+    elif kind == "rms_mem":
+        y, r = ops.group_rms_norm_fwd(x, D, G, 1e-6)
+        ref = (ops.group_rms_norm_bwd(dy, y, D, G, r, True),)
+        out = group_norm_bwd(dy, y, G, r, mem_eff=True)
+    else:
+        _, r = ops.group_rms_norm_fwd(x, D, G, 1e-6)
+        ref = (ops.group_rms_norm_bwd(dy, x, D, G, r, False),)
+        out = group_norm_bwd(dy, x, G, r)
+    assert len(out) == len(ref)
+    for a, c in zip(out, ref):
+        torch.testing.assert_close(a.float(), c.float(), atol=4e-2, rtol=1e-2)

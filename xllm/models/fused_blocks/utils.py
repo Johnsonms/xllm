@@ -305,6 +305,9 @@ def layernorm_bwd(
     num_groups: int,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     xdim = x.shape[-1]
+    if weight is not None and _fused_norm_bwd_ok(y_grad, x, num_groups):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
+        return group_norm_bwd(y_grad, x, num_groups, rstd, mean, weight + 1.0, layer=True)
     if weight is not None:
         return xllm_ops.group_layer_norm_bwd_affine(y_grad, x, xdim, num_groups, mean, rstd, weight + 1.0, bias, False)
     else:
@@ -335,6 +338,10 @@ def rmsnorm_bwd(
     num_groups: int,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     xdim = x.shape[-1]
+    if _fused_norm_bwd_ok(y_grad, x, num_groups):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
+        res = group_norm_bwd(y_grad, x, num_groups, rstd, None, weight + 1.0 if weight is not None else None)
+        return res if weight is not None else (res[0], None)
     if weight is not None:
         return xllm_ops.group_rms_norm_bwd_affine(y_grad, x, xdim, num_groups, rstd, weight + 1.0, False)
     else:
@@ -348,6 +355,9 @@ def mem_effn_rmsnorm_bwd(
     num_groups: int,
 ) -> Tensor:
     ydim = y.shape[-1]
+    if _fused_norm_bwd_ok(y_grad, y, num_groups):
+        from xllm.modules.fused_ops.cute.group_norm import group_norm_bwd
+        return group_norm_bwd(y_grad, y, num_groups, rstd, mem_eff=True)[0]
     return xllm_ops.group_rms_norm_bwd(y_grad, y, ydim, num_groups, rstd, True)
 
 
@@ -892,6 +902,13 @@ def _fused_norm_ok(x: Tensor, num_groups: int) -> bool:
         return False
     from xllm.modules.fused_ops.cute import group_norm as cute_group_norm
     return cute_group_norm.supported(x, num_groups)
+
+
+def _fused_norm_bwd_ok(y_grad: Tensor, x: Tensor, num_groups: int) -> bool:
+    if _NORM_EXT:
+        return False
+    from xllm.modules.fused_ops.cute import group_norm as cute_group_norm
+    return cute_group_norm.supported_bwd(y_grad, x, num_groups)
 
 
 _SWIGLU_TORCH = os.environ.get("XLLM_SWIGLU_TORCH", "0") == "1"  # torch reference path instead of the fused kernels

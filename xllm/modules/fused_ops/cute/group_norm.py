@@ -4,7 +4,7 @@ group_layer_norm_fwd_affine, whose one-warp blocks with strided scalar loads run
 
   rms:   rstd = rsqrt(mean(x^2) + eps),  y = x rstd (w)
   layer: mean, rstd = rsqrt(var + eps),  y = (x - mean) rstd w + b
-x [rows, G * CPG] contiguous (bf16 / fp16), CPG a multiple of 128 up to 1024; y like x, mean / rstd [rows, G] fp32.
+x [rows, G * CPG] contiguous (bf16 / fp16), CPG a multiple of 128 up to 2048; y like x, mean / rstd [rows, G] fp32.
 """
 import torch
 
@@ -18,7 +18,7 @@ TORCH2CUTE = {torch.bfloat16: BFloat16, torch.float16: Float16}
 
 class GroupNormFwd:
     def __init__(self, dtype, CPG: int, G: int, layer: bool, affine: bool, warps: int = 8):
-        assert CPG % 128 == 0 and CPG <= 1024 and (affine or not layer)
+        assert CPG % 128 == 0 and CPG <= 2048 and (affine or not layer)
         self.dtype, self.CPG, self.G, self.layer, self.affine, self.warps = dtype, CPG, G, layer, affine, warps
         self.E = CPG // 32  # elements per lane
         self.VW = min(8, self.E)  # vector width
@@ -94,7 +94,7 @@ def _fake(dtype, align):
 def supported(x: torch.Tensor, num_groups: int) -> bool:
     D = x.shape[-1]
     return (x.is_cuda and x.dtype in TORCH2CUTE and x.is_contiguous() and D % num_groups == 0
-            and (D // num_groups) % 128 == 0 and D // num_groups <= 1024 and x.data_ptr() % 16 == 0)
+            and (D // num_groups) % 128 == 0 and D // num_groups <= 2048 and x.data_ptr() % 16 == 0)
 
 
 def group_norm_fwd(x: torch.Tensor, num_groups: int, eps: float, weight=None, bias=None, layer: bool = False):
@@ -120,3 +120,162 @@ def group_norm_fwd(x: torch.Tensor, num_groups: int, eps: float, weight=None, bi
     b = bias.contiguous() if (layer and bias is not None) else x
     _COMPILED[key](x.reshape(-1), w.reshape(-1), b.reshape(-1), y.reshape(-1), mean.reshape(-1), rstd.reshape(-1), rows, eps)
     return (y, mean, rstd) if layer else (y, rstd)
+
+
+class GroupNormBwd:
+    """Group RMS / layer norm backward with the gamma / beta reductions fused (CuTe DSL, any arch).
+
+      xhat = (x - mean) rstd   (rms: mean = 0; mem_eff: xhat = the saved output y, rms without affine only)
+      g = dy w (affine) or dy
+      dx = rstd (g - (sum g [layer] + xhat sum(g xhat)) / CPG),  dgamma += dy xhat,  dbeta += dy
+    One CTA of 8 warps per (group, split of the rows); a warp takes every 8th row of the split (one row-group of
+    CPG elements, vector loads), keeps its dgamma / dbeta partials in registers, the CTA adds them up in shared
+    memory and writes them per split ([splits, D] fp32, summed by the caller). Replaces GroupRMSNormBwdKernel / GroupLayerNormBwdKernel plus the
+    separate Gamma(Beta)BwdLargeKernel passes (2.4-3.8x over the bandwidth floor at the gekko shapes)."""
+
+    def __init__(self, dtype, CPG: int, G: int, layer: bool, affine: bool, mem_eff: bool, warps: int = 8):
+        assert CPG % 128 == 0 and CPG <= 2048 and not (mem_eff and (affine or layer)) and (affine or not layer)
+        self.dtype, self.CPG, self.G, self.layer, self.affine, self.mem_eff, self.warps = \
+            dtype, CPG, G, layer, affine, mem_eff, warps
+        self.E = CPG // 32
+        self.VW = min(8, self.E)
+        self.NV = self.E // self.VW
+
+    @cute.jit
+    def __call__(self, tDy: cute.Tensor, tX: cute.Tensor, tW: cute.Tensor, tMean: cute.Tensor, tRstd: cute.Tensor,
+                 tDx: cute.Tensor, tDw: cute.Tensor, tDb: cute.Tensor, rows: Int32, splits: Int32, stream: cuda.CUstream):
+        self.kernel(tDy.iterator, tX.iterator, tW.iterator, tMean.iterator, tRstd.iterator, tDx.iterator, tDw.iterator,
+                    tDb.iterator, rows, splits).launch(
+            grid=[self.G * splits, 1, 1], block=[32 * self.warps, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(self, pDy: cute.Pointer, pX: cute.Pointer, pW: cute.Pointer, pMean: cute.Pointer, pRstd: cute.Pointer,
+               pDx: cute.Pointer, pDw: cute.Pointer, pDb: cute.Pointer, rows: Int32, splits: Int32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        lane = cute.arch.lane_idx()
+        warp = tidx // 32
+        g = bidx % self.G
+        sp = bidx // self.G
+        per = (rows + splits - 1) // splits
+        r0 = sp * per
+        r1 = cutlass.min(rows, r0 + per)
+        al = 2 * self.VW
+        D = self.G * self.CPG
+        smem = cutlass.utils.SmemAllocator()
+        sW = smem.allocate_tensor(Float32, cute.make_layout(self.CPG), byte_alignment=16)
+        sB = smem.allocate_tensor(Float32, cute.make_layout(self.CPG), byte_alignment=16)
+        for i in cutlass.range(tidx, self.CPG, 32 * self.warps):
+            sW[i] = Float32(0.0)
+            sB[i] = Float32(0.0)
+        accw = cute.make_rmem_tensor(cute.make_layout(self.E), Float32)
+        accb = cute.make_rmem_tensor(cute.make_layout(self.E), Float32)
+        for i in cutlass.range_constexpr(self.E):
+            accw[i] = Float32(0.0)
+            accb[i] = Float32(0.0)
+        cute.arch.sync_threads()
+        for r in cutlass.range(r0 + warp, r1, self.warps):
+            base = Int64(r) * D + g * self.CPG
+            v = cute.make_tensor(pRstd + (r * self.G + g), cute.make_layout(1))[0]
+            mu = Float32(0.0)
+            if cutlass.const_expr(self.layer):
+                mu = cute.make_tensor(pMean + (r * self.G + g), cute.make_layout(1))[0]
+            # x-hat and dy stay in registers; w is re-read per row (L1) and g = dy w recomputed, so that the
+            # register footprint is 4 x CPG / 32 floats per lane (with the dgamma / dbeta partials)
+            xh = cute.make_rmem_tensor(cute.make_layout(self.E), Float32)
+            dyr = cute.make_rmem_tensor(cute.make_layout(self.E), Float32)
+            s1 = Float32(0.0)
+            s2 = Float32(0.0)
+            for j in cutlass.range_constexpr(self.NV):
+                off = base + j * 32 * self.VW + lane * self.VW
+                dyv = cute.make_tensor((pDy + off).align(al), cute.make_layout(self.VW)).load().to(Float32)
+                xv = cute.make_tensor((pX + off).align(al), cute.make_layout(self.VW)).load().to(Float32)
+                wv = dyv
+                if cutlass.const_expr(self.affine):
+                    wv = cute.make_tensor((pW + (g * self.CPG + j * 32 * self.VW + lane * self.VW)).align(al),
+                                          cute.make_layout(self.VW)).load().to(Float32)
+                for e in cutlass.range_constexpr(self.VW):
+                    i = j * self.VW + e
+                    dyr[i] = dyv[e]
+                    xh[i] = xv[e] if cutlass.const_expr(self.mem_eff) else (xv[e] - mu) * v
+                    ge = dyv[e] * wv[e] if cutlass.const_expr(self.affine) else dyv[e]
+                    s2 = s2 + ge * xh[i]
+                    if cutlass.const_expr(self.layer):
+                        s1 = s1 + ge
+            for o in cutlass.range_constexpr(5):
+                s2 = s2 + cute.arch.shuffle_sync_bfly(s2, offset=1 << o)
+                if cutlass.const_expr(self.layer):
+                    s1 = s1 + cute.arch.shuffle_sync_bfly(s1, offset=1 << o)
+            inv = 1.0 / self.CPG
+            for j in cutlass.range_constexpr(self.NV):
+                off = base + j * 32 * self.VW + lane * self.VW
+                o = cute.make_rmem_tensor(cute.make_layout(self.VW), Float32)
+                wv2 = o.load()
+                if cutlass.const_expr(self.affine):
+                    wv2 = cute.make_tensor((pW + (g * self.CPG + j * 32 * self.VW + lane * self.VW)).align(al),
+                                           cute.make_layout(self.VW)).load().to(Float32)
+                for e in cutlass.range_constexpr(self.VW):
+                    i = j * self.VW + e
+                    ge = dyr[i] * wv2[e] if cutlass.const_expr(self.affine) else dyr[i]
+                    o[e] = v * (ge - (s1 + xh[i] * s2) * inv)
+                    if cutlass.const_expr(self.affine):
+                        accw[i] = accw[i] + dyr[i] * xh[i]
+                        if cutlass.const_expr(self.layer):
+                            accb[i] = accb[i] + dyr[i]
+                cute.make_tensor((pDx + off).align(al), cute.make_layout(self.VW)).store(o.load().to(self.dtype))
+        if cutlass.const_expr(self.affine):
+            for j in cutlass.range_constexpr(self.NV):
+                for e in cutlass.range_constexpr(self.VW):
+                    c = j * 32 * self.VW + lane * self.VW + e
+                    cute.arch.atomic_add((sW.iterator + c).llvm_ptr, accw[j * self.VW + e], sem="relaxed", scope="cta")
+                    if cutlass.const_expr(self.layer):
+                        cute.arch.atomic_add((sB.iterator + c).llvm_ptr, accb[j * self.VW + e], sem="relaxed", scope="cta")
+            cute.arch.sync_threads()
+            # this split's partial sums (no global atomics: with few groups hundreds of CTAs would add into the
+            # same addresses); the caller sums the splits, which also keeps dgamma / dbeta deterministic
+            out_off = Int64(sp) * D + g * self.CPG
+            gW = cute.make_tensor(pDw + out_off, cute.make_layout(self.CPG))
+            gB = cute.make_tensor(pDb + out_off, cute.make_layout(self.CPG))
+            for i in cutlass.range(tidx, self.CPG, 32 * self.warps):
+                gW[i] = sW[i]
+                if cutlass.const_expr(self.layer):
+                    gB[i] = sB[i]
+
+
+_COMPILED_BWD = {}
+
+
+def group_norm_bwd(dy: torch.Tensor, x_or_y: torch.Tensor, num_groups: int, rstd: torch.Tensor, mean=None, weight=None,
+                   layer: bool = False, mem_eff: bool = False):
+    """Returns dx (like x), and dgamma / dbeta (dtype of weight) when affine: (dx,), (dx, dw) or (dx, dw, db)."""
+    D = x_or_y.shape[-1]
+    G = num_groups
+    CPG = D // G
+    rows = x_or_y.numel() // D
+    affine = weight is not None
+    dx = torch.empty_like(x_or_y)
+    sms = torch.cuda.get_device_properties(dy.device).multi_processor_count
+    splits = max(1, min(-(-4 * sms // G), rows // (8 * 32)))  # >= 32 rows per warp: amortize the per-CTA reduction
+    accs = torch.empty(2 if layer else 1, splits, D, dtype=torch.float32, device=dy.device) if affine else rstd
+    key = (x_or_y.dtype, CPG, G, layer, affine, mem_eff)
+    if key not in _COMPILED_BWD:
+        dt = TORCH2CUTE[x_or_y.dtype]
+        al = 2 * min(8, CPG // 32)
+        _COMPILED_BWD[key] = cute.compile(
+            GroupNormBwd(dt, CPG, G, layer, affine, mem_eff), _fake(dt, al), _fake(dt, al), _fake(dt, al),
+            _fake(Float32, 4), _fake(Float32, 4), _fake(dt, al), _fake(Float32, 4), _fake(Float32, 4), Int32(0), Int32(0),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True), options="--enable-tvm-ffi")
+    w = weight.contiguous() if affine else dy
+    m = mean.contiguous() if layer else rstd
+    accw = accs[0] if affine else rstd
+    accb = accs[1] if (affine and layer) else accw
+    _COMPILED_BWD[key](dy.contiguous().reshape(-1), x_or_y.reshape(-1), w.reshape(-1), m.reshape(-1), rstd.reshape(-1),
+                       dx.reshape(-1), accw.reshape(-1), accb.reshape(-1), rows, splits)
+    if not affine:
+        return (dx,)
+    sums = accs.sum(1).to(weight.dtype)
+    return (dx, sums[0], sums[1]) if layer else (dx, sums[0])
+
+
+def supported_bwd(dy: torch.Tensor, x: torch.Tensor, num_groups: int) -> bool:
+    return supported(x, num_groups) and dy.shape == x.shape and dy.dtype == x.dtype
