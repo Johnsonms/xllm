@@ -70,6 +70,30 @@ def _select_elem(pred, a, b):
     return tuple(cutlass.select_(pred, u, v) for u, v in zip(a, b))
 
 
+@lru_cache(maxsize=None)
+def _has_f32x2() -> bool:
+    """Packed f32x2 add/mul/fma are sm_100+; on Hopper the pair helpers below fall back to scalar ops."""
+    return torch.cuda.get_device_capability()[0] >= 10
+
+
+def _add2(a, b):
+    if _has_f32x2():
+        return cute.arch.add_packed_f32x2(a, b)
+    return a[0] + b[0], a[1] + b[1]
+
+
+def _mul2(a, b):
+    if _has_f32x2():
+        return cute.arch.mul_packed_f32x2(a, b)
+    return a[0] * b[0], a[1] * b[1]
+
+
+def _fma2(a, b, c):
+    if _has_f32x2():
+        return cute.arch.fma_packed_f32x2(a, b, c)
+    return a[0] * b[0] + c[0], a[1] * b[1] + c[1]
+
+
 class TimestepDecayNormFwd:
 
     def __init__(
@@ -518,7 +542,7 @@ class TimestepDecayNormFwd:
         for i in cutlass.range_constexpr(self.RPT):
             pairs = [(xs[i][2 * k], xs[i][2 * k + 1]) for k in range(npair)]
             for lv in cutlass.range_constexpr(int(math.log2(npair))):
-                pairs = [cute.arch.add_packed_f32x2(pairs[2 * k], pairs[2 * k + 1]) for k in range(npair >> (lv + 1))]
+                pairs = [_add2(pairs[2 * k], pairs[2 * k + 1]) for k in range(npair >> (lv + 1))]
             sums.append(pairs[0][0] + pairs[0][1])
         for o in cutlass.range_constexpr(levels):
             sums = [v + cute.arch.shuffle_sync_bfly(v, offset=1 << o) for v in sums]
@@ -526,10 +550,10 @@ class TimestepDecayNormFwd:
         sqs = []
         for i in cutlass.range_constexpr(self.RPT):
             m = (-means[i], -means[i])
-            d = [cute.arch.add_packed_f32x2((xs[i][2 * k], xs[i][2 * k + 1]), m) for k in range(npair)]
-            acc = cute.arch.mul_packed_f32x2(d[0], d[0])
+            d = [_add2((xs[i][2 * k], xs[i][2 * k + 1]), m) for k in range(npair)]
+            acc = _mul2(d[0], d[0])
             for k in cutlass.range_constexpr(1, npair):
-                acc = cute.arch.fma_packed_f32x2(d[k], d[k], acc)
+                acc = _fma2(d[k], d[k], acc)
             sqs.append(acc[0] + acc[1])
         # the means are needed by every lane (butterflies); the squared deviations only by the lane that
         # stores the row, so they are reduce-scattered
@@ -722,15 +746,15 @@ class TimestepDecayNormFwd:
                 # padded rows are zero (rows past L are clipped by the TMA store anyway)
                 live = Int32(sInfo[h, row] & 1).to(Float32)
                 for k in cutlass.range_constexpr(npair):
-                    t = cute.arch.fma_packed_f32x2((x[2 * k], x[2 * k + 1]), (rs, rs), (shift, shift))
-                    bl = cute.arch.mul_packed_f32x2((bias[2 * k], bias[2 * k + 1]), (live, live))
-                    t = cute.arch.mul_packed_f32x2(t, (live, live))
-                    y[2 * k], y[2 * k + 1] = cute.arch.fma_packed_f32x2(t, (w[2 * k], w[2 * k + 1]), bl)
+                    t = _fma2((x[2 * k], x[2 * k + 1]), (rs, rs), (shift, shift))
+                    bl = _mul2((bias[2 * k], bias[2 * k + 1]), (live, live))
+                    t = _mul2(t, (live, live))
+                    y[2 * k], y[2 * k + 1] = _fma2(t, (w[2 * k], w[2 * k + 1]), bl)
             else:
                 for k in cutlass.range_constexpr(npair):
                     # y = ((x - mean) * rstd) * gamma + beta
-                    t = cute.arch.fma_packed_f32x2((x[2 * k], x[2 * k + 1]), (rs, rs), (shift, shift))
-                    y[2 * k], y[2 * k + 1] = cute.arch.fma_packed_f32x2(t, (w[2 * k], w[2 * k + 1]), (bias[2 * k], bias[2 * k + 1]))
+                    t = _fma2((x[2 * k], x[2 * k + 1]), (rs, rs), (shift, shift))
+                    y[2 * k], y[2 * k + 1] = _fma2(t, (w[2 * k], w[2 * k + 1]), (bias[2 * k], bias[2 * k + 1]))
             tiles[i].store(y.load().to(self.dtype))
         # make y visible to the TMA unit, then hand the stage to the producer
         cute.arch.fence_proxy("async.shared", space="cta")
@@ -1474,10 +1498,10 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             agx = (Float32(0.0), Float32(0.0))
             for k in cutlass.range_constexpr(npair):
                 xp = (xs[i][2 * k], xs[i][2 * k + 1])
-                gp = cute.arch.mul_packed_f32x2((dys[i][2 * k], dys[i][2 * k + 1]), (w[2 * k], w[2 * k + 1]))
-                ax = cute.arch.add_packed_f32x2(ax, xp)
-                ag = cute.arch.add_packed_f32x2(ag, gp)
-                agx = cute.arch.fma_packed_f32x2(gp, xp, agx)
+                gp = _mul2((dys[i][2 * k], dys[i][2 * k + 1]), (w[2 * k], w[2 * k + 1]))
+                ax = _add2(ax, xp)
+                ag = _add2(ag, gp)
+                agx = _fma2(gp, xp, agx)
             sx.append(ax[0] + ax[1])
             sg.append(ag[0] + ag[1])
             sgx.append(agx[0] + agx[1])
@@ -1628,12 +1652,12 @@ class TimestepDecayNormBwd(TimestepDecayNormFwd):
             for k in cutlass.range_constexpr(npair):
                 xp = (xs[i][2 * k], xs[i][2 * k + 1])
                 dyp = (dys[i][2 * k], dys[i][2 * k + 1])
-                wrs = cute.arch.mul_packed_f32x2((w[2 * k], w[2 * k + 1]), (rs, rs))
-                t = cute.arch.fma_packed_f32x2(xp, (a, a), (c, c))
-                dx[2 * k], dx[2 * k + 1] = cute.arch.fma_packed_f32x2(dyp, wrs, t)
-                xn = cute.arch.fma_packed_f32x2(xp, (rs, rs), (ncr, ncr))
-                accg[k] = cute.arch.fma_packed_f32x2(dyp, xn, accg[k])
-                accb[k] = cute.arch.fma_packed_f32x2(dyp, (live, live), accb[k])
+                wrs = _mul2((w[2 * k], w[2 * k + 1]), (rs, rs))
+                t = _fma2(xp, (a, a), (c, c))
+                dx[2 * k], dx[2 * k + 1] = _fma2(dyp, wrs, t)
+                xn = _fma2(xp, (rs, rs), (ncr, ncr))
+                accg[k] = _fma2(dyp, xn, accg[k])
+                accb[k] = _fma2(dyp, (live, live), accb[k])
             dyt[i].store(dx.load().to(self.dtype))
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.barrier_arrive(barrier_id=BAR_BASE + 2 * self.NB + self.NA + stage, number_of_threads=self.NC + 32)
