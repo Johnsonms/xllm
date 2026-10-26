@@ -33,7 +33,8 @@ for k, v in os.environ.items():
         cur = getattr(cfg, k[4:]); setattr(cfg, k[4:], (v == "1") if isinstance(cur, bool) else type(cur)(v))
 torch.manual_seed(0)
 torch.backends.cuda.matmul.allow_tf32 = True
-model = build_model(cfg, dtype="bf16", fully_sharded_size=None, fp32_reduce_scatter=bool(int(os.environ.get("FSDP_FP32_RS", "1"))), reshard_after_forward=bool(int(os.environ.get("FSDP_RESHARD", "1"))), forward_prefetch=bool(int(os.environ.get("FSDP_FWD_PREFETCH", "0"))), tokenizer=Tok())
+# FSDP_SHARD_SIZE = HSDP shard group size (1 = pure replication); unset = fully sharded over the world
+model = build_model(cfg, dtype="bf16", fully_sharded_size=int(os.environ["FSDP_SHARD_SIZE"]) if os.environ.get("FSDP_SHARD_SIZE") else None, fp32_reduce_scatter=bool(int(os.environ.get("FSDP_FP32_RS", "1"))), reshard_after_forward=bool(int(os.environ.get("FSDP_RESHARD", "1"))), forward_prefetch=bool(int(os.environ.get("FSDP_FWD_PREFETCH", "0"))), tokenizer=Tok())
 if os.environ.get("FSDP_SYMM"):  # NCCL symmetric-memory all-gather staging (copy-engine all-gather with NCCL_CTA_POLICY=2)
     from torch.distributed.fsdp import FSDPModule
     for _m in model.modules():
