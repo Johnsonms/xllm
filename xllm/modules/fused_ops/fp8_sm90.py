@@ -12,6 +12,12 @@ colwise operand X^T (C, R) is stored transposed: the quantisation kernel loads a
 both the rowwise (R, C) and the transposed colwise (C, R) piece (~2.6 TB/s). The contraction dimension of a blockwise GEMM must be
 a multiple of 512 (K / 128 scales a multiple of 4: other K are accepted by the shape check but give wrong columns, and
 a padded scale stride is rejected), and every dimension of a linear is K of one of its three GEMMs: see ``supported``.
+
+Opt-in ``XLLM_FP8_DEEPGEMM=1``: GEMMs with a 1 x 128 A and a 128 x 128 B operand (and no residual) run through
+DeepGEMM's sm90 kernels (deepseek-ai/DeepGEMM, same recipe; results bitwise equal to cuBLASLt on the same operands,
+1.1 - 1.35x faster at the gekko shapes on H200). DeepGEMM only takes that operand pairing, so the weight gradient
+then tiles X^T instead of dY^T (``WGRAD_TILE`` defaults to "x"). Its kernels are JIT-compiled per shape on first use;
+``XLLM_FP8_DEEPGEMM_SMS`` caps the SMs they use (default all).
 """
 import os
 from typing import Optional, Sequence, Tuple
@@ -27,7 +33,11 @@ BLOCK = 128
 # which transposed operand of the weight-gradient GEMM dW = dY^T X takes the 128 x 128 blocks (cuBLASLt on sm90 runs
 # the blockwise GEMM at ~1.6x bf16 when one operand has 128 x 128 blocks, ~1.2x when both are 1 x 128): "x" (X^T,
 # the layer input) or "dy" (dY^T, the output gradient)
-WGRAD_TILE = os.environ.get("XLLM_FP8_SM90_WGRAD_TILE", "dy")
+DEEPGEMM = os.environ.get("XLLM_FP8_DEEPGEMM", "0") == "1"
+# SMs for DeepGEMM's persistent kernels, 0 = all (H200: 116 / 124 made no difference; H100 measured 120 best next to the
+# overlapped reduce-scatter)
+DEEPGEMM_SMS = int(os.environ.get("XLLM_FP8_DEEPGEMM_SMS", "0"))
+WGRAD_TILE = os.environ.get("XLLM_FP8_SM90_WGRAD_TILE", "x" if DEEPGEMM else "dy")
 
 
 class Fp8Mat:
@@ -426,22 +436,21 @@ def _fused_c_op():
     return _FUSED_C[0]
 
 
-_DEEP_GEMM = []  # deep_gemm (XLLM_FP8_DEEP_GEMM=1 and importable), or None
+_DG = []  # the deep_gemm module (XLLM_FP8_DEEPGEMM=1 and installed), or None
 
 
 def _deep_gemm():
-    if not _DEEP_GEMM:
+    if not _DG:
         mod = None
-        if os.environ.get("XLLM_FP8_DEEP_GEMM", "0") == "1":
+        if DEEPGEMM:
             try:
                 import deep_gemm as mod
-                sms = int(os.environ.get("XLLM_FP8_DEEP_GEMM_SMS", "120"))
-                if sms:  # leave SMs to the overlapped collectives (all 132: 4B +1.8%, 120: -0.9%); 0 = all
-                    mod.set_num_sms(sms)
+                if DEEPGEMM_SMS:
+                    mod.set_num_sms(DEEPGEMM_SMS)
             except ImportError:
                 pass
-        _DEEP_GEMM.append(mod)
-    return _DEEP_GEMM[0]
+        _DG.append(mod)
+    return _DG[0]
 
 
 def mm(a: Fp8Mat, b: Fp8Mat, bias: Optional[torch.Tensor] = None, out: Optional[torch.Tensor] = None,
@@ -457,13 +466,13 @@ def mm(a: Fp8Mat, b: Fp8Mat, bias: Optional[torch.Tensor] = None, out: Optional[
             return d
         d = mm(a, b, bias, out)
         return torch.add(d, residual, out=d)
-    kw = {} if out is None else {"out": out}
-    if bias is None and not a.tile and b.tile:
+    if bias is None and not a.tile and b.tile and (out is None or out.is_contiguous()):
         dg = _deep_gemm()
-        if dg is not None:  # 1 x 128 by 128 x 128 (forward, dgrad): DeepGEMM's sm90 1D2D kernel, bitwise equal to cuBLASLt
-            d = torch.empty(a.rows, b.rows, dtype=torch.bfloat16, device=a.data.device) if out is None else out
-            dg.fp8_gemm_nt((a.data, a.scale), (b.data, b.scale), d, disable_ue8m0_cast=True)
+        if dg is not None:
+            d = out if out is not None else torch.empty(a.rows, b.rows, dtype=torch.bfloat16, device=a.data.device)
+            dg.fp8_gemm_nt((a.data, a.scale), (b.data, b.scale), d)
             return d
+    kw = {} if out is None else {"out": out}
     return torch._scaled_mm(a.data, b.data.t(), a.a_scale(), b.b_scale(), bias=bias, out_dtype=torch.bfloat16, **kw)
 
 
