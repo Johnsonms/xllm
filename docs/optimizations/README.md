@@ -3,6 +3,7 @@
 This branch holds the final state of the Gekko kernel / training-step optimization work, squashed on top of
 `main` (October 2026), and one report per architecture:
 
+- [SUMMARY.md](SUMMARY.md): one page - the kernel speed-ups and the model speed-ups on the three architectures.
 - [B200.md](B200.md): Blackwell (sm_100a) results and recipes - done.
 - [H100.md](H100.md): Hopper (sm_90a) results and recipes - done; open decisions listed at the end.
 - [H200.md](H200.md): H200 (sm_90a, 141 GB HBM3e) results and recipes - done (one pass, 2026-10-25/26, on a KVM node
