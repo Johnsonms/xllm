@@ -177,6 +177,34 @@ def test_mm_residual_in_epilogue():
     assert _rel(f8.mm(xr, ws, residual=r[:, :1024].contiguous()), f8.mm(xr, ws).float() + r[:, :1024].float()) < 4e-3
 
 
+@pytest.mark.parametrize("M,N,K", [(512, 512, 512), (8192, 4096, 2560), (2048, 1024, 9216), (1024, 1536, 1536)])
+def test_mm_deepgemm(M, N, K, monkeypatch):
+    """XLLM_FP8_DEEPGEMM: the 1 x 128 x 128 x 128 GEMMs (forward, dgrad, weight gradient with WGRAD_TILE=x, a weight
+    row slice, the lazily transposed weight, out=) through DeepGEMM, bitwise equal to cuBLASLt on the same operands."""
+    dg = pytest.importorskip("deep_gemm")
+    torch.manual_seed(0)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    ws = [torch.randn(n, K, device="cuda", dtype=torch.bfloat16) * 0.02 for n in (N // 2, N - N // 2)]
+    dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(f8, "WGRAD_TILE", "x")
+    xr, xc = f8.quantize(x, kind="act")
+    dr, dc = f8.quantize(dy, kind="grad")
+    wr, wc = f8.quantize_cat(ws, 0, kind="weight")
+    pairs = [(xr, wr), (dr, wc), (dc, xc)]
+    if N // 2 % 512 == 0:
+        pairs.append((xr, wr.row_slice(0, N // 2)))
+    monkeypatch.setattr(f8, "_DG", [None])
+    ref = [f8.mm(a, b) for a, b in pairs]
+    monkeypatch.setattr(f8, "_DG", [dg])
+    for (a, b), r in zip(pairs, ref):
+        assert not a.tile and b.tile
+        got = f8.mm(a, b)
+        assert got.shape == r.shape and torch.equal(got, r)
+    out = torch.full_like(ref[0], float("nan"))
+    assert f8.mm(xr, wr, out=out) is out and torch.equal(out, ref[0])
+    assert _rel(f8.mm(dc, xc), dy.float().t() @ x.float()) < 0.05
+
+
 @pytest.mark.parametrize("gate", ["softplus", "silu"])
 @pytest.mark.parametrize("M,H,V", [(1024, 4, 128), (2048, 8, 256), (512, 2, 256)])
 def test_gate_quantize(M, H, V, gate):
@@ -193,24 +221,3 @@ def test_gate_quantize(M, H, V, gate):
         x, y = f8.dequantize(got), f8.dequantize(want)
         assert (x != y).float().mean().item() < 2e-3 and _rel(x, y) < 2e-3
     assert f8.gate_quantize(s[:, :H * 64], a[:, :H * 64], r[:, :H * 64], H, gate, 1e-6) is None  # V = 64: not handled
-
-
-@pytest.mark.parametrize("M,N,K", [(512, 512, 512), (8192, 4096, 2560), (2048, 1024, 9216)])
-def test_mm_deep_gemm(M, N, K, monkeypatch):
-    """XLLM_FP8_DEEP_GEMM=1: the 1 x 128 by 128 x 128 GEMMs (forward, dgrad through the lazy W^T) through DeepGEMM,
-    bitwise equal to cuBLASLt; the weight gradient (tiled A operand) stays on cuBLASLt."""
-    dg = pytest.importorskip("deep_gemm")
-    torch.manual_seed(0)
-    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
-    dy = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
-    xr, xc = f8.quantize(x, kind="act")
-    wr, wc = f8.quantize(w, kind="weight")
-    dr, dc = f8.quantize(dy, kind="grad")
-    ref = [f8.mm(xr, wr), f8.mm(dr, wc), f8.mm(dc, xc)]
-    monkeypatch.setenv("XLLM_FP8_DEEP_GEMM", "1")
-    monkeypatch.setattr(f8, "_DEEP_GEMM", [])
-    assert f8._deep_gemm() is dg
-    got = [f8.mm(xr, wr), f8.mm(dr, wc), f8.mm(dc, xc)]
-    for g, r in zip(got, ref):
-        assert torch.equal(g, r)

@@ -12,6 +12,10 @@ preset, bsz, seq_len = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 steps = int(sys.argv[4]) if len(sys.argv) > 4 else 5
 local_rank = int(os.environ.get("LOCAL_RANK", 0)); torch.cuda.set_device(local_rank)
 if os.environ.get("SM_CARVEOUT"): torch._C._set_sm_carveout_experimental(int(os.environ["SM_CARVEOUT"]))
+if os.environ.get("PIN_CPU"):  # pin the rank to PIN_CPU cores of its GPU's NUMA node (PIN_GPUS_PER_NODE GPUs and PIN_CPUS_PER_NODE cores per node)
+    _per, _gpn, _cpn = int(os.environ["PIN_CPU"]), int(os.environ.get("PIN_GPUS_PER_NODE", "4")), int(os.environ.get("PIN_CPUS_PER_NODE", "78"))
+    _node, _i = local_rank // _gpn, local_rank % _gpn
+    os.sched_setaffinity(0, range(_node * _cpn + _i * _per, _node * _cpn + (_i + 1) * _per))
 from xllm.distributed import init_torch_distributed, initialize_model_parallel
 init_torch_distributed(1800); initialize_model_parallel(1, 1, 1800)
 rank, world = dist.get_rank(), dist.get_world_size()
@@ -29,7 +33,7 @@ for k, v in os.environ.items():
         cur = getattr(cfg, k[4:]); setattr(cfg, k[4:], (v == "1") if isinstance(cur, bool) else type(cur)(v))
 torch.manual_seed(0)
 torch.backends.cuda.matmul.allow_tf32 = True
-model = build_model(cfg, dtype="bf16", fully_sharded_size=None, fp32_reduce_scatter=bool(int(os.environ.get("FSDP_FP32_RS", "1"))), reshard_after_forward=bool(int(os.environ.get("FSDP_RESHARD", "1"))), forward_prefetch=False, tokenizer=Tok())
+model = build_model(cfg, dtype="bf16", fully_sharded_size=None, fp32_reduce_scatter=bool(int(os.environ.get("FSDP_FP32_RS", "1"))), reshard_after_forward=bool(int(os.environ.get("FSDP_RESHARD", "1"))), forward_prefetch=bool(int(os.environ.get("FSDP_FWD_PREFETCH", "0"))), tokenizer=Tok())
 if os.environ.get("FSDP_SYMM"):  # NCCL symmetric-memory all-gather staging (copy-engine all-gather with NCCL_CTA_POLICY=2)
     from torch.distributed.fsdp import FSDPModule
     for _m in model.modules():
@@ -40,11 +44,18 @@ if os.environ.get("FSDP_PGALLOC"):  # NCCL-allocated staging buffers for all-gat
     from torch.distributed.fsdp import FSDPModule
     for _m in model.modules():
         if isinstance(_m, FSDPModule): _m.set_allocate_memory_from_process_group_for_comm(True)
+if int(os.environ.get("FSDP_PREFETCH_DEPTH", "0")) > 0:  # explicit FSDP2 forward prefetch of the next N units
+    from torch.distributed.fsdp import FSDPModule
+    _units = [m for m in model.modules() if isinstance(m, FSDPModule) and m is not model]
+    _d = int(os.environ["FSDP_PREFETCH_DEPTH"])
+    for _i, _m in enumerate(_units):
+        if _i + 1 < len(_units): _m.set_modules_to_forward_prefetch(_units[_i + 1:_i + 1 + _d])
+    if rank == 0: print(f"forward prefetch depth {_d} over {len(_units)} FSDP units", flush=True)
 optimizer, scheduler = build_optimizer(model, OptimConf(fused=os.environ.get("ADAM_FOREACH", "0") != "1"), 1000, "bf16")
 g = torch.Generator(device="cuda").manual_seed(1000 + int(os.environ.get("SEED_OFFSET", "0")) + (0 if os.environ.get("SAME_SEED") else rank))
 def batch():
     tokens = torch.randint(3, Tok.vocab_size, (bsz, seq_len + 1), device="cuda", generator=g)
-    tokens[torch.rand(bsz, seq_len + 1, device="cuda", generator=g) < 1 / 3000] = Tok.eos_id
+    tokens[torch.rand(bsz, seq_len + 1, device="cuda", generator=g) < float(os.environ.get("EOS_RATE", 1 / 3000))] = Tok.eos_id
     return tokens[:, :-1], tokens[:, 1:]
 def step(prof=None):
     x, y = batch()
@@ -84,6 +95,11 @@ for s in range(steps):
 if rank == 0:
     mid = res[1:-1] if steps > 2 else res
     print(f"{preset} world={world} B={bsz} L={seq_len} fp32rs={os.environ.get('FSDP_FP32_RS','1')} reshard={os.environ.get('FSDP_RESHARD','1')} grp={cfg.fsdp_layers_per_group} sameseed={bool(os.environ.get('SAME_SEED'))}: mean fwd+bwd {sum(r[2] for r in mid)/len(mid):.0f} ms, clip {sum(r[3] for r in mid)/len(mid):.0f} ms, optim {sum(r[4] for r in mid)/len(mid):.0f} ms; peak mem {torch.cuda.max_memory_allocated()/2**30:.1f} GiB")
+    mean = sum(r[2] + r[3] + r[4] for r in mid) / len(mid)
+    med = sorted(r[2] for r in mid)[len(mid) // 2]
+    print(f"  tokens/s/GPU {bsz * seq_len / (mean / 1000):.0f} (fwd+bwd+clip+optim mean {mean:.0f} ms); median fwd+bwd {med:.0f} ms", flush=True)
+    if int(os.environ.get("PROF_STEP", steps - 1)) < 0:  # no profiled step
+        dist.barrier(); dist.destroy_process_group(); sys.exit(0)
     ev = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA and e.name not in ("FWD", "BWD")]
     first = min(e.time_range.start for e in ev); last = max(e.time_range.end for e in ev)
     cats = defaultdict(float)
