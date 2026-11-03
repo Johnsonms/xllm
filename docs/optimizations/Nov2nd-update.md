@@ -53,3 +53,22 @@ B200 用 tcgen05 / TMEM，H100 / H200 用 wgmma，运行时按架构选路径，
 ## 待决定
 
 主要是默认值：fp8、对称集合通信、DeepGEMM 是否默认打开；xattn 补丁是否上游；H200 host-bound 的行在裸机上重测。
+
+## 按类别的总表
+
+| 类别 | 做了什么 | 替换 / 改动的对象 | 效果 |
+|---|---|---|---|
+| CuTe 算子：Timestep decay norm | 前向 / 反向 look-back scan 核（B200 tcgen05 免费路径，Hopper 标量路径） | CUB scan 核 | 每次调用 15-20x，接近 HBM 上限；0.9B 每步 120 → 2.3 ms |
+| CuTe 算子：Adaptive working memory | chunk GEMM + 递推 + 输出 GEMM，前向 / 反向（B200 tcgen05 / TMEM，Hopper wgmma） | torch / cuBLAS 实现 | 前向 6-11x，反向 9-16x（0.9B 反向每步 99 → 6 ms） |
+| CuTe 算子：Sliding chunk attention（B200） | flash 风格前向 / 反向，TMEM 操作数；V = 2048 的 7.1B 反向走物化 P / dS + GEMM，可选 MXFP8 dP | swift（物化注意力矩阵 + cuBLAS） | 0.9B 单步 1151 → 590 ms，峰值显存 139 → 40 GB；7.1B 反向每层 2.2x；前向达 tensor pipe 峰值 ~95% |
+| Hopper 注意力 | xattn 1.1.1 本地补丁（hdim 256 两段反向、GQA K/V 复用、预计算 dO·O）、swift 反向 dS 融合 | 上游 xattn / swift | xattn 反向 1.1-1.2x，swift 7.1B 每层 1.75x |
+| 融合逐元素 / 归一化核 | RoPE、q/k prep（rmsnorm + rope + softmax）、conv + q/k prep 融合、attention gate 链、SwiGLU、group LN、cross-entropy 行核、causal conv 前向 | 一串 torch 逐元素算子 | 0.9B 这部分步时 527 → 315 ms；H100 上 RoPE 6x、block 逐元素 3.5x、conv + q/k prep 1.7x / 2.5x |
+| FP8 GEMM（B200） | MXFP8（e4m3 + e8m0 / 32，cuBLASLt），量化融合进上游核，权重每步量化一次 | bf16 cuBLAS | GEMM 时间 1.75-1.84x 降低；步长 -8% 到 -27% |
+| FP8 GEMM（Hopper） | blockwise e4m3（1 x 128 / 128 x 128），残差加在 epilogue；可选 DeepGEMM 后端；fp8 all-gather | bf16 cuBLAS | 每个 GEMM 1.5-1.7x；H200 上 DeepGEMM 再 1.10-1.35x；fp8 all-gather 省 2.6-6 GiB |
+| 训练步结构 | 残差加融合进 GEMM epilogue；`recompute_conv_qk=False` 保存前向激活；TSDN 步数前向传反向 | 融合 block 的重计算与多余 pass | 单卡 0.9B 322 → 305，4B 288 → 273 ms |
+| FSDP2 / 通信 | `fsdp_layers_per_group` 分组 all-gather、`reshard_after_forward=False`、Triton reduce-scatter copy-in、梯度除法折进 copy-in、Hopper 对称内存集合通信、`balance_dp_rows` | FSDP2 默认行为、`torch._chunk_cat` | 8 卡 0.9B 348 → 326、7.1B 828 → 818 ms；H200 上分组是最大收益项 |
+| 优化器 / 裁剪 | 在 flat 梯度 buffer 上做梯度裁剪、本地分片上的 fused AdamW | DTensor 分发的 clip 与 AdamW | 8 卡 clip 9 → 4 ms，optim 13 → 3 ms |
+| CUDA graph | 融合 block 的前向 / 反向按层捕获回放（`cuda_graph_block`） | eager 发射 | B200 4B 消除步长双峰（251 / 280 → 251）；H200 无 EOS 时 4B -6%，有 EOS 打包数据还不能用 |
+| Bug 修复 | `create_on_gpu` 残留的 TorchFunctionMode；AWM 单 chunk 崩溃 / 挂起；conv_qk_prep NaN；sm_100 `_mul2` / `_fma2` 递归 | - | 4B 单卡 554 → 444 ms（第一项） |
+| 测试 | 每个 kernel 对 fp32 / fp64 参考的单测（130+），fp8 block 级测试，端到端 parity 与 100-200 步 soak | - | bf16 项 loss 差 ≤ 2e-4，fp8 约 1e-3 |
+| 文档 / 工程整理 | `docs/optimizations/`：README、B200 / H100 / H200 报告、SUMMARY、KERNELS、本文件、xattn 补丁、复现 harness；7 个开发 / hand-off 分支合成一个分支 | - | 一个分支，三份架构报告 |
