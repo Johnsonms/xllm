@@ -3,6 +3,7 @@
 This branch holds the final state of the Gekko kernel / training-step optimization work, squashed on top of
 `main` (October 2026), and one report per architecture:
 
+- [Nov2nd-update.md](Nov2nd-update.md): 2026-11-02 overview of everything done on top of `main` (Chinese).
 - [SUMMARY.md](SUMMARY.md): one page - the top 5 kernel optimizations and the model speed-ups on the three architectures.
 - [KERNELS.md](KERNELS.md): the full kernel-by-kernel table (every item, all three architectures).
 - [B200.md](B200.md): Blackwell (sm_100a) results and recipes - done.
