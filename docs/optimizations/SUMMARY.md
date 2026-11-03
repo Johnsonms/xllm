@@ -3,6 +3,33 @@
 Branch `gekko-optimizations`. Details, recipes and caveats: [B200.md](B200.md), [H100.md](H100.md),
 [H200.md](H200.md); the full kernel-by-kernel table: [KERNELS.md](KERNELS.md).
 
+## What was done on top of `main` (f5f8687)
+
+1. **Gekko's core operators rewritten in the CuTe DSL** (tcgen05 / TMEM on B200, wgmma on H100 / H200; the path is
+   chosen per architecture at runtime; every kernel has a unit test against an fp32 / fp64 reference): timestep decay
+   norm fwd / bwd (replaces CUB, 15-20x per call), adaptive working memory fwd / bwd (replaces torch / cuBLAS, 6-11x
+   fwd, 9-16x bwd), sliding chunk attention on B200 (replaces swift's materialised attention matrix; 0.9B step
+   1151 -> 590 ms, peak memory 139 -> 40 GB; 7.1B V = 2048 backward through materialised P / dS + GEMMs, optional
+   MXFP8 dP; Hopper keeps xattn / swift with local patches and a fused swift backward), and a set of fused
+   elementwise / norm kernels (RoPE, q / k prep, conv + q / k prep, attention gate chain, SwiGLU, group layer norm,
+   cross-entropy rows, causal conv forward; 0.9B: 527 -> 315 ms of that stage).
+2. **fp8 GEMMs**: MXFP8 on B200 (e4m3 + e8m0 per 32, cuBLASLt, quantisation fused into the producing kernels; GEMM
+   time 1.75-1.84x lower, step -8 to -27%); blockwise e4m3 on Hopper (1 x 128 / 128 x 128, residual in the epilogue,
+   optional DeepGEMM backend: another 1.10-1.35x per GEMM on H200, fp8 all-gather to save memory).
+3. **Training step and FSDP2**: residual adds in GEMM epilogues, `recompute_conv_qk=False` (keep the forward
+   activations), `fsdp_layers_per_group`, `reshard_after_forward=False`; Triton reduce-scatter copy-in, gradient
+   clipping on the flat buffers, fused AdamW on the local shards, NCCL symmetric-memory collectives on Hopper,
+   `balance_dp_rows`; CUDA-graph replay of the fused block (4B: removes the bimodal step; not yet usable with
+   EOS-packed batches on H200). Bugs fixed on the way: a leftover TorchFunctionMode from `create_on_gpu` (4B 1 GPU
+   554 -> 444 ms), AWM crashes / hangs with a single chunk, a conv_qk_prep NaN, the sm_100 `_mul2` / `_fma2` recursion.
+4. **End to end** (table below): 0.9B / 4B / 7.1B steps 4.7x / 3.9x / 2.1x faster on B200, 1.86x / 1.68x / 1.71x on
+   H100, 2.42x / 1.82x / 2.02x on H200; losses within 2e-4 (bf16 items) / ~1e-3 (fp8) of the original on the same
+   batches over 100-200-step soaks.
+5. **Docs and branch hygiene**: `docs/optimizations/` (README, the three reports, this page, KERNELS.md, xattn
+   patches, the reproduction harness); the seven development / hand-off branches squashed into this one branch
+   (old history archived in local bundles). Left to the owner: fp8, symmetric collectives and DeepGEMM as defaults;
+   upstreaming the xattn patches; re-measuring the host-bound H200 rows on bare metal.
+
 ## Top 5 kernel optimizations
 
 | # | kernel | what changed | B200 (sm_100a) | H100 / H200 (sm_90a) |
